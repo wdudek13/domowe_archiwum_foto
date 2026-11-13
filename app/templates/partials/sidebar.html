@@ -1,0 +1,160 @@
+{% macro render_group_nodes(nodes) %}
+    {% for node in nodes %}
+    <div class="pl-{{ node.depth * 3 }} py-0.5">
+        <button onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
+                class="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
+            <span class="truncate flex items-center space-x-1.5">
+                <span class="text-amber-400">📁</span>
+                <span class="truncate">{{ node.group.name }}</span>
+            </span>
+            <span class="text-[10px] font-mono bg-slate-900 px-1.5 py-0.5 rounded text-slate-400 group-hover:text-indigo-300">{{ node.total_count }}</span>
+        </button>
+        {% if node.children %}
+            {{ render_group_nodes(node.children) }}
+        {% endif %}
+    </div>
+    {% endfor %}
+{% endmacro %}
+
+<div class="space-y-5 text-xs">
+    <div>
+        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Zbiory Główne</div>
+        <div class="space-y-0.5">
+            <button onclick="applySidebarFilter({_reset: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200">
+                <span>📷 Wszystkie multimedia</span>
+                <span class="font-mono text-[10px] text-slate-400">{{ total_all }}</span>
+            </button>
+            <button onclick="applySidebarFilter({_reset: true, ungrouped_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-slate-300">
+                <span>📂 Nieprzypisane do grup</span>
+            </button>
+            <button onclick="applySidebarFilter({_reset: true, anomaly_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-amber-300">
+                <span>⚠️ Anomalie daty</span>
+                <span class="font-mono text-[10px]">{{ total_anomalies }}</span>
+            </button>
+            <button onclick="applySidebarFilter({_reset: true, duplicates_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-rose-300">
+                <span>👥 Duplikaty binarne</span>
+                <span class="font-mono text-[10px]">{{ total_dups }}</span>
+            </button>
+            <button onclick="applySidebarFilter({_reset: true, blurry_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-orange-300">
+                <span>🔍 Rozmyte / Nieostre</span>
+                <span class="font-mono text-[10px]">{{ total_blurry }}</span>
+            </button>
+<button type="button" onclick="applySidebarFilter({_reset: true, trashed_only: true})"
+                    class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 font-semibold border border-rose-900/40 mt-1">
+                <span>🗑️ Kosz (Usunięte)</span>
+                <span class="font-mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded">{{ total_trashed }}</span>
+            </button>
+
+            {% if trashed_groups %}
+            <div class="mt-2 p-2 rounded-lg bg-rose-950/20 border border-rose-900/40 space-y-1">
+                <div class="text-[10px] font-bold text-rose-300 uppercase">Grupy w Koszu:</div>
+                {% for tg in trashed_groups %}
+                <div class="flex items-center justify-between text-[11px] text-slate-300 py-0.5">
+                    <span class="truncate">📁 {{ tg.name }}</span>
+                    <button type="button"
+                            hx-post="/actions/restore-from-trash"
+                            hx-vals='{"restore_mode": "group", "restore_group_id": "{{ tg.id }}"}'
+                            hx-target="#global-notification"
+                            class="text-[10px] bg-emerald-800 hover:bg-emerald-700 text-white px-1.5 py-0.5 rounded">
+                        ♻️ Przywróć
+                    </button>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            <div class="px-2.5 py-1 flex justify-between items-center text-[11px] text-purple-300">
+                <span>🧠 Wektory 512-D w bazie:</span>
+                <span class="font-mono font-bold">{{ total_vectors }} / {{ total_all }}</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="p-2.5 rounded-xl bg-indigo-950/30 border border-indigo-800/50 space-y-2">
+        <div class="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">1-Klik Auto-Organizacja</div>
+        <div class="grid grid-cols-1 gap-1.5">
+            <button hx-post="/actions/auto-group" hx-vals='{"mode": "folder", "scope": "filtered"}' hx-include="#filter-form" hx-target="#global-notification"
+                    class="w-full text-left px-2.5 py-1.5 rounded bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/30 text-indigo-200 text-[11px] transition">
+                🌳 Utwórz drzewo wg Katalogów z dysku
+            </button>
+            <button hx-post="/actions/auto-group" hx-vals='{"mode": "date", "scope": "filtered"}' hx-include="#filter-form" hx-target="#global-notification"
+                    class="w-full text-left px-2.5 py-1.5 rounded bg-purple-600/20 hover:bg-purple-600/40 border border-purple-500/30 text-purple-200 text-[11px] transition">
+                📅 Utwórz drzewo wg Daty (Rok -> Miesiąc)
+            </button>
+        </div>
+    </div>
+
+    <div>
+        <div class="flex items-center justify-between mb-1.5">
+            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Drzewo Grup / Albumów</span>
+            <button onclick="document.getElementById('group-modal').classList.remove('hidden')" class="text-indigo-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800">+</button>
+        </div>
+        <div class="max-h-60 overflow-y-auto pr-1 space-y-0.5">
+            {% if group_tree %}
+                {{ render_group_nodes(group_tree) }}
+            {% else %}
+                <div class="text-[11px] text-slate-500 italic px-2 py-1">Brak grup.</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div>
+        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Tagi AI (Kliknij aby filtrować)</div>
+        <div class="flex flex-wrap gap-1 max-h-48 overflow-y-auto">
+            {% for t_name, cnt in top_tags %}
+            <button onclick="applySidebarFilter({_reset: true, tag: '{{ t_name }}'})"
+                    class="px-2 py-0.5 rounded-full bg-slate-900 hover:bg-indigo-950 border border-borderBg hover:border-indigo-500 text-[10px] text-slate-200 transition">
+                {{ t_name }} <span class="text-indigo-400 font-mono">({{ cnt }})</span>
+            </button>
+            {% else %}
+            <span class="text-[11px] text-amber-400/90 px-1">Kliknij fioletowy przycisk <strong>⚡ Analizuj AI</strong> na górnym pasku, aby wygenerować tagi i wektory.</span>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div>
+        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Nośniki / Dyski USB</div>
+        <div class="space-y-1.5">
+            {% for v in volumes %}
+            {% set sp = vol_space.get(v.id) if vol_space else None %}
+            <div class="p-2 rounded-lg bg-slate-900/70 hover:bg-slate-800 border border-borderBg transition space-y-1">
+                <div class="flex items-center justify-between">
+                    <button type="button" onclick="applySidebarFilter({_reset: true, volume_id: '{{ v.id }}'})"
+                            class="flex items-center space-x-1.5 truncate text-left flex-1">
+                        <span class="w-2 h-2 rounded-full flex-shrink-0 {% if v.is_online %}bg-emerald-400{% else %}bg-rose-500{% endif %}"></span>
+                        <span class="font-medium text-slate-200 truncate" title="{{ v.volume_label }}">{{ v.volume_label }}</span>
+                        <span class="text-slate-400 font-mono text-[10px]">({{ v.last_known_drive_letter }})</span>
+                    </button>
+                    <div class="flex items-center space-x-1">
+                        <button type="button"
+                                title="Nadaj krótką nazwę dysku"
+                                onclick="const n = prompt('Podaj krótką nazwę dla dysku {{ v.last_known_drive_letter }}:', '{{ v.volume_label }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/rename-volume', {values: {volume_id: '{{ v.id }}', new_label: n.trim()}, target: '#global-notification'});"
+                                class="text-[10px] text-slate-400 hover:text-indigo-300 px-1">✏️</button>
+<button type="button"
+        title="Wyindeksuj cały ten dysk z bazy (pliki na dysku pozostaną)"
+        hx-post="/actions/unindex"
+        hx-vals='{"unindex_volume_id": "{{ v.id }}"}'
+        hx-confirm="Wyindeksować cały dysk {{ v.volume_label }} z bazy? Pliki na dysku pozostaną nienaruszone."
+        hx-target="#global-notification"
+        class="text-[10px] text-slate-500 hover:text-rose-400 px-1">✖️</button>
+                        <span class="font-mono text-[10px] bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">{{ vol_counts.get(v.id, 0) }}</span>
+                    </div>
+                </div>
+
+                {% if sp %}
+                <div class="space-y-0.5">
+                    <div class="flex justify-between text-[10px] font-mono text-slate-400">
+                        <span>Wolne: <strong class="text-emerald-400">{{ "%.1f"|format(sp.free_gb) }} GB</strong> / {{ "%.1f"|format(sp.total_gb) }} GB</span>
+                        <span>{{ sp.used_pct }}%</span>
+                    </div>
+                    <div class="w-full h-1 bg-slate-800 rounded overflow-hidden">
+                        <div class="h-full {% if sp.used_pct > 90 %}bg-rose-500{% elif sp.used_pct > 75 %}bg-amber-500{% else %}bg-indigo-500{% endif %}" style="width: {{ sp.used_pct }}%"></div>
+                    </div>
+                </div>
+                {% else %}
+                <div class="text-[10px] text-slate-500 font-mono">Offline • VSN: {{ v.volume_serial_number }}</div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>

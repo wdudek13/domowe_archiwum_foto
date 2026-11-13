@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="pl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hydra Media Vault</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { darkBg: '#0b0f19', cardBg: '#131b2e', borderBg: '#1f2b48' } } }
+        }
+    </script>
+    <style>
+        .lightbox-open { overflow: hidden; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #0b0f19; }
+        ::-webkit-scrollbar-thumb { background: #1f2b48; border-radius: 4px; }
+        .zoomed-img { transform: scale(1.85); cursor: zoom-out !important; }
+    </style>
+</head>
+<body class="bg-darkBg text-slate-100 h-screen flex flex-col font-sans antialiased overflow-hidden">
+    <header class="border-b border-borderBg bg-cardBg/95 backdrop-blur z-40 px-5 py-2.5 flex items-center justify-between flex-shrink-0">
+        <div class="flex items-center space-x-3">
+            <a href="/" class="flex items-center space-x-2.5">
+                <div class="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow">H</div>
+                <span class="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Hydra Photos</span>
+            </a>
+        </div>
+        <div id="global-notification" class="text-xs px-3 py-1 rounded"></div>
+        <div class="flex items-center space-x-2 text-xs">
+            <button type="button"
+                    onclick="openGDriveModal()"
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-sky-300 font-medium transition">
+                ☁️ Google Drive Archiwum
+            </button>
+        </div>
+    </header>
+
+    <div class="flex flex-1 overflow-hidden">
+<aside id="sidebar-container"
+               hx-get="/media/sidebar"
+               hx-trigger="refresh-all from:body"
+               class="w-72 border-r border-borderBg bg-cardBg/50 p-3.5 overflow-y-auto flex-shrink-0 hidden md:block">
+            {% include "partials/sidebar.html" %}
+        </aside>
+
+        <main class="flex-1 p-4 overflow-y-auto" id="main-scroll">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    <!-- Fullscreen Gallery Lightbox -->
+    <div id="lightbox" class="hidden fixed inset-0 z-50 bg-black/95 flex flex-col justify-between p-4 select-none">
+        <div class="flex items-center justify-between px-4 py-2 bg-slate-900/70 rounded-xl backdrop-blur z-50">
+            <div id="lightbox-caption" class="text-xs text-slate-200 font-mono truncate max-w-xl"></div>
+            <div class="flex items-center space-x-3">
+                <button type="button" onclick="findSimilarFromLightbox()" class="bg-purple-800/80 hover:bg-purple-700 text-purple-100 text-xs px-3 py-1.5 rounded-lg">🔍 Pokaż podobne</button>
+<button type="button" id="tv-slideshow-btn" onclick="toggleTvSlideshow()"
+        class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition">
+    📺 Pokaz slajdów TV (Start)
+</button>
+                <button type="button" onclick="openDetailFromLightbox()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1.5 rounded-lg">ℹ️ Szczegóły EXIF / Tagi</button>
+                <a id="lightbox-download" href="#" download class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1.5 rounded-lg">📥 Oryginał</a>
+                <button type="button" onclick="closeLightbox()" class="text-white hover:text-rose-400 text-2xl font-bold px-2">&times;</button>
+            </div>
+        </div>
+
+        <div class="flex-1 flex items-center justify-between overflow-hidden relative my-2">
+            <button type="button" onclick="prevLightbox()" class="text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10094;</button>
+            <div class="flex-1 h-full flex items-center justify-center overflow-hidden">
+                <img id="lightbox-img" src="" onclick="this.classList.toggle('zoomed-img')"
+                     class="hidden max-w-full max-h-[82vh] object-contain rounded shadow-2xl transition-transform duration-200 cursor-zoom-in">
+                <video id="lightbox-video" controls autoplay
+                       class="hidden max-w-full max-h-[82vh] rounded shadow-2xl bg-black outline-none"></video>
+            </div>
+            <button type="button" onclick="nextLightbox()" class="text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10095;</button>
+        </div>
+
+        <div class="text-center text-[11px] text-slate-400 font-mono">
+            Nawigacja: Strzałki <strong>&larr; / &rarr;</strong> | Kliknij zdjęcie aby powiększyć (Zoom) | <strong>ESC</strong> aby zamknąć
+        </div>
+    </div>
+
+    <!-- Google Drive Live Archive & Folder Verification Modal -->
+    <div id="gdrive-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-3xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+                <div>
+                    <h3 class="font-bold text-sm text-sky-400">☁️ Archiwum Google Drive (.\data\credentials.json)</h3>
+                    <p class="text-[11px] text-slate-400">Weryfikacja sumy kontrolnej MD5 oraz podgląd plików w chmurze na żywo.</p>
+                </div>
+                <button type="button" onclick="document.getElementById('gdrive-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div id="gdrive-panel-body">
+                <div class="p-8 text-center text-slate-400">Kliknij powyżej, aby załadować kartoteki Google Drive...</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal-container"></div>
+
+    <script>
+        let currentLightboxIndex = 0;
+        let lightboxItems = [];
+        let lastCheckedCheckbox = null;
+
+        function openGDriveModal() {
+            document.getElementById('gdrive-modal').classList.remove('hidden');
+            document.getElementById('gdrive-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Łączenie z Google Drive API...</div>";
+            htmx.ajax('GET', '/actions/gdrive-panel', '#gdrive-panel-body');
+        }
+
+        function handleCheckboxClick(e, cb) {
+            const allCbs = Array.from(document.querySelectorAll("input[name='selected_ids']"));
+            if (e.shiftKey && lastCheckedCheckbox && lastCheckedCheckbox !== cb) {
+                const start = allCbs.indexOf(cb);
+                const end = allCbs.indexOf(lastCheckedCheckbox);
+                if (start !== -1 && end !== -1) {
+                    const [low, high] = [Math.min(start, end), Math.max(start, end)];
+                    for (let i = low; i <= high; i++) allCbs[i].checked = cb.checked;
+                }
+            }
+            lastCheckedCheckbox = cb;
+            updateSelectionState();
+        }
+
+        function updateSelectionState() {
+            const checked = document.querySelectorAll("input[name='selected_ids']:checked");
+            const countSpan = document.getElementById('selected-counter');
+            const scopeSelect = document.getElementById('bulk-scope-select');
+            if (countSpan) countSpan.textContent = checked.length;
+            if (scopeSelect) scopeSelect.value = checked.length > 0 ? 'selected' : 'filtered';
+        }
+
+        function selectAllVisible(state) {
+            document.querySelectorAll("input[name='selected_ids']").forEach(cb => cb.checked = state);
+            updateSelectionState();
+        }
+
+        function toggleDaySelection(dateStr) {
+            const cbs = document.querySelectorAll(`input[data-day='${dateStr}']`);
+            const allChecked = Array.from(cbs).every(c => c.checked);
+            cbs.forEach(c => c.checked = !allChecked);
+            updateSelectionState();
+        }
+
+        function applySidebarFilter(paramsObj) {
+            const form = document.getElementById('filter-form');
+            if (!form) return;
+            if (paramsObj._reset) {
+                ['volume_id', 'folder_prefix', 'group_id', 'tag', 'year'].forEach(k => {
+                    const el = form.querySelector(`[name='${k}']`);
+                    if (el) el.value = '';
+                });
+['anomaly_only', 'blurry_only', 'duplicates_only', 'untagged_only', 'ungrouped_only', 'trashed_only'].forEach(k => {
+    const el = form.querySelector(`[name='${k}']`);
+    if (el) el.checked = false;
+});
+            }
+            for (const [k, v] of Object.entries(paramsObj)) {
+                if (k === '_reset') continue;
+                let el = form.querySelector(`[name='${k}']`);
+                if (el) {
+                    if (el.type === 'checkbox') el.checked = Boolean(v);
+                    else el.value = v;
+                }
+            }
+            const pageEl = form.querySelector("[name='page']");
+            if (pageEl) pageEl.value = '1';
+            htmx.trigger(form, 'change');
+        }
+
+        function goToPage(p) {
+            const form = document.getElementById('filter-form');
+            const pageEl = form.querySelector("[name='page']");
+            if (pageEl) {
+                pageEl.value = p;
+                htmx.trigger(form, 'change');
+                document.getElementById('main-scroll').scrollTop = 0;
+            }
+        }
+
+        function openLightboxById(mediaId) {
+            lightboxItems = Array.from(document.querySelectorAll('.gallery-media-item')).map(el => ({
+                id: el.getAttribute('data-id'),
+                rawUrl: el.getAttribute('data-raw'),
+                mediaType: el.getAttribute('data-type'),
+                title: el.getAttribute('data-title') || ''
+            }));
+            currentLightboxIndex = lightboxItems.findIndex(x => x.id === mediaId);
+            if (currentLightboxIndex === -1) currentLightboxIndex = 0;
+            renderLightboxSlide();
+            document.getElementById('lightbox').classList.remove('hidden');
+            document.body.classList.add('lightbox-open');
+        }
+
+        function renderLightboxSlide() {
+            if (!lightboxItems.length) return;
+            const item = lightboxItems[currentLightboxIndex];
+            const imgEl = document.getElementById('lightbox-img');
+            const vidEl = document.getElementById('lightbox-video');
+            imgEl.classList.remove('zoomed-img');
+
+            vidEl.pause();
+            vidEl.removeAttribute('src');
+
+            if (item.mediaType === 'video') {
+                imgEl.classList.add('hidden');
+                vidEl.classList.remove('hidden');
+                vidEl.src = item.rawUrl;
+                vidEl.load();
+            } else {
+                vidEl.classList.add('hidden');
+                imgEl.classList.remove('hidden');
+                imgEl.src = item.rawUrl;
+            }
+
+            document.getElementById('lightbox-caption').textContent = `${currentLightboxIndex + 1} / ${lightboxItems.length} — ${item.title}`;
+            document.getElementById('lightbox-download').href = item.rawUrl;
+        }
+
+        function closeLightbox() {
+            stopTvSlideshow();
+            const vidEl = document.getElementById('lightbox-video');
+            if (vidEl) { vidEl.pause(); vidEl.removeAttribute('src'); }
+            document.getElementById('lightbox').classList.add('hidden');
+            document.body.classList.remove('lightbox-open');
+        }
+
+        function nextLightbox() {
+            if (!lightboxItems.length) return;
+            currentLightboxIndex = (currentLightboxIndex + 1) % lightboxItems.length;
+            renderLightboxSlide();
+        }
+
+        function prevLightbox() {
+            if (!lightboxItems.length) return;
+            currentLightboxIndex = (currentLightboxIndex - 1 + lightboxItems.length) % lightboxItems.length;
+            renderLightboxSlide();
+        }
+
+        function findSimilarFromLightbox() {
+            if (!lightboxItems.length) return;
+            const item = lightboxItems[currentLightboxIndex];
+            closeLightbox();
+            htmx.ajax('GET', `/semantic/similar/${item.id}`, '#media-grid');
+        }
+
+        function openDetailFromLightbox() {
+            if (!lightboxItems.length) return;
+            const item = lightboxItems[currentLightboxIndex];
+            htmx.ajax('GET', `/media/${item.id}/detail`, '#modal-container');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (document.getElementById('lightbox').classList.contains('hidden')) return;
+            if (e.key === 'Escape') closeLightbox();
+            if (e.key === 'ArrowRight') nextLightbox();
+            if (e.key === 'ArrowLeft') prevLightbox();
+        });
+
+let tvSlideshowTimer = null;
+        let isTvSlideshowActive = false;
+
+        function toggleTvSlideshow() {
+            const btn = document.getElementById('tv-slideshow-btn');
+            const lb = document.getElementById('lightbox');
+
+            if (!isTvSlideshowActive) {
+                isTvSlideshowActive = true;
+                btn.textContent = "⏹️ Zatrzymaj pokaz TV";
+                btn.classList.replace('bg-amber-600', 'bg-rose-600');
+                if (lb.requestFullscreen) {
+                    lb.requestFullscreen().catch(() => {});
+                }
+                scheduleNextTvSlide();
+            } else {
+                stopTvSlideshow();
+            }
+        }
+
+        function scheduleNextTvSlide() {
+            clearTimeout(tvSlideshowTimer);
+            if (!isTvSlideshowActive || !lightboxItems.length) return;
+
+            const currentItem = lightboxItems[currentLightboxIndex];
+            const vidEl = document.getElementById('lightbox-video');
+
+            if (currentItem.mediaType === 'video') {
+                // Dla wideo czekamy az film dobiegnie do konca i przechodzimy dalej
+                vidEl.onended = () => {
+                    if (isTvSlideshowActive) {
+                        nextLightbox();
+                        scheduleNextTvSlide();
+                    }
+                };
+            } else {
+                // Dla zdjec przechodzimy dalej co 5 sekund
+                tvSlideshowTimer = setTimeout(() => {
+                    if (isTvSlideshowActive) {
+                        nextLightbox();
+                        scheduleNextTvSlide();
+                    }
+                }, 5000);
+            }
+        }
+
+        function stopTvSlideshow() {
+            isTvSlideshowActive = false;
+            clearTimeout(tvSlideshowTimer);
+            const btn = document.getElementById('tv-slideshow-btn');
+            if (btn) {
+                btn.textContent = "📺 Pokaz slajdów TV (Start)";
+                btn.classList.replace('bg-rose-600', 'bg-amber-600');
+            }
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+    </script>
+</body>
+</html>

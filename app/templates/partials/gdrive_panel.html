@@ -1,0 +1,126 @@
+<div class="space-y-4 text-xs">
+    {% if error_msg %}
+    <div class="p-3 bg-rose-950/80 border border-rose-700 text-rose-200 rounded-xl">
+        <strong>Błąd Google Drive:</strong> {{ error_msg }}
+    </div>
+    {% endif %}
+
+    {% if status_report %}
+    <div class="p-3.5 bg-emerald-950/80 border border-emerald-600 text-emerald-100 rounded-xl space-y-2">
+        <div class="flex items-center justify-between font-bold text-sm text-emerald-300">
+            <span>✓ Operacja zakończona pomyślnie</span>
+            <span class="font-mono text-xs">{{ finished_at }}</span>
+        </div>
+        <div class="text-xs">{{ status_summary }}</div>
+        {% if uploaded_results %}
+        <div class="max-h-40 overflow-y-auto border-t border-emerald-800/60 pt-2 mt-2">
+            <table class="w-full text-left font-mono text-[10px]">
+                <thead>
+                    <tr class="text-emerald-400 border-b border-emerald-800/50">
+                        <th class="pb-1">Plik</th>
+                        <th class="pb-1">Weryfikacja MD5</th>
+                        <th class="pb-1">Dysk lokalny</th>
+                        <th class="pb-1">Link</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-emerald-900/40">
+                    {% for r in uploaded_results %}
+                    <tr>
+                        <td class="py-1 truncate max-w-[160px]">{{ r.name }}</td>
+                        <td class="py-1 text-emerald-300">✓ OK ({{ r.md5[:10] }}...)</td>
+                        <td class="py-1">{% if r.purged_local %}<span class="text-amber-300">Usunięto (Archiwum)</span>{% else %}Pozostawiono kopię{% endif %}</td>
+                        <td class="py-1"><a href="{{ r.webViewLink }}" target="_blank" class="underline text-sky-300 hover:text-white">Otwórz na Drive &nearr;</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- Formularz wyboru kartoteki i uruchomienia Archiwizacji -->
+    <form hx-post="/actions/gdrive-sync"
+          hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+          hx-target="#gdrive-panel-body"
+          class="bg-slate-900/90 border border-borderBg p-4 rounded-xl space-y-3">
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+                <label class="block text-slate-400 mb-1">Wybierz istniejącą kartotekę na Google Drive:</label>
+                <select name="folder_id" onchange="htmx.ajax('GET', '/actions/gdrive-panel?folder_id=' + this.value, '#gdrive-panel-body')"
+                        class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200">
+                    {% for fld in folders %}
+                    <option value="{{ fld.id }}" {% if fld.id == active_folder_id %}selected{% endif %}>📁 {{ fld.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="block text-slate-400 mb-1">Lub wpisz nazwę nowej kartoteki do utworzenia:</label>
+                <input type="text" name="new_folder_name" placeholder="np. Archiwum_Wakacje_2024"
+                       class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-white">
+            </div>
+        </div>
+
+        <div class="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-borderBg">
+            <label class="flex items-center space-x-2 cursor-pointer text-amber-300 font-medium">
+                <input type="checkbox" name="purge_local" value="true" class="rounded bg-slate-900 border-borderBg text-rose-600">
+                <span>Tryb Archiwum: Usuń z dysku lokalnego po 100% weryfikacji MD5 i rozmiaru</span>
+            </label>
+
+            <div class="flex items-center space-x-2">
+                <button type="submit" name="mode" value="db_backup"
+                        class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-slate-200 px-3 py-2 rounded-lg font-medium transition">
+                    📦 Wyślij Backup Bazy SQLite
+                </button>
+                <button type="submit" name="mode" value="media"
+                        class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
+                    ☁️ Wyślij wybrane zdjęcia do kartoteki
+                </button>
+            </div>
+        </div>
+    </form>
+
+    <!-- Dowód wgrania: Podgląd zawartości wybranego katalogu na Google Drive -->
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-300">📂 Zawartość wybranej kartoteki na Google Drive ({{ cloud_files|length }} plików):</span>
+            <button type="button"
+                    onclick="htmx.ajax('GET', '/actions/gdrive-panel?folder_id={{ active_folder_id }}', '#gdrive-panel-body')"
+                    class="text-sky-400 hover:underline text-[11px]">🔄 Odśwież podgląd chmury</button>
+        </div>
+
+        <div class="max-h-56 overflow-y-auto">
+            {% if cloud_files %}
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg text-slate-400">
+                        <th class="py-1.5 px-2">Nazwa pliku w chmurze</th>
+                        <th class="py-1.5 px-2">Rozmiar</th>
+                        <th class="py-1.5 px-2">Suma MD5 (Google Drive)</th>
+                        <th class="py-1.5 px-2">Data wgrania</th>
+                        <th class="py-1.5 px-2 text-right">Podgląd</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for cf in cloud_files %}
+                    <tr class="hover:bg-slate-800/50">
+                        <td class="py-1.5 px-2 text-slate-200 truncate max-w-[180px]" title="{{ cf.name }}">{{ cf.name }}</td>
+                        <td class="py-1.5 px-2 text-slate-400">{{ "%.2f"|format((cf.size|int) / (1024*1024)) if cf.size else '?' }} MB</td>
+                        <td class="py-1.5 px-2 text-emerald-400 text-[10px]">{{ cf.md5Checksum or 'Folder/Doc' }}</td>
+                        <td class="py-1.5 px-2 text-slate-400 text-[10px]">{{ cf.createdTime[:19].replace('T', ' ') if cf.createdTime else '' }}</td>
+                        <td class="py-1.5 px-2 text-right">
+                            <a href="{{ cf.webViewLink }}" target="_blank" class="bg-sky-900/70 hover:bg-sky-700 text-sky-200 px-2 py-0.5 rounded text-[10px]">
+                                Pokaż na Drive &nearr;
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="p-6 text-center text-slate-500 italic">Wybrana kartoteka na Google Drive jest obecnie pusta.</div>
+            {% endif %}
+        </div>
+    </div>
+</div>

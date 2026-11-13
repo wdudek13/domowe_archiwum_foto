@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="space-y-4">
+    <div class="bg-cardBg border border-borderBg p-3.5 rounded-xl shadow flex flex-wrap gap-3 items-center justify-between">
+        <form hx-post="/actions/scan" hx-target="#global-notification" class="flex flex-wrap items-center gap-2 text-xs">
+            <input type="text" name="path" placeholder="Ścieżka dysku/folderu, np. E:\ lub D:\Zdjecia" required
+                   class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-60 focus:outline-none focus:border-indigo-500">
+            <label class="flex items-center space-x-1 text-[11px] text-slate-400 cursor-pointer">
+                <input type="checkbox" name="force_rescan" value="true" class="rounded bg-slate-900 border-borderBg text-indigo-600">
+                <span>Re-indeksuj</span>
+            </label>
+            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg font-medium transition">
+                Skanuj dysk
+            </button>
+        </form>
+
+        <form id="filter-form" hx-get="/media/search" hx-target="#media-grid" hx-trigger="change, submit" class="flex flex-wrap gap-2 items-center text-xs flex-1 justify-end">
+            <input type="hidden" name="volume_id" value="">
+            <input type="hidden" name="folder_prefix" value="">
+            <input type="hidden" name="group_id" value="">
+            <input type="hidden" name="tag" value="">
+            <input type="hidden" name="year" value="">
+            <input type="hidden" name="page" value="1">
+            <input type="checkbox" name="trashed_only" value="true" class="hidden">
+            <input type="checkbox" name="anomaly_only" value="true" class="hidden">
+            <input type="checkbox" name="blurry_only" value="true" class="hidden">
+            <input type="checkbox" name="duplicates_only" value="true" class="hidden">
+            <input type="checkbox" name="untagged_only" value="true" class="hidden">
+            <input type="checkbox" name="ungrouped_only" value="true" class="hidden">
+
+            <div class="flex items-center space-x-1">
+                <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
+                       hx-get="/semantic/search" hx-target="#media-grid" hx-trigger="keyup changed delay:250ms" hx-include="#filter-form"
+                       class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-64 focus:outline-none focus:border-indigo-500">
+            </div>
+
+            <select name="media_type" class="bg-slate-900 border border-borderBg rounded-lg px-2 py-1.5">
+                <option value="all">Wszystkie typy</option>
+                <option value="image">Zdjęcia</option>
+                <option value="video">Wideo</option>
+            </select>
+
+            <select name="sort_by" class="bg-slate-900 border border-borderBg rounded-lg px-2 py-1.5">
+                <option value="date_desc">Data: Najnowsze</option>
+                <option value="date_asc">Data: Najstarsze</option>
+                <option value="size_desc">Rozmiar: Malejąco</option>
+                <option value="size_asc">Rozmiar: Rosnąco</option>
+                <option value="name_asc">Nazwa: A-Z</option>
+                <option value="blur_asc">Ostrość: Najbardziej rozmyte</option>
+            </select>
+
+            <select name="view_mode" class="bg-slate-900 border border-borderBg rounded-lg px-2 py-1.5 text-indigo-300 font-medium">
+                <option value="grid">Widok: Oś czasu</option>
+                <option value="compact">Widok: Gęsty (Kompakt)</option>
+                <option value="table">Widok: Tabela (Lista)</option>
+            </select>
+        </form>
+    </div>
+
+    <div class="bg-slate-900/90 border border-borderBg px-4 py-2.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div class="flex items-center space-x-3">
+            <span class="text-slate-400">Zakres akcji:</span>
+            <select id="bulk-scope-select" name="scope" class="bg-cardBg border border-indigo-500/50 text-indigo-300 font-semibold rounded-lg px-2.5 py-1">
+                <option value="filtered">Cały aktualny filtr / zbiór</option>
+                <option value="selected">Tylko zaznaczone kafelki</option>
+            </select>
+            <span class="text-slate-400">Zaznaczono: <strong id="selected-counter" class="text-white">0</strong></span>
+            <button type="button" onclick="selectAllVisible(true)" class="text-indigo-400 hover:underline">Zaznacz stronę</button>
+            <button type="button" onclick="selectAllVisible(false)" class="text-slate-400 hover:underline">Odznacz</button>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    hx-post="/actions/analyze-all"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    class="bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white px-3.5 py-1.5 rounded-lg font-semibold shadow transition">
+                ⚡ Analizuj AI (Tagi + Wektory 512-D + Ostrość)
+            </button>
+            <button type="button"
+                    onclick="document.getElementById('group-modal').classList.remove('hidden')"
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-white px-3 py-1.5 rounded-lg font-medium transition">
+                📁 Przypisz do grupy / podfolderu
+            </button>
+<button type="button"
+        onclick="document.getElementById('move-files-modal').classList.remove('hidden')"
+        class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-medium transition">
+    🚚 Przenieś fizycznie pliki
+</button>
+            <button type="button"
+                    hx-post="/actions/export-json-disk"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    class="bg-emerald-800/80 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg transition">
+                📥 Zapisz JSON na dysk
+            </button>
+<button type="button"
+                    hx-post="/actions/unindex"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-confirm="Usunąć wybrane pozycje z bazy danych (wyindeksować)? Oryginalne pliki na dysku NIE zostaną usunięte."
+                    hx-target="#global-notification"
+                    class="bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 px-3 py-1.5 rounded-lg transition">
+                ✖️ Usuń z bazy (bez pliku)
+            </button>
+            <button type="button"
+                    hx-post="/actions/move-to-trash"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-confirm="Czy na pewno przenieść wybrane zdjęcia do lokalnego katalogu kosza (data/kosz)?"
+                    hx-target="#global-notification"
+                    class="bg-rose-900/80 hover:bg-rose-800 border border-rose-700 text-rose-200 px-3 py-1.5 rounded-lg transition">
+                🗑️ Przenieś do Kosza
+            </button>
+<button type="button"
+                    hx-post="/actions/delete-permanently"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-confirm="UWAGA! Czy na pewno TRWALE usunąć wybrane pliki fizycznie z dysku/pendrive'a? Tej operacji NIE można cofnąć!"
+                    hx-target="#global-notification"
+                    class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-3 py-1.5 rounded-lg font-semibold transition">
+                🔥 Usuń trwale z dysku
+            </button>
+        </div>
+    </div>
+
+<div id="media-grid" hx-get="/media/search" hx-trigger="refresh-all from:body" hx-include="#filter-form">
+        {% include "partials/media_grid.html" %}
+    </div>
+</div>
+
+<div id="group-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
+        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+            <h3 class="font-bold text-sm text-white">Przypisz do grupy lub utwórz podgrupę w drzewie</h3>
+            <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+        </div>
+        <form hx-post="/actions/assign-group"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              onsubmit="document.getElementById('group-modal').classList.add('hidden');"
+              class="space-y-4">
+            <div>
+                <label class="block text-slate-400 mb-1">Nazwa grupy / podkatalogu:</label>
+                <input type="text" name="group_name" placeholder="np. Grecja_2024" required class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+            </div>
+            <div>
+                <label class="block text-slate-400 mb-1">ID grupy nadrzędnej (opcjonalnie, dla podfolderu w drzewie):</label>
+                <input type="number" name="parent_id" placeholder="Puste = główny poziom" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2 text-slate-300">
+            </div>
+            <div class="flex justify-end space-x-2 pt-2">
+                <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-semibold text-white">Zapisz</button>
+            </div>
+        </form>
+    </div>
+</div>
+<div id="move-files-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
+        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+            <h3 class="font-bold text-sm text-amber-400">🚚 Fizyczne przenoszenie plików na dysku / USB</h3>
+            <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+        </div>
+        <form hx-post="/actions/move-files"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              onsubmit="document.getElementById('move-files-modal').classList.add('hidden');"
+              class="space-y-4">
+            <div>
+                <label class="block text-slate-300 mb-1">Docelowa ścieżka katalogu (zostanie utworzona, jeśli nie istnieje):</label>
+                <input type="text" name="destination_path" placeholder="np. E:\Wakacje_Wybrane lub D:\Archiwum_2024" required
+                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white font-mono">
+                <p class="text-[11px] text-slate-400 mt-1">Przed przeniesieniem system automatycznie wykona kopię zapasową bazy SQLite i zaktualizuje ścieżki.</p>
+            </div>
+            <div class="flex justify-end space-x-2 pt-2">
+                <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
+                <button type="submit" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg font-semibold text-white">Przenieś pliki teraz</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,285 @@
+import ctypes
+from ctypes import wintypes
+import datetime
+import hashlib
+import os
+from pathlib import Path
+import re
+from typing import Optional, Tuple
+import uuid
+import cv2
+from PIL import ExifTags, Image, ImageOps
+from app.database import THUMBNAILS_DIR
+from app.models import MediaItem, WindowsVolume, MediaEmbedding
+from app.ai.embeddings import OnDemandClipEmbedder
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".gif", ".avif"}
+VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".mts", ".m2ts", ".3gp", ".mpg", ".mpeg"}
+
+DATE_PATTERNS = [
+    re.compile(r"(?P<year>19\d{2}|20\d{2})[-_]?(?P<month>0[1-9]|1[0-2])[-_]?(?P<day>0[1-9]|[12]\d|3[01])[-_\sT](?P<hour>[01]\d|2[0-3])[-_]?(?P<min>[0-5]\d)[-_]?(?P<sec>[0-5]\d)"),
+    re.compile(r"(?P<year>19\d{2}|20\d{2})[-_](?P<month>0[1-9]|1[0-2])[-_](?P<day>0[1-9]|[12]\d|3[01])"),
+    re.compile(r"IMG[-_](?P<year>19\d{2}|20\d{2})(?P<month>0[1-9]|1[0-2])(?P<day>0[1-9]|[12]\d|3[01])"),
+    re.compile(r"VID[-_](?P<year>19\d{2}|20\d{2})(?P<month>0[1-9]|1[0-2])(?P<day>0[1-9]|[12]\d|3[01])"),
+]
+
+
+class WindowsVolumeInspector:
+    @staticmethod
+    def get_volume_info(path: Path) -> Tuple[str, str, str]:
+        abs_path = path.resolve()
+        drive = os.path.splitdrive(str(abs_path))[0]
+        drive_root = (drive.rstrip("\\/") + "\\") if drive else (str(abs_path.anchor) if abs_path.anchor else "C:\\")
+
+        try:
+            kernel32 = ctypes.windll.kernel32
+            volume_name = ctypes.create_unicode_buffer(1024)
+            fs_name = ctypes.create_unicode_buffer(1024)
+            serial_number = wintypes.DWORD()
+            max_component_len = wintypes.DWORD()
+            flags = wintypes.DWORD()
+
+            res = kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(drive_root),
+                volume_name,
+                ctypes.sizeof(volume_name),
+                ctypes.byref(serial_number),
+                ctypes.byref(max_component_len),
+                ctypes.byref(flags),
+                fs_name,
+                ctypes.sizeof(fs_name),
+            )
+            if res:
+                vsn_int = serial_number.value
+                vsn_hex = f"{(vsn_int >> 16) & 0xFFFF:04X}-{vsn_int & 0xFFFF:04X}"
+                label = volume_name.value if volume_name.value else "UNNAMED_DRIVE"
+                return vsn_hex, label, drive_root
+        except Exception:
+            pass
+
+        return f"VOL_{drive.rstrip(':') or 'LOCAL'}", "LOCAL_STORAGE", drive_root
+
+
+class FastHasher:
+    CHUNK_SIZE = 64 * 1024
+
+    @classmethod
+    def hash_image_full(cls, file_path: Path) -> str:
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(cls.CHUNK_SIZE):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @classmethod
+    def hash_video_partial(cls, file_path: Path, file_size: int) -> str:
+        if file_size <= cls.CHUNK_SIZE * 3:
+            return cls.hash_image_full(file_path)
+        hasher = hashlib.sha256()
+        hasher.update(file_size.to_bytes(8, "big"))
+        with open(file_path, "rb") as f:
+            hasher.update(f.read(cls.CHUNK_SIZE))
+            f.seek(file_size // 2 - cls.CHUNK_SIZE // 2)
+            hasher.update(f.read(cls.CHUNK_SIZE))
+            f.seek(file_size - cls.CHUNK_SIZE)
+            hasher.update(f.read(cls.CHUNK_SIZE))
+        return hasher.hexdigest()
+
+    hash_image = hash_image_full
+    hash_video = hash_video_partial
+
+
+class MetadataDateResolver:
+    @staticmethod
+    def parse_exif(path: Path) -> Optional[datetime.datetime]:
+        try:
+            with Image.open(path) as img:
+                exif = img._getexif()
+                if not exif:
+                    return None
+                for tag_name in ["DateTimeOriginal", "DateTimeDigitized", "DateTime"]:
+                    for tag_id, name in ExifTags.TAGS.items():
+                        if name == tag_name and tag_id in exif:
+                            val = str(exif[tag_id]).strip("\x00").strip()
+                            try:
+                                return datetime.datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                            except ValueError:
+                                pass
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def parse_filename(cls, name: str) -> Optional[datetime.datetime]:
+        for pattern in DATE_PATTERNS:
+            m = pattern.search(name)
+            if m:
+                d = m.groupdict()
+                try:
+                    return datetime.datetime(
+                        int(d["year"]), int(d["month"]), int(d["day"]),
+                        int(d.get("hour", 0)), int(d.get("min", 0)), int(d.get("sec", 0)),
+                    )
+                except ValueError:
+                    continue
+        return None
+
+    @classmethod
+    def resolve_dates(cls, file_path: Path, is_image: bool):
+        stat = file_path.stat()
+        ctime = datetime.datetime.fromtimestamp(stat.st_ctime)
+        mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+        exif = cls.parse_exif(file_path) if is_image else None
+        fn_date = cls.parse_filename(file_path.name)
+
+        candidates = [
+            d for d in [exif, fn_date, ctime, mtime]
+            if d and datetime.datetime(1975, 1, 1) <= d <= datetime.datetime.utcnow() + datetime.timedelta(days=1)
+        ]
+        effective = min(candidates) if candidates else mtime
+
+        anomaly = False
+        reason = None
+        if is_image:
+            if not exif:
+                anomaly = True
+                reason = "Brak metadanych EXIF DateTimeOriginal"
+            elif abs((exif - effective).total_seconds()) > 86400:
+                anomaly = True
+                reason = "EXIF rozni sie od najstarszej daty o >24h"
+        return exif, fn_date, ctime, mtime, effective, anomaly, reason
+
+    resolve = resolve_dates
+
+
+class ThumbnailService:
+    @classmethod
+    def generate(cls, path: Path, media_id: str, is_img: bool) -> Tuple[str, Optional[int], Optional[int], Optional[float]]:
+        dest = THUMBNAILS_DIR / f"{media_id}.webp"
+        if is_img:
+            with Image.open(path) as img:
+                orig_w, orig_h = img.size
+                try:
+                    img.draft("RGB", (320, 320))
+                except Exception:
+                    pass
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((300, 300), Image.Resampling.BILINEAR)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(dest, "WEBP", quality=78, method=2)
+            return dest.name, orig_w, orig_h, None
+        else:
+            cap = cv2.VideoCapture(str(path.resolve()))
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                dur = float(frames / fps) if fps > 0 else 0.0
+
+                cap.set(cv2.CAP_PROP_POS_FRAMES, min(int(fps), max(0, int(frames - 1))))
+                success, frame = cap.read()
+                if not success or frame is None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    success, frame = cap.read()
+
+                if success and frame is not None:
+                    scale = min(300 / max(1, frame.shape[1]), 300 / max(1, frame.shape[0]))
+                    resized = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))))
+                    cv2.imwrite(str(dest.resolve()), resized, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
+                else:
+                    dest.touch()
+                return dest.name, w, h, dur
+            finally:
+                cap.release()
+
+
+class FileScannerService:
+    @classmethod
+    def process_file(cls, path: Path, volume: WindowsVolume, rel_override: Optional[str] = None) -> Optional[MediaItem]:
+        ext = path.suffix.lower()
+        is_img = ext in IMAGE_EXTS
+        is_vid = ext in VIDEO_EXTS
+        if not (is_img or is_vid):
+            return None
+
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+
+        if stat.st_size == 0:
+            return None
+
+        media_id = str(uuid.uuid4())
+        file_hash = FastHasher.hash_image_full(path) if is_img else FastHasher.hash_video_partial(path, stat.st_size)
+        exif, fn_dt, ctime, mtime, effective, anomaly, reason = MetadataDateResolver.resolve_dates(path, is_img)
+
+        try:
+            thumb_name, w, h, dur = ThumbnailService.generate(path, media_id, is_img)
+            corrupted = False
+        except Exception:
+            thumb_name = f"{media_id}.webp"
+            (THUMBNAILS_DIR / thumb_name).touch()
+            w, h, dur, corrupted = None, None, None, True
+
+        if rel_override:
+            rel_path = rel_override
+        else:
+            drive_root = Path(volume.last_known_drive_letter)
+            try:
+                rel_path = path.resolve().relative_to(drive_root.resolve()).as_posix()
+            except ValueError:
+                rel_path = path.name
+
+        now = datetime.datetime.utcnow()
+        item = MediaItem(
+            id=media_id,
+            volume_id=volume.id,
+            relative_path=rel_path,
+            file_name=path.name,
+            file_size_bytes=stat.st_size,
+            media_type="image" if is_img else "video",
+            mime_type=f"{'image' if is_img else 'video'}/{ext.lstrip('.')}",
+            file_hash=file_hash,
+            hash_algorithm="sha256" if is_img else "partial_3x64k",
+            is_primary_duplicate=True,
+            width=w,
+            height=h,
+            duration_seconds=dur,
+            exif_date=exif,
+            filename_date=fn_dt,
+            fs_ctime=ctime,
+            fs_mtime=mtime,
+            effective_date=effective,
+            has_date_anomaly=anomaly,
+            date_anomaly_reason=reason,
+            is_corrupted=corrupted,
+            is_blurry=False,
+            blur_score=None,
+            thumbnail_relative_path=thumb_name,
+            group_id=None,
+            is_trashed=False,
+            created_at=now,
+            updated_at=now,
+        )
+
+        # Automatyczne wyliczenie wektora 512-D z miniatury podczas indeksowania
+        thumb_full = THUMBNAILS_DIR / thumb_name
+        if not corrupted and thumb_full.exists() and thumb_full.stat().st_size > 0:
+            try:
+                blob = OnDemandClipEmbedder.generate_image_embedding(thumb_full)
+                item.embedding = MediaEmbedding(
+                    media_id=media_id, model_name=OnDemandClipEmbedder.MODEL_NAME, dimensions=512, vector=blob
+                )
+            except Exception:
+                pass
+
+        return item
