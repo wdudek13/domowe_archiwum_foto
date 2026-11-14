@@ -10,7 +10,9 @@ import re
 from typing import Dict, List, Optional, Tuple
 import uuid
 import cv2
-from PIL import ExifTags, Image, ImageOps
+from PIL import ExifTags, Image, ImageFile, ImageOps
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from app.database import THUMBNAILS_DIR
 from app.models import MediaItem, WindowsVolume, MediaEmbedding
 from app.ai.embeddings import OnDemandClipEmbedder
@@ -400,46 +402,164 @@ class MetadataDateResolver:
 class ThumbnailService:
     """Generates lightweight 300px WebP thumbnails on the local disk for offline browsing."""
 
+    @staticmethod
+    def is_valid_thumbnail(path: Path) -> bool:
+        """Checks that a cached thumbnail file exists, is non-empty, and has a valid WebP header."""
+        try:
+            if not path.exists() or not path.is_file():
+                return False
+            size = path.stat().st_size
+            if size == 0:
+                return False
+            with open(path, "rb") as fh:
+                hdr = fh.read(12)
+            if len(hdr) >= 12 and hdr[:4] == b"RIFF" and hdr[8:12] == b"WEBP":
+                return True
+            return size >= 100
+        except OSError:
+            return False
+
+    @classmethod
+    def extract_embedded_frame(cls, path: Path) -> Optional[Image.Image]:
+        """Scans raw file chunks for embedded JPEG / MJPEG image frames (e.g. EXIF preview or MJPEG stream)."""
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            sz = path.stat().st_size
+            if sz < 64:
+                return None
+            with open(path, "rb") as f:
+                chunk = f.read(min(4 * 1024 * 1024, sz))
+            pos = 0
+            best_im = None
+            import io
+            while True:
+                idx = chunk.find(b"\xff\xd8", pos)
+                if idx == -1 or idx > 2 * 1024 * 1024:
+                    break
+                try:
+                    im = Image.open(io.BytesIO(chunk[idx:]))
+                    im.load()
+                    w, h = im.size
+                    if w >= 64 and h >= 64:
+                        if best_im is None or (w * h > best_im.size[0] * best_im.size[1]):
+                            best_im = im
+                            if w >= 300 or h >= 300:
+                                break
+                except Exception as cand_exc:
+                    logger.debug("Skipping unreadable embedded offset %d: %s", idx, cand_exc)
+                pos = idx + 2
+            return best_im
+        except Exception as exc:
+            logger.debug("extract_embedded_frame failed for %s: %s", path, exc)
+            return None
+
+    @classmethod
+    def generate_placeholder(cls, dest: Path, title: str = "USZKODZONY PLIK") -> bool:
+        """Generates a crisp 300x300 WebP badge representing a corrupted or unreadable media item."""
+        try:
+            from PIL import ImageDraw
+            im = Image.new("RGB", (300, 300), (15, 23, 42))
+            draw = ImageDraw.Draw(im)
+            draw.rectangle([6, 6, 293, 293], outline=(225, 29, 72), width=3)
+            draw.rectangle([20, 105, 280, 185], fill=(136, 19, 55))
+            draw.text((150, 130), "PLIK USZKODZONY", fill=(254, 205, 211), anchor="mm")
+            draw.text((150, 160), title[:24], fill=(203, 213, 225), anchor="mm")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            im.save(dest, "WEBP", quality=75)
+            return True
+        except Exception as exc:
+            logger.debug("generate_placeholder failed for %s: %s", dest, exc)
+            return False
+
     @classmethod
     def generate(cls, path: Path, media_id: str, is_img: bool) -> Tuple[str, Optional[int], Optional[int], Optional[float]]:
         dest = THUMBNAILS_DIR / f"{media_id}.webp"
-        if is_img:
-            with Image.open(path) as img:
-                orig_w, orig_h = img.size
+        tmp_dest = THUMBNAILS_DIR / f".{media_id}.{uuid.uuid4().hex[:8]}.tmp.webp"
+        try:
+            if is_img:
+                orig_w: Optional[int] = None
+                orig_h: Optional[int] = None
                 try:
-                    img.draft("RGB", (320, 320))
-                except Exception as exc:
-                    logger.debug("Image.draft not applicable: %s", exc)
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((300, 300), Image.Resampling.BILINEAR)
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                img.save(dest, "WEBP", quality=78, method=2)
-            return dest.name, orig_w, orig_h, None
-        else:
-            cap = cv2.VideoCapture(str(path.resolve()))
-            try:
-                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                dur = float(frames / fps) if fps > 0 else 0.0
+                    with Image.open(path) as img:
+                        orig_w, orig_h = img.size
+                        try:
+                            img.draft("RGB", (320, 320))
+                        except Exception as exc:
+                            logger.debug("Image.draft not applicable: %s", exc)
+                        img = ImageOps.exif_transpose(img)
+                        img.thumbnail((300, 300), Image.Resampling.BILINEAR)
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        img.save(tmp_dest, "WEBP", quality=78, method=2)
+                except Exception as pil_exc:
+                    bgr = cv2.imread(str(path.resolve()), cv2.IMREAD_COLOR)
+                    if bgr is not None and bgr.size > 0:
+                        orig_h, orig_w = int(bgr.shape[0]), int(bgr.shape[1])
+                        scale = min(300 / max(1, orig_w), 300 / max(1, orig_h), 1.0)
+                        resized = cv2.resize(bgr, (max(1, int(orig_w * scale)), max(1, int(orig_h * scale))))
+                        cv2.imwrite(str(tmp_dest.resolve()), resized, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
+                    else:
+                        embedded = cls.extract_embedded_frame(path)
+                        if embedded is not None:
+                            orig_w, orig_h = embedded.size
+                            embedded = ImageOps.exif_transpose(embedded)
+                            embedded.thumbnail((300, 300), Image.Resampling.BILINEAR)
+                            if embedded.mode != "RGB":
+                                embedded = embedded.convert("RGB")
+                            embedded.save(tmp_dest, "WEBP", quality=78, method=2)
+                        else:
+                            cls.generate_placeholder(tmp_dest, path.name)
+                            orig_w, orig_h = None, None
 
-                cap.set(cv2.CAP_PROP_POS_FRAMES, min(int(fps), max(0, int(frames - 1))))
-                success, frame = cap.read()
-                if not success or frame is None:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if not cls.is_valid_thumbnail(tmp_dest):
+                    cls.generate_placeholder(tmp_dest, path.name)
+                tmp_dest.replace(dest)
+                return dest.name, orig_w, orig_h, None
+            else:
+                cap = cv2.VideoCapture(str(path.resolve()))
+                try:
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    dur = float(frames / fps) if fps > 0 else 0.0
+
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, min(int(fps), max(0, int(frames - 1))))
                     success, frame = cap.read()
+                    if not success or frame is None:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        success, frame = cap.read()
 
-                if success and frame is not None:
-                    scale = min(300 / max(1, frame.shape[1]), 300 / max(1, frame.shape[0]))
-                    resized = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))))
-                    cv2.imwrite(str(dest.resolve()), resized, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
-                else:
-                    raise RuntimeError(f"Could not decode video frame for {path}")
-                return dest.name, w, h, dur
-            finally:
-                cap.release()
+                    if success and frame is not None:
+                        scale = min(300 / max(1, frame.shape[1]), 300 / max(1, frame.shape[0]))
+                        resized = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))))
+                        cv2.imwrite(str(tmp_dest.resolve()), resized, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
+                    else:
+                        embedded = cls.extract_embedded_frame(path)
+                        if embedded is not None:
+                            w, h = embedded.size
+                            dur = None
+                            embedded.thumbnail((300, 300), Image.Resampling.BILINEAR)
+                            if embedded.mode != "RGB":
+                                embedded = embedded.convert("RGB")
+                            embedded.save(tmp_dest, "WEBP", quality=78, method=2)
+                        else:
+                            cls.generate_placeholder(tmp_dest, path.name)
+                            w, h, dur = None, None, None
+
+                    if not cls.is_valid_thumbnail(tmp_dest):
+                        cls.generate_placeholder(tmp_dest, path.name)
+                    tmp_dest.replace(dest)
+                    return dest.name, w, h, dur
+                finally:
+                    cap.release()
+        finally:
+            if tmp_dest.exists():
+                try:
+                    tmp_dest.unlink()
+                except OSError as rm_exc:
+                    logger.debug("Temp thumbnail cleanup skipped: %s", rm_exc)
 
 
 class FileScannerService:
@@ -483,7 +603,7 @@ class FileScannerService:
 
         try:
             thumb_name, w, h, dur = ThumbnailService.generate(path, media_id, is_img)
-            corrupted = False
+            corrupted = bool(w is None and h is None) if is_img else bool(w is None and h is None and dur is None)
         except Exception as exc:
             logger.debug("Thumbnail generation failed for %s: %s", path, exc)
             thumb_name = f"{media_id}.webp"

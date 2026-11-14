@@ -564,7 +564,7 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                 thumb_p = THUMBNAILS_DIR / thumb_rel
                 src_p = Path(drive_let) / rel_p
                 src_accessible = bool(vol_online and src_p.exists() and src_p.is_file())
-                thumb_ok = thumb_p.exists() and thumb_p.stat().st_size > 100
+                thumb_ok = ThumbnailService.is_valid_thumbnail(thumb_p)
 
                 # Quality / sharpness / defect inspection strictly requires direct disk access to the original file;
                 # ignore offline files so cached thumbnails are never mistaken for corrupted originals.
@@ -572,6 +572,17 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                     AI_BATCH_STATE["skipped_offline"] += 1
                     AI_BATCH_STATE["processed"] += 1
                     continue
+
+                repaired_dims: Optional[Tuple[Optional[int], Optional[int]]] = None
+                if not thumb_ok and src_accessible:
+                    try:
+                        _, rw, rh, _ = ThumbnailService.generate(src_p, mid, mtype == "image")
+                        if rw and rh:
+                            orig_w, orig_h = rw, rh
+                            repaired_dims = (rw, rh)
+                        thumb_ok = ThumbnailService.is_valid_thumbnail(thumb_p)
+                    except Exception as thumb_exc:
+                        logger.debug("AI batch thumbnail repair skipped for %s: %s", mid, thumb_exc)
 
                 readable_path = thumb_p if thumb_ok else (src_p if src_accessible else None)
                 if not readable_path and not (run_quality and src_accessible):
@@ -607,12 +618,18 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                     )
                     blurry = bool(blurry or extra_blurry)
 
-                computed_batch.append((mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags))
+                computed_batch.append((mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags, repaired_dims))
                 AI_BATCH_STATE["processed"] += 1
 
             if computed_batch:
                 with SessionLocal() as db:
-                    for mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags in computed_batch:
+                    for mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags, repaired_dims in computed_batch:
+                        if repaired_dims is not None:
+                            it_dim = db.get(MediaItem, mid)
+                            if it_dim:
+                                it_dim.width, it_dim.height = repaired_dims
+                                it_dim.is_corrupted = False
+
                         if run_tags:
                             db.execute(delete(MediaTag).where(MediaTag.media_id == mid))
                             for t_name, conf in tags:

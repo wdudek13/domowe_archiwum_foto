@@ -2487,6 +2487,254 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             db.expire_all()
             self.assertFalse(db.get(WindowsVolume, vr_id).is_online)
 
+    # ------------------------------------------------------------------
+    # 14. TRUNCATED JPEGs, TINY VALID WEBP THUMBNAILS & AI THUMB REPAIR
+    # ------------------------------------------------------------------
+    def test_truncated_jpeg_resilience_small_webp_and_preview_repair(self):
+        # 1) Create a slightly truncated camera JPEG (missing final 10 bytes / EOI marker)
+        full_jpg = self.drive_a / "full_src.jpg"
+        trunc_jpg = self.drive_a / "trunc_camera.jpg"
+        create_synthetic_jpeg(full_jpg, width=320, height=240, sharp=True)
+        raw_bytes = full_jpg.read_bytes()
+        trunc_jpg.write_bytes(raw_bytes[:-10])
+
+        # ThumbnailService must decode truncated JPEG cleanly and write valid WebP
+        t_id = str(uuid.uuid4())
+        t_name, tw, th, _ = ThumbnailService.generate(trunc_jpg, t_id, is_img=True)
+        self.assertEqual((tw, th), (320, 240))
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / t_name))
+
+        # OpenCV fallback in ThumbnailService when PIL raises while cv2.imread succeeds
+        t_cv_id = str(uuid.uuid4())
+        with patch("app.scanner.Image.open", side_effect=OSError("pil blocked")):
+            t_cv_name, cw, ch, _ = ThumbnailService.generate(full_jpg, t_cv_id, is_img=True)
+            self.assertEqual((cw, ch), (320, 240))
+            self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / t_cv_name))
+
+        # Quality, tagger, and vector embedder must all decode truncated JPEG without flagging corrupted
+        q_res = MediaQualityAnalyzer.analyze_image_detailed(trunc_jpg)
+        self.assertFalse(q_res["is_corrupted"])
+        self.assertIsNotNone(q_res["blur_score"])
+        vec = OnDemandClipEmbedder.generate_image_embedding(trunc_jpg)
+        self.assertEqual(len(vec), 512 * 4)
+        tagger = OnDemandObjectTagger()
+        tagger.model_path = self.root / "no_model.onnx"
+        tags = tagger.tag_image(trunc_jpg)
+        self.assertIsInstance(tags, list)
+
+        # Genuinely corrupted bytes must still be marked corrupted
+        garbage_jpg = self.drive_a / "garbage.jpg"
+        garbage_jpg.write_bytes(b"\x00\x00\x10\x27GARBAGE_NOT_JPEG")
+        self.assertTrue(MediaQualityAnalyzer.analyze_image_detailed(garbage_jpg)["is_corrupted"])
+
+        # Embedded frame extraction (e.g. Olympus/camera file with corrupted prefix but valid embedded JPEG)
+        embedded_raw = b"\x00\x00\x10\x27" * 50 + full_jpg.read_bytes()
+        embedded_file = self.drive_a / "embedded_prefix.jpg"
+        embedded_file.write_bytes(embedded_raw)
+        emb_id = str(uuid.uuid4())
+        emb_name, ew, eh, _ = ThumbnailService.generate(embedded_file, emb_id, is_img=True)
+        self.assertEqual((ew, eh), (320, 240))
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / emb_name))
+
+        # Test decode_image_array with embedded frame fallback (both color and grayscale)
+        from app.ai.quality import decode_image_array
+        arr_gray = decode_image_array(embedded_file, grayscale=True)
+        self.assertIsNotNone(arr_gray)
+        arr_col = decode_image_array(embedded_file, grayscale=False)
+        self.assertIsNotNone(arr_col)
+
+        # Totally unreadable image/video files must generate a valid placeholder thumbnail (so 404 is avoided)
+        unreadable_img = self.drive_a / "total_junk.jpg"
+        unreadable_img.write_bytes(b"TOTAL_JUNK_DATA_NO_JPEG")
+        uj_id = str(uuid.uuid4())
+        uj_name, uw, uh, _ = ThumbnailService.generate(unreadable_img, uj_id, is_img=True)
+        self.assertIsNone(uw)
+        self.assertIsNone(uh)
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / uj_name))
+
+        unreadable_vid = self.drive_a / "total_junk.mov"
+        unreadable_vid.write_bytes(b"TOTAL_JUNK_VIDEO_NO_MOOV")
+        uv_id = str(uuid.uuid4())
+        uv_name, vw, vh, vd = ThumbnailService.generate(unreadable_vid, uv_id, is_img=False)
+        self.assertIsNone(vw)
+        self.assertIsNone(vh)
+        self.assertIsNone(vd)
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / uv_name))
+
+        # Embedded frame inside a broken video (e.g. Motion-JPEG MOV with missing moov atom)
+        broken_vid = self.drive_a / "broken_mjpeg.mov"
+        broken_vid.write_bytes(b"\x00\x00\x00\x14pnot" + full_jpg.read_bytes())
+        bv_id = str(uuid.uuid4())
+        bv_name, bw, bh, _ = ThumbnailService.generate(broken_vid, bv_id, is_img=False)
+        self.assertEqual((bw, bh), (320, 240))
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / bv_name))
+
+        # MediaQualityAnalyzer.analyze_video on unreadable video returns corrupted=True, blurry=True, blur_score=0.0
+        v_corr, v_blur, v_sc = MediaQualityAnalyzer.analyze_video(unreadable_vid)
+        self.assertTrue(v_corr)
+        self.assertTrue(v_blur)
+        self.assertEqual(v_sc, 0.0)
+
+        # 2) Valid tiny WebP (<100 bytes, e.g. 44B-90B icon) on OFFLINE volume must NOT be unlinked
+        tiny_img = Image.new("RGB", (6, 6), (20, 80, 140))
+        tiny_id = str(uuid.uuid4())
+        tiny_thumb = self.thumbs_dir / f"{tiny_id}.webp"
+        tiny_img.save(tiny_thumb, "WEBP", quality=50)
+        self.assertLess(tiny_thumb.stat().st_size, 100)
+        self.assertTrue(ThumbnailService.is_valid_thumbnail(tiny_thumb))
+
+        with self.TestingSessionLocal() as db:
+            vol_on = WindowsVolume(
+                volume_serial_number="TRNC-1111",
+                volume_label="OnlineTrunc",
+                last_known_drive_letter=str(self.drive_a) + "\\",
+                is_online=True,
+            )
+            vol_off = WindowsVolume(
+                volume_serial_number="OFFL-2222",
+                volume_label="OfflineTiny",
+                last_known_drive_letter="Z:\\",
+                is_online=False,
+            )
+            db.add_all([vol_on, vol_off])
+            db.flush()
+
+            # Stale corrupted truncated JPEG with MISSING thumbnail (simulates pre-fix scan state)
+            stale_id = str(uuid.uuid4())
+            stale_item = MediaItem(
+                id=stale_id,
+                volume_id=vol_on.id,
+                relative_path="trunc_camera.jpg",
+                file_name="trunc_camera.jpg",
+                file_size_bytes=trunc_jpg.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="trunc_hash_1",
+                hash_algorithm="sha256",
+                is_corrupted=True,
+                blur_score=None,
+                fs_ctime=datetime.datetime(2024, 5, 1),
+                fs_mtime=datetime.datetime(2024, 5, 1),
+                effective_date=datetime.datetime(2024, 5, 1),
+                thumbnail_relative_path=f"{stale_id}.webp",
+            )
+            tiny_item = MediaItem(
+                id=tiny_id,
+                volume_id=vol_off.id,
+                relative_path="tiny_off.webp",
+                file_name="tiny_off.webp",
+                file_size_bytes=200,
+                media_type="image",
+                mime_type="image/webp",
+                file_hash="tiny_hash_2",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2024, 5, 2),
+                fs_mtime=datetime.datetime(2024, 5, 2),
+                effective_date=datetime.datetime(2024, 5, 2),
+                thumbnail_relative_path=tiny_thumb.name,
+            )
+            db.add_all([stale_item, tiny_item])
+            db.commit()
+
+        vsn_map = {"TRNC-1111": (str(self.drive_a) + "\\", "OnlineTrunc")}
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_map):
+            # Offline valid tiny (<100B) WebP must return 200 and survive intact
+            r_tiny = self.client.get(f"/media/thumbnails/{tiny_thumb.name}")
+            self.assertEqual(r_tiny.status_code, 200)
+            self.assertTrue(tiny_thumb.exists())
+
+            # /raw for flagged truncated JPEG must re-encode cleanly (200 image/jpeg), including OpenCV fallback
+            r_raw = self.client.get(f"/media/{stale_id}/raw")
+            self.assertEqual(r_raw.status_code, 200)
+            self.assertEqual(r_raw.headers.get("content-type"), "image/jpeg")
+
+            with patch("PIL.Image.open", side_effect=OSError("pil raw err")):
+                r_raw_cv = self.client.get(f"/media/{stale_id}/raw")
+                self.assertEqual(r_raw_cv.status_code, 200)
+                self.assertEqual(r_raw_cv.headers.get("content-type"), "image/jpeg")
+
+            # Also verify PIL fallback in decode_image_array when OpenCV imdecode + imread return None
+            with patch("app.ai.quality.cv2.imdecode", return_value=None), patch("app.ai.quality.cv2.imread", return_value=None):
+                q_pil = MediaQualityAnalyzer.analyze_image_detailed(full_jpg)
+                self.assertFalse(q_pil["is_corrupted"])
+
+            # Test error branches and RGBA/L modes for full scanner and quality coverage
+            with patch.object(MediaQualityAnalyzer, "_decode_grayscale", return_value=None):
+                q_dec_none = MediaQualityAnalyzer.analyze_image_detailed(full_jpg)
+                self.assertTrue(q_dec_none["is_corrupted"])
+                self.assertEqual(q_dec_none["blur_score"], 0.0)
+
+            with patch.object(MediaQualityAnalyzer, "_decode_grayscale", side_effect=RuntimeError("lum err")):
+                _, q_tags_err = MediaQualityAnalyzer.classify_quality_tags(full_jpg, False, True, 20.0)
+                self.assertIn("do_usuniecia:rozmyte", q_tags_err)
+
+            with patch("app.scanner.ThumbnailService.extract_embedded_frame", side_effect=RuntimeError("emb err")):
+                self.assertIsNone(decode_image_array(garbage_jpg))
+
+            # Test placeholder failure when dest path is invalid
+            self.assertFalse(ThumbnailService.generate_placeholder(Path("invalid/\x00/dest.webp")))
+            self.assertIsNone(ThumbnailService.extract_embedded_frame(Path("invalid/\x00/src.jpg")))
+
+            # Test embedded frame with L mode in ThumbnailService.generate (both img and vid)
+            l_img = Image.new("L", (120, 120), 128)
+            l_buf = io.BytesIO()
+            l_img.save(l_buf, format="JPEG")
+            l_file = self.drive_a / "embedded_l_mode.jpg"
+            l_file.write_bytes(b"\x00" * 80 + l_buf.getvalue())
+            l_id = str(uuid.uuid4())
+            ThumbnailService.generate(l_file, l_id, is_img=True)
+            self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / f"{l_id}.webp"))
+
+            l_vid = self.drive_a / "embedded_l_vid.mov"
+            l_vid.write_bytes(b"\x00" * 80 + l_buf.getvalue())
+            l_vid_id = str(uuid.uuid4())
+            ThumbnailService.generate(l_vid, l_vid_id, is_img=False)
+            self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / f"{l_vid_id}.webp"))
+
+            # Semantic fallback to src_p when thumbnail is invalid and embedding exception
+            from app.routers import semantic as semantic_mod
+            shutil.copy(full_jpg, self.drive_a / "sem_unique_src.jpg")
+            with self.TestingSessionLocal() as db_sem:
+                sem_vol = WindowsVolume(volume_serial_number="SEM-1", volume_label="SemVol", last_known_drive_letter=str(self.drive_a) + "\\", is_online=True)
+                db_sem.add(sem_vol)
+                db_sem.flush()
+                sem_item = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=sem_vol.id,
+                    relative_path="sem_unique_src.jpg",
+                    file_name="sem_unique_src.jpg",
+                    file_size_bytes=full_jpg.stat().st_size,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash="sem_hash_1",
+                    hash_algorithm="sha256",
+                    effective_date=datetime.datetime(2024, 1, 1),
+                    fs_ctime=datetime.datetime(2024, 1, 1),
+                    fs_mtime=datetime.datetime(2024, 1, 1),
+                    thumbnail_relative_path="missing_sem_thumb.webp",
+                )
+                db_sem.add(sem_item)
+                db_sem.commit()
+                db_sem.refresh(sem_item)
+                vec_fb = semantic_mod._compute_vector_in_ram(sem_item)
+                self.assertEqual(len(vec_fb), 512)
+                with patch.object(OnDemandClipEmbedder, "generate_image_embedding", side_effect=RuntimeError("vec err")):
+                    vec_zero = semantic_mod._compute_vector_in_ram(sem_item)
+                    self.assertEqual(len(vec_zero), 512)
+
+            # Run AI batch ('all') -> heals missing thumbnail AND clears false is_corrupted flag
+            r_ai = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "all", "scope": "all_drives", "unanalyzed_quality_only": "true", "run_sync": "true"},
+            )
+            self.assertEqual(r_ai.status_code, 200)
+            self.assertTrue(ThumbnailService.is_valid_thumbnail(self.thumbs_dir / f"{stale_id}.webp"))
+            with self.TestingSessionLocal() as db:
+                healed = db.get(MediaItem, stale_id)
+                self.assertFalse(healed.is_corrupted)
+                self.assertIsNotNone(healed.blur_score)
+                self.assertEqual((healed.width, healed.height), (320, 240))
+
 
 if __name__ == "__main__":
     unittest.main()

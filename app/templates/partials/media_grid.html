@@ -372,9 +372,11 @@
                     <td class="p-1.5">
                         <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                              onclick="openLightboxById('{{ item.id }}')"
+                             onerror="this.onerror=null; this.classList.add('hidden'); this.nextElementSibling && this.nextElementSibling.classList.remove('hidden');"
                              alt="{{ item.file_name }}"
                              style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                              class="w-10 h-10 object-cover rounded cursor-pointer border border-borderBg">
+                        <span class="hidden w-10 h-10 flex items-center justify-center text-xs bg-slate-950 rounded border border-borderBg text-slate-500">🖼️</span>
                     </td>
                     <td class="p-2 font-medium text-slate-200 cursor-pointer hover:text-indigo-400"
                         hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container">
@@ -452,9 +454,11 @@
             {% endif %}
             <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                  alt="{{ item.file_name }}" loading="lazy"
+                 onerror="this.onerror=null; this.classList.add('hidden'); this.nextElementSibling && this.nextElementSibling.classList.remove('hidden');"
                  style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                  onclick="openLightboxById('{{ item.id }}')"
                  class="w-full h-full object-cover cursor-pointer group-hover:scale-105 transition">
+            <div class="hidden w-full h-full flex items-center justify-center text-slate-500 text-xs bg-slate-950 cursor-pointer" onclick="openLightboxById('{{ item.id }}')">🖼️</div>
             {% if item.media_type == 'video' %}
             <span class="absolute bottom-1 left-1 bg-black/80 text-white text-[8px] px-1 rounded font-mono">&#9658; {{ "%.0f"|format(item.duration_seconds or 0) }}s</span>
             {% endif %}

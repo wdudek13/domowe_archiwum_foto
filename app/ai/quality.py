@@ -3,7 +3,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile, ImageOps
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger("MediaQuality")
 
@@ -12,6 +14,55 @@ try:
     register_heif_opener()
 except ImportError as exc:
     logger.debug("pillow_heif not available: %s", exc)
+
+
+def decode_image_array(path: Path, grayscale: bool = False) -> Optional[np.ndarray]:
+    """
+    Decodes an image into a NumPy array (grayscale or BGR), falling back cleanly
+    for Unicode paths, HEIC/HEIF files, and slightly truncated camera JPEGs.
+    """
+    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
+        return None
+    ext = path.suffix.lower()
+    flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+    if ext not in (".heic", ".heif"):
+        try:
+            file_bytes = np.fromfile(str(path.resolve()), dtype=np.uint8)
+            arr = cv2.imdecode(file_bytes, flag)
+            if arr is not None and arr.size > 0:
+                return arr
+        except Exception as exc:
+            logger.debug("cv2.imdecode fallback for %s: %s", path, exc)
+        try:
+            arr = cv2.imread(str(path.resolve()), flag)
+            if arr is not None and arr.size > 0:
+                return arr
+        except Exception as exc:
+            logger.debug("cv2.imread fallback for %s: %s", path, exc)
+
+    try:
+        with Image.open(path) as pil_img:
+            pil_img = ImageOps.exif_transpose(pil_img)
+            if grayscale:
+                return np.array(pil_img.convert("L"))
+            rgb = np.array(pil_img.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception as exc:
+        logger.debug("PIL image decode fallback failed for %s: %s", path, exc)
+
+    try:
+        from app.scanner import ThumbnailService
+        embedded = ThumbnailService.extract_embedded_frame(path)
+        if embedded is not None:
+            embedded = ImageOps.exif_transpose(embedded)
+            if grayscale:
+                return np.array(embedded.convert("L"))
+            rgb = np.array(embedded.convert("RGB"))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception as exc:
+        logger.debug("Embedded frame decode fallback failed for %s: %s", path, exc)
+
+    return None
 
 
 class MediaQualityAnalyzer:
@@ -74,12 +125,7 @@ class MediaQualityAnalyzer:
 
     @classmethod
     def _decode_grayscale(cls, path: Path) -> Optional[np.ndarray]:
-        ext = path.suffix.lower()
-        if ext in (".heic", ".heif"):
-            with Image.open(path) as pil_img:
-                return np.array(pil_img.convert("L"))
-        file_bytes = np.fromfile(str(path.resolve()), dtype=np.uint8)
-        return cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+        return decode_image_array(path, grayscale=True)
 
     @classmethod
     def _detect_luminance_defects(cls, gray: np.ndarray) -> List[str]:
@@ -110,8 +156,8 @@ class MediaQualityAnalyzer:
         if not path.exists() or path.stat().st_size == 0:
             return {
                 "is_corrupted": True,
-                "is_blurry": False,
-                "blur_score": None,
+                "is_blurry": True,
+                "blur_score": 0.0,
                 "reasons": ["uszkodzone"],
                 "quality_tags": ["do_usuniecia", "do_usuniecia:uszkodzone"],
             }
@@ -124,8 +170,8 @@ class MediaQualityAnalyzer:
             if gray is None or gray.size == 0:
                 return {
                     "is_corrupted": True,
-                    "is_blurry": False,
-                    "blur_score": None,
+                    "is_blurry": True,
+                    "blur_score": 0.0,
                     "reasons": ["uszkodzone"],
                     "quality_tags": ["do_usuniecia", "do_usuniecia:uszkodzone"],
                 }
@@ -157,8 +203,8 @@ class MediaQualityAnalyzer:
             logger.debug("Image analysis failed for %s: %s", path, exc)
             return {
                 "is_corrupted": True,
-                "is_blurry": False,
-                "blur_score": None,
+                "is_blurry": True,
+                "blur_score": 0.0,
                 "reasons": ["uszkodzone"],
                 "quality_tags": ["do_usuniecia", "do_usuniecia:uszkodzone"],
             }
@@ -209,14 +255,14 @@ class MediaQualityAnalyzer:
     @classmethod
     def analyze_video(cls, path: Path, threshold: float = DEFAULT_BLUR_THRESHOLD) -> Tuple[bool, bool, Optional[float]]:
         if not path.exists() or path.stat().st_size == 0:
-            return True, False, None
+            return True, True, 0.0
         cap = cv2.VideoCapture(str(path.resolve()))
         if not cap.isOpened():
-            return True, False, None
+            return True, True, 0.0
         try:
             ret, frame = cap.read()
             if not ret or frame is None:
-                return True, False, None
+                return True, True, 0.0
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             score = cls._compute_subject_sharpness(gray)
             return False, bool(score < threshold), score

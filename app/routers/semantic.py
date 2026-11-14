@@ -44,8 +44,9 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
     ):
         return np.frombuffer(item.embedding.vector, dtype=np.float32)
 
+    from app.scanner import ThumbnailService
     thumb_p = THUMBNAILS_DIR / item.thumbnail_relative_path
-    if not thumb_p.exists() or thumb_p.stat().st_size < 100:
+    if not ThumbnailService.is_valid_thumbnail(thumb_p):
         if item.volume:
             src_p = Path(item.volume.last_known_drive_letter) / item.relative_path
             if src_p.exists():

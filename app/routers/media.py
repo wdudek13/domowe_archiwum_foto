@@ -117,13 +117,13 @@ def apply_media_filters(
     if unvectored_only:
         stmt = stmt.where(~MediaItem.id.in_(select(MediaEmbedding.media_id)))
     if unanalyzed_quality_only:
-        stmt = stmt.where(MediaItem.blur_score.is_(None))
+        stmt = stmt.where(MediaItem.blur_score.is_(None), MediaItem.is_corrupted == False)
     if year:
         stmt = stmt.where(extract("year", MediaItem.effective_date) == year)
     if anomaly_only:
         stmt = stmt.where(MediaItem.has_date_anomaly == True)
     if blurry_only:
-        stmt = stmt.where(MediaItem.is_blurry == True)
+        stmt = stmt.where(or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True))
     if duplicates_only:
         dup_hashes_subq = (
             select(MediaItem.file_hash)
@@ -221,7 +221,12 @@ def build_sidebar_context(db: Session) -> dict:
     total_all = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False)) or 0
     total_anomalies = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.has_date_anomaly == True)) or 0
     total_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_primary_duplicate == False)) or 0
-    total_blurry = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_blurry == True)) or 0
+    total_blurry = db.scalar(
+        select(func.count(MediaItem.id)).where(
+            MediaItem.is_trashed == False,
+            or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
+        )
+    ) or 0
     total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
     total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id))) or 0
     total_untagged = db.scalar(
@@ -231,7 +236,11 @@ def build_sidebar_context(db: Session) -> dict:
         select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, ~MediaItem.id.in_(select(MediaEmbedding.media_id)))
     ) or 0
     total_unanalyzed_quality = db.scalar(
-        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.blur_score.is_(None))
+        select(func.count(MediaItem.id)).where(
+            MediaItem.is_trashed == False,
+            MediaItem.blur_score.is_(None),
+            MediaItem.is_corrupted == False,
+        )
     ) or 0
     total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
     total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
@@ -405,8 +414,10 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
     except ImportError as exc:
         logger.debug("pillow_heif not available: %s", exc)
 
+    from app.scanner import ThumbnailService, IMAGE_EXTS
+
     p = THUMBNAILS_DIR / filename
-    if not p.exists() or p.stat().st_size < 100:
+    if not ThumbnailService.is_valid_thumbnail(p):
         media_id = filename.rsplit(".", 1)[0]
         it = db.scalars(select(MediaItem).options(joinedload(MediaItem.volume)).where(MediaItem.id == media_id)).unique().first()
         if it and it.volume:
@@ -415,7 +426,6 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
             src_p = Path(it.volume.last_known_drive_letter) / it.relative_path
             if it.volume.is_online and src_p.exists():
                 try:
-                    from app.scanner import ThumbnailService, IMAGE_EXTS
                     _, w, h, _ = ThumbnailService.generate(src_p, it.id, src_p.suffix.lower() in IMAGE_EXTS)
                     if w and h:
                         it.width = w
@@ -425,20 +435,20 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
                 except Exception as exc:
                     logger.debug("Lazy thumbnail regeneration failed: %s", exc)
 
-    if p.exists() and p.stat().st_size < 100:
-        try:
-            p.unlink()
-        except OSError as rm_exc:
-            logger.debug("Could not remove empty thumbnail %s: %s", p, rm_exc)
-        raise HTTPException(status_code=404)
-    if not p.exists():
+    if not ThumbnailService.is_valid_thumbnail(p):
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError as rm_exc:
+                logger.debug("Could not remove empty thumbnail %s: %s", p, rm_exc)
         raise HTTPException(status_code=404)
     return FileResponse(p, media_type="image/webp", headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/{media_id}/raw")
 def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageFile, ImageOps
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
@@ -454,8 +464,8 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
         if full_path.exists() and full_path.is_file():
             ext = full_path.suffix.lower()
 
-            # 1. On-the-fly conversion of HEIC/HEIF/TIFF images to JPEG
-            if ext in (".heic", ".heif", ".tiff", ".tif"):
+            # 1. On-the-fly conversion of HEIC/HEIF/TIFF or previously flagged truncated/damaged images to clean JPEG
+            if ext in (".heic", ".heif", ".tiff", ".tif") or (it.is_corrupted and it.media_type == "image"):
                 try:
                     with Image.open(full_path) as img:
                         img = ImageOps.exif_transpose(img)
@@ -467,6 +477,14 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
                         return StreamingResponse(buf, media_type="image/jpeg")
                 except Exception as exc:
                     logger.debug("On-the-fly JPEG conversion failed: %s", exc)
+                    if it.is_corrupted and it.media_type == "image":
+                        from app.ai.quality import decode_image_array
+                        import cv2
+                        arr = decode_image_array(full_path, grayscale=False)
+                        if arr is not None:
+                            ok, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                            if ok:
+                                return StreamingResponse(io.BytesIO(enc.tobytes()), media_type="image/jpeg")
 
             # 2. On-the-fly transcoding of .MOV / .MKV / .AVI / .WMV to browser-playable H.264 MP4
             if ext in (".mov", ".mkv", ".avi", ".wmv", ".mts", ".m2ts", ".flv", ".3gp"):
@@ -492,8 +510,9 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
 
             return FileResponse(full_path, media_type=it.mime_type, filename=it.file_name)
 
+    from app.scanner import ThumbnailService
     thumb_path = THUMBNAILS_DIR / it.thumbnail_relative_path
-    if thumb_path.exists():
+    if ThumbnailService.is_valid_thumbnail(thumb_path):
         return FileResponse(thumb_path, media_type="image/webp")
     raise HTTPException(status_code=404, detail="File offline and no thumbnail cached")
 

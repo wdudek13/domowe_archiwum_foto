@@ -116,9 +116,16 @@
             <button type="button" onclick="prevLightbox()" class="lightbox-nav-btn text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10094;</button>
             <div id="lightbox-viewport" class="flex-1 h-full w-full flex items-center justify-center overflow-hidden relative">
                 <img id="lightbox-img" src="" draggable="false"
+                     onerror="this.classList.add('hidden'); document.getElementById('lightbox-error').classList.remove('hidden');"
                      class="hidden max-w-full max-h-[84vh] object-contain rounded shadow-2xl cursor-grab select-none">
                 <video id="lightbox-video" controls autoplay
+                       onerror="this.classList.add('hidden'); document.getElementById('lightbox-error').classList.remove('hidden');"
                        class="hidden max-w-full max-h-[84vh] rounded shadow-2xl bg-black outline-none"></video>
+                <div id="lightbox-error" class="hidden text-center text-slate-300 bg-slate-900/90 border border-rose-800/70 rounded-2xl p-6 max-w-md space-y-2">
+                    <div class="text-3xl">⚠️</div>
+                    <div class="font-semibold text-sm text-rose-300">Nie można wyświetlić podglądu pliku</div>
+                    <div class="text-xs text-slate-400">Plik źródłowy jest uszkodzony, w nieobsługiwanym formacie wideo albo nośnik jest odłączony (offline) i brak miniatury.</div>
+                </div>
             </div>
             <button type="button" onclick="nextLightbox()" class="lightbox-nav-btn text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10095;</button>
         </div>
@@ -454,6 +461,8 @@
             const item = lightboxItems[currentLightboxIndex];
             const imgEl = document.getElementById('lightbox-img');
             const vidEl = document.getElementById('lightbox-video');
+            const errEl = document.getElementById('lightbox-error');
+            if (errEl) errEl.classList.add('hidden');
 
             lbZoom = 1.0;
             lbPanX = 0;
