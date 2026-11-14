@@ -306,9 +306,7 @@ class MetadataDateResolver:
 
     @staticmethod
     def matches_folder_date(dt: datetime.datetime, folder_dt: datetime.datetime, precision: str) -> bool:
-        if precision == "day":
-            return abs((dt.date() - folder_dt.date()).days) <= 1
-        if precision == "month":
+        if precision in ("day", "month"):
             return dt.year == folder_dt.year and dt.month == folder_dt.month
         return dt.year == folder_dt.year
 
@@ -322,101 +320,67 @@ class MetadataDateResolver:
         folder_info: Optional[Tuple[datetime.datetime, str, str]] = None,
     ) -> Tuple[datetime.datetime, bool, Optional[str]]:
         """
-        Determines the most probable effective date across EXIF, filename, folder name, and filesystem
-        timestamps, flagging anomalies whenever available sources contradict each other or file timestamps
-        were modified during copying. Missing EXIF alone is NOT treated as an anomaly.
+        Resolves effective date per user specification:
+        a) If EXIF / container date exists, use it directly with NO anomaly.
+        b) Otherwise use file creation date (`ctime`) when it agrees with filename and folder
+           date (day may differ in folder names as long as month and year match) -> NO anomaly.
+        c) On conflict in (b) or copy-updated `ctime`, pick the oldest existing date and flag a date discrepancy.
         """
         now_upper = datetime.datetime.utcnow() + datetime.timedelta(days=1)
         valid_exif = exif if cls._is_valid_date(exif, now_upper) else None
+        if valid_exif is not None:
+            return valid_exif, False, None
+
         valid_fn = fn_date if cls._is_valid_date(fn_date, now_upper) else None
         valid_ctime = ctime if cls._is_valid_date(ctime, now_upper) else now_upper
         valid_mtime = mtime if cls._is_valid_date(mtime, now_upper) else now_upper
-        fs_oldest = min(valid_ctime, valid_mtime)
-        fs_newest = max(valid_ctime, valid_mtime)
 
         valid_folder: Optional[Tuple[datetime.datetime, str, str]] = None
         if folder_info and cls._is_valid_date(folder_info[0], now_upper):
             valid_folder = folder_info
 
-        # Select the most probable date from available evidence
-        if valid_exif and valid_fn:
-            fn_date_only = valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
-            if cls.dates_agree(valid_exif, valid_fn, date_only=fn_date_only):
-                effective = valid_exif
-            elif valid_folder:
-                f_dt, f_prec, _ = valid_folder
-                exif_ok = cls.matches_folder_date(valid_exif, f_dt, f_prec)
-                fn_ok = cls.matches_folder_date(valid_fn, f_dt, f_prec)
-                if exif_ok and not fn_ok:
-                    effective = valid_exif
-                elif fn_ok and not exif_ok:
-                    effective = valid_fn
-                else:
-                    effective = min(valid_exif, valid_fn)
-            else:
-                exif_fs = cls.dates_agree(valid_exif, fs_oldest)
-                fn_fs = cls.dates_agree(valid_fn, fs_oldest, date_only=fn_date_only)
-                if exif_fs and not fn_fs:
-                    effective = valid_exif
-                elif fn_fs and not exif_fs:
-                    effective = valid_fn
-                else:
-                    effective = min(valid_exif, valid_fn)
-        elif valid_exif:
-            if valid_folder and not cls.matches_folder_date(valid_exif, valid_folder[0], valid_folder[1]) and cls.matches_folder_date(fs_oldest, valid_folder[0], valid_folder[1]):
-                effective = fs_oldest
-            else:
-                effective = valid_exif
-        elif valid_fn:
-            if valid_folder and not cls.matches_folder_date(valid_fn, valid_folder[0], valid_folder[1]) and cls.matches_folder_date(fs_oldest, valid_folder[0], valid_folder[1]):
-                effective = fs_oldest
-            else:
-                effective = valid_fn
-        elif valid_folder:
-            f_dt, f_prec, _ = valid_folder
-            if cls.matches_folder_date(fs_oldest, f_dt, f_prec):
-                effective = fs_oldest
-            else:
-                effective = f_dt
-        else:
-            effective = fs_oldest
-
-        # Flag genuine discrepancies across sources or copy-modified filesystem dates
         reasons: List[str] = []
-        if valid_exif and valid_fn:
-            fn_date_only = valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
-            if not cls.dates_agree(valid_exif, valid_fn, date_only=fn_date_only):
-                reasons.append(
-                    f"Niezgodność dat: EXIF ({valid_exif.strftime('%Y-%m-%d')}) vs nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) (>24h)"
-                )
+        fn_date_only = valid_fn is not None and valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
+
+        if valid_fn and not cls.dates_agree(valid_ctime, valid_fn, date_only=fn_date_only):
+            reasons.append(
+                f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) vs nazwa pliku ({valid_fn.strftime('%Y-%m-%d')})"
+            )
 
         if valid_folder:
             f_dt, f_prec, f_seg = valid_folder
-            if valid_exif and not cls.matches_folder_date(valid_exif, f_dt, f_prec):
-                reasons.append(f"Niezgodność dat: EXIF ({valid_exif.strftime('%Y-%m-%d')}) z folderem '{f_seg}'")
+            if not cls.matches_folder_date(valid_ctime, f_dt, f_prec):
+                reasons.append(
+                    f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) z folderem '{f_seg}'"
+                )
             if valid_fn and not cls.matches_folder_date(valid_fn, f_dt, f_prec):
-                reasons.append(f"Niezgodność dat: nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) z folderem '{f_seg}'")
+                reasons.append(
+                    f"Niezgodność dat: nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) z folderem '{f_seg}'"
+                )
 
-        if valid_exif or valid_fn:
-            ref_date_only = valid_exif is None and valid_fn is not None and valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
-            if not cls.dates_agree(fs_oldest, effective, date_only=ref_date_only) or not cls.dates_agree(fs_newest, effective, date_only=ref_date_only):
-                reasons.append(
-                    f"Niezgodność dat: data pliku ({fs_newest.strftime('%Y-%m-%d')}) zmodyfikowana przy kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
-                )
-        elif valid_folder:
-            f_dt, f_prec, f_seg = valid_folder
-            if not cls.matches_folder_date(fs_oldest, f_dt, f_prec) or not cls.matches_folder_date(fs_newest, f_dt, f_prec):
-                reasons.append(
-                    f"Niezgodność dat: data pliku ({fs_newest.strftime('%Y-%m-%d')}) z folderem '{f_seg}' po kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
-                )
-        elif abs((valid_ctime - valid_mtime).total_seconds()) > 86400:
+        if (valid_ctime - valid_mtime).total_seconds() > 86400:
             reasons.append(
                 f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) zmodyfikowane przy kopiowaniu vs modyfikacja ({valid_mtime.strftime('%Y-%m-%d')})"
             )
 
-        if reasons:
-            return effective, True, "; ".join(reasons)[:255]
-        return effective, False, None
+        if not reasons:
+            return valid_ctime, False, None
+
+        precise_candidates = [valid_ctime, valid_mtime]
+        if valid_fn is not None:
+            precise_candidates.append(valid_fn)
+        oldest_precise = min(precise_candidates)
+
+        if valid_folder:
+            f_dt, f_prec, _ = valid_folder
+            if not cls.matches_folder_date(oldest_precise, f_dt, f_prec) and f_dt < oldest_precise:
+                effective = f_dt
+            else:
+                effective = oldest_precise
+        else:
+            effective = oldest_precise
+
+        return effective, True, "; ".join(reasons)[:255]
 
     @classmethod
     def resolve_dates(cls, file_path: Path, is_image: bool, rel_path: Optional[str] = None):
@@ -472,7 +436,7 @@ class ThumbnailService:
                     resized = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))))
                     cv2.imwrite(str(dest.resolve()), resized, [int(cv2.IMWRITE_WEBP_QUALITY), 78])
                 else:
-                    dest.touch()
+                    raise RuntimeError(f"Could not decode video frame for {path}")
                 return dest.name, w, h, dur
             finally:
                 cap.release()
@@ -523,7 +487,12 @@ class FileScannerService:
         except Exception as exc:
             logger.debug("Thumbnail generation failed for %s: %s", path, exc)
             thumb_name = f"{media_id}.webp"
-            (THUMBNAILS_DIR / thumb_name).touch()
+            bad_thumb = THUMBNAILS_DIR / thumb_name
+            if bad_thumb.exists():
+                try:
+                    bad_thumb.unlink()
+                except OSError as rm_exc:
+                    logger.debug("Cleanup partial thumb %s: %s", bad_thumb, rm_exc)
             w, h, dur, corrupted = None, None, None, True
 
         is_backup = cls.is_in_backup_folder(rel_path)

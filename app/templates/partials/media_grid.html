@@ -511,8 +511,13 @@
                     <div class="aspect-square bg-slate-900 overflow-hidden cursor-pointer relative" onclick="openLightboxById('{{ item.id }}')">
                         <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                              alt="{{ item.file_name }}" loading="lazy"
+                             onerror="this.onerror=null; this.classList.add('hidden'); this.nextElementSibling && this.nextElementSibling.classList.remove('hidden');"
                              style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                              class="w-full h-full object-cover transition duration-200 group-hover:scale-105">
+                        <div class="hidden w-full h-full flex flex-col items-center justify-center text-slate-500 text-[10px] p-2 text-center bg-slate-950">
+                            <span class="text-lg mb-1">🖼️</span>
+                            <span>Brak miniatury{% if not item.volume.is_online %} (Offline){% endif %}</span>
+                        </div>
 
                         {% if item.media_type == 'video' %}
                         <div class="absolute inset-0 flex items-center justify-center bg-black/30 group-hover:bg-black/10 transition">

@@ -26,7 +26,7 @@ from app.models import (
     BackgroundJob,
 )
 from app.operation_log import OperationLogger, ProcessManager
-from app.scanner import WindowsVolumeInspector, FileScannerService, ThumbnailService, IMAGE_EXTS, VIDEO_EXTS
+from app.scanner import WindowsVolumeInspector, FileScannerService, MetadataDateResolver, ThumbnailService, IMAGE_EXTS, VIDEO_EXTS
 from app.storage_ops import StorageAutomationService
 from app.ai.quality import MediaQualityAnalyzer
 from app.ai.tagger import OnDemandObjectTagger
@@ -352,6 +352,7 @@ AI_BATCH_STATE = {
     "tagged": 0,
     "vectors": 0,
     "blurry": 0,
+    "skipped_offline": 0,
     "result_summary": "",
 }
 
@@ -388,6 +389,84 @@ def _run_storage_analysis_in_batch(job_id: int, item_ids: List[str], analysis_ty
                 f"pominięte offline={res['offline_skipped']}, duplikatów={res['dup_total']}."
             )
 
+        if analysis_type == "date_discrepancy":
+            svc.refresh_volumes_online_status()
+            volumes_map = {v.id: v for v in db.scalars(select(WindowsVolume)).all()}
+            checked = 0
+            anomalies = 0
+            updated = 0
+            for start in range(0, len(item_ids), 250):
+                if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
+                    ProcessManager.update_progress(
+                        job_id,
+                        remaining_ids=item_ids[start:],
+                        status="STOPPED",
+                        message=f"Zatrzymano analizę niezgodności dat na {checked}/{len(item_ids)}.",
+                        db=db,
+                    )
+                    return f"Zatrzymano analizę niezgodności dat na {checked}/{len(item_ids)}."
+
+                chunk_ids = item_ids[start : start + 250]
+                chunk_items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(chunk_ids))).all())
+                for it in chunk_items:
+                    checked += 1
+                    vol = volumes_map.get(it.volume_id)
+                    src_p = (Path(vol.last_known_drive_letter) / it.relative_path) if vol else None
+                    online_ok = bool(vol and vol.is_online and src_p and src_p.exists() and src_p.is_file())
+
+                    exif_dt = it.exif_date
+                    ctime = it.fs_ctime
+                    mtime = it.fs_mtime
+                    if online_ok and src_p is not None:
+                        try:
+                            st = src_p.stat()
+                            ctime = datetime.datetime.fromtimestamp(st.st_ctime)
+                            mtime = datetime.datetime.fromtimestamp(st.st_mtime)
+                            it.fs_ctime = ctime
+                            it.fs_mtime = mtime
+                        except OSError as exc:
+                            logger.debug("Stat refresh skipped for %s: %s", src_p, exc)
+                        if exif_dt is None and it.media_type == "image":
+                            parsed_exif = MetadataDateResolver.parse_exif(src_p)
+                            if parsed_exif is not None:
+                                exif_dt = parsed_exif
+                                it.exif_date = parsed_exif
+
+                    fn_dt = MetadataDateResolver.parse_filename(it.file_name) or it.filename_date
+                    it.filename_date = fn_dt
+                    folder_info = MetadataDateResolver.parse_folder_date(Path(it.relative_path), rel_path=it.relative_path)
+                    new_eff, new_anom, new_reason = MetadataDateResolver.evaluate_date_sources(
+                        exif_dt, fn_dt, ctime, mtime, folder_info=folder_info
+                    )
+                    if (
+                        it.effective_date != new_eff
+                        or bool(it.has_date_anomaly) != bool(new_anom)
+                        or it.date_anomaly_reason != new_reason
+                    ):
+                        updated += 1
+                    it.effective_date = new_eff
+                    it.has_date_anomaly = new_anom
+                    it.date_anomaly_reason = new_reason
+                    if new_anom:
+                        anomalies += 1
+
+                db.commit()
+                AI_BATCH_STATE["processed"] = checked
+                ProcessManager.update_progress(
+                    job_id,
+                    processed_delta=len(chunk_items),
+                    remaining_ids=item_ids[start + len(chunk_ids) :],
+                    message=f"Sprawdzanie dat: {checked}/{len(item_ids)} (niezgodności: {anomalies})...",
+                    db=db,
+                )
+
+            msg = (
+                f"Analiza niezgodności dat: sprawdzono {checked} plików | "
+                f"Wykryto niezgodności: {anomalies} | Zaktualizowano: {updated}."
+            )
+            OperationLogger.log("DATE_DISCREPANCY_SCAN", msg, status="OK", db=db)
+            return msg
+
         unbacked_list = svc.detect_files_without_backup(recluster=True)
         AI_BATCH_STATE["processed"] = len(item_ids)
         msg = (
@@ -408,12 +487,13 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
     AI_BATCH_STATE["tagged"] = 0
     AI_BATCH_STATE["vectors"] = 0
     AI_BATCH_STATE["blurry"] = 0
+    AI_BATCH_STATE["skipped_offline"] = 0
     AI_BATCH_STATE["result_summary"] = ""
 
     run_tags = analysis_type in ("all", "tags")
     run_vectors = analysis_type in ("all", "vectors")
     run_quality = analysis_type in ("all", "quality")
-    is_storage_analysis = analysis_type in ("duplicates_fast", "duplicates_exact", "unbacked")
+    is_storage_analysis = analysis_type in ("duplicates_fast", "duplicates_exact", "unbacked", "date_discrepancy")
 
     stopped_midway = False
     tagger = OnDemandObjectTagger() if run_tags else None
@@ -433,6 +513,9 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
 
         if tagger is not None:
             tagger.open_session()
+
+        with SessionLocal() as db:
+            StorageAutomationService(db).refresh_volumes_online_status()
 
         chunk_size = 50
         for start in range(0, len(item_ids), chunk_size):
@@ -459,13 +542,14 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                         WindowsVolume.last_known_drive_letter,
                         MediaItem.width,
                         MediaItem.height,
+                        WindowsVolume.is_online,
                     )
                     .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
                     .where(MediaItem.id.in_(batch_ids))
                 ).all()
 
             computed_batch = []
-            for idx_in_batch, (mid, mtype, thumb_rel, rel_p, drive_let, orig_w, orig_h) in enumerate(rows):
+            for idx_in_batch, (mid, mtype, thumb_rel, rel_p, drive_let, orig_w, orig_h, vol_online) in enumerate(rows):
                 if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
                     stopped_midway = True
                     remaining = item_ids[start + idx_in_batch :]
@@ -479,24 +563,31 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
 
                 thumb_p = THUMBNAILS_DIR / thumb_rel
                 src_p = Path(drive_let) / rel_p
-                readable_path = (
-                    thumb_p
-                    if (thumb_p.exists() and thumb_p.stat().st_size > 100)
-                    else (src_p if src_p.exists() else None)
-                )
+                src_accessible = bool(vol_online and src_p.exists() and src_p.is_file())
+                thumb_ok = thumb_p.exists() and thumb_p.stat().st_size > 100
 
-                if not readable_path:
+                # Quality / sharpness / defect inspection strictly requires direct disk access to the original file;
+                # ignore offline files so cached thumbnails are never mistaken for corrupted originals.
+                if analysis_type == "quality" and not src_accessible:
+                    AI_BATCH_STATE["skipped_offline"] += 1
+                    AI_BATCH_STATE["processed"] += 1
+                    continue
+
+                readable_path = thumb_p if thumb_ok else (src_p if src_accessible else None)
+                if not readable_path and not (run_quality and src_accessible):
+                    if not src_accessible:
+                        AI_BATCH_STATE["skipped_offline"] += 1
                     AI_BATCH_STATE["processed"] += 1
                     continue
 
                 tags = []
-                if run_tags and tagger is not None:
+                if run_tags and tagger is not None and readable_path is not None:
                     tags = tagger.tag_image(readable_path)
                     if mtype == "video":
                         tags.append(("wideo", 1.0))
 
                 vec_blob = None
-                if run_vectors:
+                if run_vectors and readable_path is not None:
                     try:
                         vec_blob = OnDemandClipEmbedder.generate_image_embedding(readable_path)
                     except Exception as exc:
@@ -504,22 +595,24 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
 
                 corrupted, blurry, score = False, False, None
                 quality_tags: List[str] = []
-                if run_quality:
-                    if mtype == "video" and readable_path == src_p:
-                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_video(readable_path)
+                quality_done = False
+                if run_quality and src_accessible:
+                    quality_done = True
+                    if mtype == "video":
+                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_video(src_p)
                     else:
-                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(readable_path)
+                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(src_p)
                     extra_blurry, quality_tags = MediaQualityAnalyzer.classify_quality_tags(
-                        readable_path, corrupted, blurry, score, orig_dims=(orig_w, orig_h)
+                        src_p, corrupted, blurry, score, orig_dims=(orig_w, orig_h)
                     )
                     blurry = bool(blurry or extra_blurry)
 
-                computed_batch.append((mid, tags, vec_blob, corrupted, blurry, score, quality_tags))
+                computed_batch.append((mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags))
                 AI_BATCH_STATE["processed"] += 1
 
             if computed_batch:
                 with SessionLocal() as db:
-                    for mid, tags, vec_blob, corrupted, blurry, score, quality_tags in computed_batch:
+                    for mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags in computed_batch:
                         if run_tags:
                             db.execute(delete(MediaTag).where(MediaTag.media_id == mid))
                             for t_name, conf in tags:
@@ -538,7 +631,7 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                             )
                             AI_BATCH_STATE["vectors"] += 1
 
-                        if run_quality:
+                        if run_quality and quality_done:
                             it_obj = db.get(MediaItem, mid)
                             if it_obj:
                                 it_obj.is_corrupted = corrupted
@@ -574,9 +667,14 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
         gc.collect()
         AI_BATCH_STATE["running"] = False
         if not stopped_midway:
+            offline_note = (
+                f" | Pominięto offline (brak dostępu do pliku): {AI_BATCH_STATE['skipped_offline']}"
+                if AI_BATCH_STATE.get("skipped_offline", 0) > 0
+                else ""
+            )
             final_msg = AI_BATCH_STATE.get("result_summary") or (
                 f"Zakończono analizę AI ({analysis_type}): {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} | "
-                f"Otagowano: {AI_BATCH_STATE['tagged']} | Wektory: {AI_BATCH_STATE['vectors']} | Rozmyte/Wadliwe: {AI_BATCH_STATE['blurry']}"
+                f"Otagowano: {AI_BATCH_STATE['tagged']} | Wektory: {AI_BATCH_STATE['vectors']} | Rozmyte/Wadliwe: {AI_BATCH_STATE['blurry']}{offline_note}"
             )
             ProcessManager.finish_job(
                 job_id,
@@ -609,9 +707,14 @@ def get_ai_batch_status():
             f"<span class='text-emerald-400 text-xs font-semibold'>✓ {st['result_summary']}</span>",
             headers={"HX-Trigger": "refresh-all"},
         )
+    offline_note = (
+        f" | Pominięto offline (brak dostępu do pliku): {st['skipped_offline']}"
+        if st.get("skipped_offline", 0) > 0
+        else ""
+    )
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>"
-        f"✓ Analiza AI ({st['analysis_type']}) zakończona! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Wektory 512-D: {st['vectors']} | Rozmyte/Wadliwe: {st['blurry']}"
+        f"✓ Analiza AI ({st['analysis_type']}) zakończona! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Wektory 512-D: {st['vectors']} | Rozmyte/Wadliwe: {st['blurry']}{offline_note}"
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -649,6 +752,7 @@ def trigger_full_ai_analysis(
     if AI_BATCH_STATE["running"]:
         return get_ai_batch_status()
 
+    StorageAutomationService(db).refresh_volumes_online_status()
     effective_scope = target_drive_scope if target_drive_scope in ("all_drives",) or target_drive_scope.startswith("volume:") else scope
     items = resolve_target_items(
         db,
@@ -680,6 +784,7 @@ def trigger_full_ai_analysis(
         "duplicates_fast": "Szybka analiza duplikatów (baza SHA-256 / hash wideo)",
         "duplicates_exact": "Dokładna analiza duplikatów 100% (weryfikacja binarna na dyskach)",
         "unbacked": "Analiza plików bez kopii zapasowej na innym urządzeniu",
+        "date_discrepancy": "Analiza niezgodności dat (EXIF / utworzenie pliku / nazwa / folder)",
     }
     item_ids = [it.id for it in items]
     job_id = ProcessManager.create_job(
@@ -702,7 +807,7 @@ def trigger_full_ai_analysis(
 def get_status_and_logs_panel(request: Request, db: Session = Depends(get_db)):
     summary = ProcessManager.get_jobs_summary(db)
     logs = OperationLogger.get_recent_logs(db, limit=100)
-    volumes = list(db.scalars(select(WindowsVolume)).all())
+    volumes = StorageAutomationService(db).refresh_volumes_online_status()
     return render_template(
         request,
         "partials/status_panel.html",
@@ -813,11 +918,14 @@ def _render_backup_panel_response(
     )
     all_unbacked = svc.detect_files_without_backup(recluster=True)
     pair_map = plan.get("unbacked_pair_map", {})
+    all_duplicate_rows = plan.get("duplicate_rows", [])
     if selected_pairs is not None:
         selected_set = set(effective_pair_keys)
         filtered_unbacked_count = sum(1 for uf in all_unbacked if pair_map.get(uf.id, "") in selected_set)
+        filtered_dups_count = sum(1 for dr in all_duplicate_rows if dr.get("pair_key_str", "") in selected_set)
     else:
         filtered_unbacked_count = len(all_unbacked)
+        filtered_dups_count = len(all_duplicate_rows)
 
     volumes_list = list(plan["volumes"].values())
     vol_space = svc.get_volume_space_map(volumes_list)
@@ -831,6 +939,9 @@ def _render_backup_panel_response(
             "unbacked_files": all_unbacked[:300],
             "unbacked_total": filtered_unbacked_count,
             "unbacked_all_total": len(all_unbacked),
+            "duplicate_files": all_duplicate_rows[:300],
+            "duplicates_total": filtered_dups_count,
+            "duplicates_all_total": len(all_duplicate_rows),
             "volumes": volumes_list,
             "vol_space": vol_space,
             "execution_result": execution_result,

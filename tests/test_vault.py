@@ -243,7 +243,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual(fn_dt, datetime.datetime(2021, 5, 10, 12, 30, 45))
         self.assertEqual(effective_dt, fn_dt)
         self.assertTrue(anomaly)
-        self.assertIn("kopiowaniu", reason)
+        self.assertIn("Niezgodność dat", reason)
 
         # Missing EXIF alone WITHOUT source discrepancy must NOT trigger an anomaly
         plain_img = create_synthetic_jpeg(self.drive_a / "random_shot.jpg")
@@ -260,7 +260,19 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual((f_eff.year, f_eff.month), (2019, 8))
         self.assertIn("folderem", f_rsn)
 
-        # Day-level folder date and copy-modified ctime vs mtime discrepancy
+        # Rule (b): Day-level folder may differ in DAY as long as YEAR and MONTH match -> NO anomaly
+        same_ym_eff, same_ym_anom, same_ym_rsn = MetadataDateResolver.evaluate_date_sources(
+            exif=None,
+            fn_date=None,
+            ctime=datetime.datetime(2022, 7, 28, 14, 0),
+            mtime=datetime.datetime(2022, 7, 28, 14, 0),
+            folder_info=(datetime.datetime(2022, 7, 15, 0, 0), "day", "2022-07-15"),
+        )
+        self.assertFalse(same_ym_anom)
+        self.assertIsNone(same_ym_rsn)
+        self.assertEqual(same_ym_eff, datetime.datetime(2022, 7, 28, 14, 0))
+
+        # Rule (c): Copy-modified ctime with older mtime matching folder -> picks mtime and flags anomaly
         day_eff, day_anom, _ = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=None,
@@ -271,7 +283,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertTrue(day_anom)
         self.assertEqual(day_eff, datetime.datetime(2022, 7, 15, 14, 0))
 
-        # Copy discrepancy without folder/EXIF/filename when ctime differs >24h from mtime
+        # Copy discrepancy without folder/EXIF/filename when ctime is >24h newer than mtime
         cp_eff, cp_anom, cp_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=None,
@@ -283,86 +295,59 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual(cp_eff, datetime.datetime(2021, 3, 20, 9, 0))
         self.assertIn("kopiowaniu", cp_rsn)
 
-        # Discrepancy between EXIF and filename resolved by matching folder date
-        cons_eff, cons_anom, cons_rsn = MetadataDateResolver.evaluate_date_sources(
+        # Rule (a): Whenever EXIF exists, return EXIF with NO anomaly even if other sources differ
+        ex_only_eff, ex_only_anom, ex_only_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=datetime.datetime(2023, 5, 10, 12, 0),
-            fn_date=datetime.datetime(2021, 5, 10, 12, 0),
-            ctime=datetime.datetime(2026, 1, 1, 10, 0),
-            mtime=datetime.datetime(2026, 1, 1, 10, 0),
-            folder_info=(datetime.datetime(2023, 1, 1, 0, 0), "year", "Wakacje_2023"),
-        )
-        self.assertTrue(cons_anom)
-        self.assertEqual(cons_eff.year, 2023)
-        self.assertIn(">24h", cons_rsn)
-
-        # Folder confirms filename when EXIF disagrees, and EXIF/filename agreement
-        eff_fn_fold, anom_fn_fold, _ = MetadataDateResolver.evaluate_date_sources(
-            exif=datetime.datetime(2024, 5, 10, 12, 0),
             fn_date=datetime.datetime(2021, 5, 10, 12, 0),
             ctime=datetime.datetime(2026, 1, 1, 10, 0),
             mtime=datetime.datetime(2026, 1, 1, 10, 0),
             folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
         )
-        self.assertTrue(anom_fn_fold)
-        self.assertEqual(eff_fn_fold.year, 2021)
+        self.assertFalse(ex_only_anom)
+        self.assertIsNone(ex_only_rsn)
+        self.assertEqual(ex_only_eff, datetime.datetime(2023, 5, 10, 12, 0))
 
+        # Rule (c) with no EXIF: filename older than folder -> picks oldest (2019-05-10)
+        eff_fn_fold, anom_fn_fold, _ = MetadataDateResolver.evaluate_date_sources(
+            exif=None,
+            fn_date=datetime.datetime(2019, 5, 10, 12, 0),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
+            mtime=datetime.datetime(2026, 1, 1, 10, 0),
+            folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
+        )
+        self.assertTrue(anom_fn_fold)
+        self.assertEqual(eff_fn_fold.year, 2019)
+
+        # Rule (b) all agree -> returns ctime with NO anomaly
         eff_agree, anom_agree, _ = MetadataDateResolver.evaluate_date_sources(
-            exif=datetime.datetime(2022, 4, 5, 11, 0),
+            exif=None,
             fn_date=datetime.datetime(2022, 4, 5, 11, 0),
             ctime=datetime.datetime(2022, 4, 5, 11, 5),
             mtime=datetime.datetime(2022, 4, 5, 11, 5),
             folder_info=MetadataDateResolver.parse_folder_date(self.drive_a / "2022-04-05" / "a.jpg", rel_path="abcdef0123456789abcdef/2022-04-05/a.jpg"),
         )
         self.assertFalse(anom_agree)
-        self.assertEqual(eff_agree, datetime.datetime(2022, 4, 5, 11, 0))
+        self.assertEqual(eff_agree, datetime.datetime(2022, 4, 5, 11, 5))
 
-        # No folder: fs_oldest breaks tie between EXIF and filename; or overrides single wrong EXIF/fn
-        self.assertEqual(
-            MetadataDateResolver.evaluate_date_sources(
-                exif=datetime.datetime(2022, 1, 2, 10, 0),
-                fn_date=datetime.datetime(2024, 1, 2, 10, 0),
-                ctime=datetime.datetime(2022, 1, 2, 10, 0),
-                mtime=datetime.datetime(2022, 1, 2, 10, 0),
-            )[0].year,
-            2022,
-        )
-        self.assertEqual(
-            MetadataDateResolver.evaluate_date_sources(
-                exif=datetime.datetime(2024, 1, 2, 10, 0),
-                fn_date=datetime.datetime(2022, 1, 2, 10, 0),
-                ctime=datetime.datetime(2022, 1, 2, 10, 0),
-                mtime=datetime.datetime(2022, 1, 2, 10, 0),
-            )[0].year,
-            2022,
-        )
-        self.assertEqual(
-            MetadataDateResolver.evaluate_date_sources(
-                exif=datetime.datetime(2026, 1, 2, 10, 0),
-                fn_date=None,
-                ctime=datetime.datetime(2020, 6, 5, 10, 0),
-                mtime=datetime.datetime(2020, 6, 5, 10, 0),
-                folder_info=(datetime.datetime(2020, 6, 1, 0, 0), "month", "2020-06"),
-            )[0].year,
-            2020,
-        )
+        # Rule (c) folder month older than filename -> picks folder (2020-06) and flags discrepancy
         self.assertEqual(
             MetadataDateResolver.evaluate_date_sources(
                 exif=None,
                 fn_date=datetime.datetime(2026, 1, 2, 10, 0),
-                ctime=datetime.datetime(2020, 6, 5, 10, 0),
-                mtime=datetime.datetime(2020, 6, 5, 10, 0),
+                ctime=datetime.datetime(2025, 6, 5, 10, 0),
+                mtime=datetime.datetime(2025, 6, 5, 10, 0),
                 folder_info=(datetime.datetime(2020, 6, 1, 0, 0), "month", "2020-06"),
             )[0].year,
             2020,
         )
 
-        # Test EXIF parsing on JpegImageFile (valid and >24h diff anomaly)
+        # Test EXIF parsing on JpegImageFile (rule a: EXIF always takes priority without anomaly)
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "2023:05:10 12:30:45"}):
             ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(img_file, is_image=True)
             self.assertEqual(ex_dt, datetime.datetime(2023, 5, 10, 12, 30, 45))
-            self.assertEqual(eff_dt, fn_dt)
-            self.assertTrue(anom)
-            self.assertIn(">24h", rsn)
+            self.assertEqual(eff_dt, ex_dt)
+            self.assertFalse(anom)
+            self.assertIsNone(rsn)
 
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "bad-date"}):
             self.assertIsNone(MetadataDateResolver.parse_exif(img_file))
@@ -2337,11 +2322,37 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 col_reloaded = db.get(MediaItem, col_id)
                 self.assertEqual(col_reloaded.hash_algorithm, "sha256_verified")
                 self.assertTrue(col_reloaded.is_primary_duplicate)
+
+                # Verify offline items are IGNORED cleanly by quality AI analysis (no corrupted marks/thumbnails)
+                off_obj = db.scalar(select(MediaItem).where(MediaItem.file_name == "offline.jpg"))
+                self.assertIsNotNone(off_obj)
+                off_thumb = self.thumbs_dir / off_obj.thumbnail_relative_path
+                off_thumb.write_bytes(b"VALID_CACHED_PREVIEW_BYTES_" * 10)
+                r_q_off = self.client.post(
+                    "/actions/analyze-all",
+                    data={
+                        "analysis_type": "quality",
+                        "scope": "selected",
+                        "selected_ids": [off_obj.id],
+                        "run_sync": "true",
+                    },
+                )
+                self.assertEqual(r_q_off.status_code, 200)
+                self.assertIn("Pominięto offline", r_q_off.text)
+                db.expire_all()
+                off_reloaded = db.get(MediaItem, off_obj.id)
+                self.assertIsNone(off_reloaded.blur_score)
+                self.assertFalse(off_reloaded.is_corrupted)
+
+                # 0-byte corrupted thumbnail file for offline media must be cleaned up and return 404 (not empty bytes)
+                off_thumb.write_bytes(b"")
+                r_th_empty = self.client.get(f"/media/thumbnails/{off_obj.thumbnail_relative_path}")
+                self.assertEqual(r_th_empty.status_code, 404)
+                self.assertFalse(off_thumb.exists())
+
                 # Delete synthetic collision & offline items before backup tests
                 db.delete(col_reloaded)
-                off_obj = db.scalar(select(MediaItem).where(MediaItem.file_name == "offline.jpg"))
-                if off_obj:
-                    db.delete(off_obj)
+                db.delete(off_reloaded)
                 db.commit()
 
             r_ub = self.client.post(
@@ -2349,6 +2360,32 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 data={"analysis_type": "unbacked", "scope": "all_drives", "run_sync": "true"},
             )
             self.assertIn("Analiza kopii zapasowych", r_ub.text)
+
+            # On-demand date discrepancy analysis via 'Analizuj AI' (EXIF cleared, conflict picks oldest + flags)
+            self.assertIn("date_discrepancy", r_home.text)
+            with self.TestingSessionLocal() as db:
+                a1_obj = db.get(MediaItem, a1_id)
+                a1_obj.exif_date = datetime.datetime(2023, 6, 15, 10, 0)
+                a1_obj.has_date_anomaly = True
+                a1_obj.date_anomaly_reason = "Stara niezgodnosc"
+                db.commit()
+            r_dd = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "date_discrepancy", "scope": "all_drives", "run_sync": "true"},
+            )
+            self.assertEqual(r_dd.status_code, 200)
+            self.assertIn("Analiza niezgodności dat", r_dd.text)
+            with self.TestingSessionLocal() as db:
+                a1_re = db.get(MediaItem, a1_id)
+                self.assertFalse(a1_re.has_date_anomaly)
+                self.assertEqual(a1_re.effective_date, datetime.datetime(2023, 6, 15, 10, 0))
+                self.assertIsNotNone(
+                    db.scalar(select(BackgroundJob).where(BackgroundJob.title.like("%Analiza niezgodności dat%")))
+                )
+            # Also cover stop branch during date_discrepancy batch
+            with patch.object(ProcessManager, "is_stop_requested", return_value=True):
+                j_dd_stop = ProcessManager.create_job("ai_analysis", "DD Stop", [a1_id])
+                actions_module._run_background_ai_batch(j_dd_stop, [a1_id], analysis_type="date_discrepancy")
 
             # 6) Backup & Deduplication: parse_pair_keys, pair selection, backup_only vs dedup_only modes
             self.assertIsNone(StorageAutomationService.parse_pair_keys(None))
@@ -2360,6 +2397,9 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(r_bp.status_code, 200)
             self.assertIn("filterUnbackedBySelectedPairs", r_bp.text)
             self.assertIn("Zakres operacji", r_bp.text)
+            self.assertIn("Lista duplikatów z wybranych urządzeń", r_bp.text)
+            self.assertIn("duplicate-file-row", r_bp.text)
+            self.assertIn("kopia_wakacje.jpg", r_bp.text)
 
             r_off_mode = self.client.post(
                 "/actions/prepare-offline-report",
@@ -2430,6 +2470,22 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(job_un.status, "COMPLETED")
                 # Original file on Disk C remains untouched on disk
                 self.assertTrue(img_c1.exists())
+
+        # 8) Disconnected hardware VSN must be detected as OFFLINE even if another drive took its drive letter
+        with self.TestingSessionLocal() as db:
+            vol_reused = WindowsVolume(
+                volume_serial_number="1111-2222",
+                volume_label="Odlaczony_USB",
+                last_known_drive_letter="C:\\",
+                is_online=True,
+            )
+            db.add(vol_reused)
+            db.commit()
+            vr_id = vol_reused.id
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"9999-8888": ("C:\\", "Inny_Dysk")}):
+                StorageAutomationService(db).refresh_volumes_online_status()
+            db.expire_all()
+            self.assertFalse(db.get(WindowsVolume, vr_id).is_online)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from collections import defaultdict
 import datetime
 import logging
 from pathlib import Path
+import re
 import shutil
 from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy import select, text, update, delete, func
@@ -37,9 +38,17 @@ class StorageAutomationService:
                 vol.is_online = True
                 vol.last_seen_at = now
             else:
-                vol.is_online = Path(vol.last_known_drive_letter).exists()
-                if vol.is_online:
-                    vol.last_seen_at = now
+                dl = (vol.last_known_drive_letter or "").strip()
+                is_drive_root = bool(re.fullmatch(r"[A-Za-z]:\\?", dl))
+                is_hw_vsn = bool(re.fullmatch(r"[0-9A-F]{4}-[0-9A-F]{4}", vol.volume_serial_number or ""))
+                if connected_map and (is_drive_root or is_hw_vsn):
+                    # Real drive enumeration found no match for this VSN, so the drive is genuinely disconnected
+                    # even if another USB device reused the same Windows drive letter.
+                    vol.is_online = False
+                else:
+                    vol.is_online = bool(dl and Path(dl).exists())
+                    if vol.is_online:
+                        vol.last_seen_at = now
 
             if vol.is_online:
                 try:
@@ -599,11 +608,35 @@ class StorageAutomationService:
 
         ordered_pairs.sort(key=lambda p: (not p["both_online"], not p["one_online"], p["pair_key"]))
 
+        duplicate_rows: List[Dict[str, Any]] = []
+        for pair_entry in ordered_pairs:
+            p_key_str = pair_entry["pair_key_str"]
+            for dup in pair_entry["tasks"]["duplicates_to_delete"]:
+                dup_v = volumes.get(dup["dup_vol_id"])
+                ref_v = volumes.get(dup["ref_vol_id"])
+                duplicate_rows.append(
+                    {
+                        "pair_key_str": p_key_str,
+                        "dup_item_id": dup["dup_item_id"],
+                        "file_name": dup["file_name"],
+                        "file_size": int(dup.get("file_size") or 0),
+                        "dup_vol_id": dup["dup_vol_id"],
+                        "dup_vol_label": dup_v.volume_label if dup_v else "?",
+                        "dup_vol_letter": dup_v.last_known_drive_letter if dup_v else "?",
+                        "dup_relative_path": dup["dup_relative_path"],
+                        "ref_vol_id": dup["ref_vol_id"],
+                        "ref_vol_label": ref_v.volume_label if ref_v else "?",
+                        "ref_vol_letter": ref_v.last_known_drive_letter if ref_v else "?",
+                        "ref_relative_path": dup["ref_relative_path"],
+                    }
+                )
+
         return {
             "volumes": volumes,
             "volume_space_summary": volume_space_summary,
             "important_candidates": important_candidates,
             "ordered_pairs": ordered_pairs,
+            "duplicate_rows": duplicate_rows,
             "unbacked_pair_map": unbacked_pair_map,
             "unbacked_count": unbacked_count,
             "redundant_duplicates_count": redundant_duplicates_count,

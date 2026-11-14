@@ -263,6 +263,7 @@ def build_sidebar_context(db: Session) -> dict:
 
 
 def build_search_context(request: Request, db: Session) -> dict:
+    StorageAutomationService(db).refresh_volumes_online_status()
     qp = request.query_params
     q = qp.get("q")
     media_type = qp.get("media_type", "all")
@@ -409,8 +410,10 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
         media_id = filename.rsplit(".", 1)[0]
         it = db.scalars(select(MediaItem).options(joinedload(MediaItem.volume)).where(MediaItem.id == media_id)).unique().first()
         if it and it.volume:
+            StorageAutomationService(db).refresh_volumes_online_status()
+            db.refresh(it.volume)
             src_p = Path(it.volume.last_known_drive_letter) / it.relative_path
-            if src_p.exists():
+            if it.volume.is_online and src_p.exists():
                 try:
                     from app.scanner import ThumbnailService, IMAGE_EXTS
                     _, w, h, _ = ThumbnailService.generate(src_p, it.id, src_p.suffix.lower() in IMAGE_EXTS)
@@ -422,6 +425,12 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
                 except Exception as exc:
                     logger.debug("Lazy thumbnail regeneration failed: %s", exc)
 
+    if p.exists() and p.stat().st_size < 100:
+        try:
+            p.unlink()
+        except OSError as rm_exc:
+            logger.debug("Could not remove empty thumbnail %s: %s", p, rm_exc)
+        raise HTTPException(status_code=404)
     if not p.exists():
         raise HTTPException(status_code=404)
     return FileResponse(p, media_type="image/webp", headers={"Cache-Control": "no-cache"})

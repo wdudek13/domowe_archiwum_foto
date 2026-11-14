@@ -91,7 +91,7 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         cur.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS media_tags_fts USING fts5(media_id UNINDEXED, tag, source_model UNINDEXED);"
         )
-        # Clear legacy false-positive date anomalies caused solely by missing EXIF metadata
+        # Clear legacy false-positive date anomalies caused solely by missing EXIF or copy timestamps on EXIF files
         if m_cols:
             cur.execute(
                 """
@@ -101,6 +101,19 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
                    OR date_anomaly_reason LIKE 'Brak EXIF%';
                 """
             )
+            if "exif_date" in m_cols:
+                cur.execute(
+                    """
+                    UPDATE media_items
+                    SET effective_date = exif_date, has_date_anomaly = 0, date_anomaly_reason = NULL
+                    WHERE exif_date IS NOT NULL
+                      AND has_date_anomaly = 1
+                      AND (
+                          date_anomaly_reason LIKE 'Niezgodność dat: EXIF%'
+                          OR date_anomaly_reason LIKE 'Niezgodność dat: data pliku%'
+                      );
+                    """
+                )
         conn.commit()
     except sqlite3.Error as exc:
         logger.warning("Schema migration warning: %s", exc)
