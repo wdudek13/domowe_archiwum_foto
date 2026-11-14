@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import io
+import gzip
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,11 @@ import uuid
 
 import cv2
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 import numpy as np
 from PIL import Image, JpegImagePlugin
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 
 from app.database import Base, ensure_schema_migrations, get_db, set_sqlite_pragma
 from app.models import (
@@ -1380,7 +1382,19 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         mgr.create_backup("t2")
         b3 = mgr.create_backup("t3")
         self.assertTrue(b3.exists())
-        self.assertLessEqual(len(list(self.backup_dir.glob("media_vault_*.db"))), 2)
+        self.assertLessEqual(len(list(self.backup_dir.glob("media_vault_*.db*"))), 2)
+
+        # Test create_backup on minimal legacy db without media_embeddings
+        mgr_legacy = BackupManager(db_path=legacy_db, backup_dir=self.backup_dir)
+        b_leg = mgr_legacy.create_backup("leg_noclip", exclude_embeddings=True)
+        self.assertTrue(b_leg.exists())
+
+        # Test restore_from_backup with corrupted .gz file
+        broken_gz = self.root / "corrupted_backup.db.gz"
+        broken_gz.write_bytes(b"INVALID_GZIP_STREAM")
+        with self.assertRaises(RuntimeError) as ctx:
+            mgr.restore_from_backup(broken_gz)
+        self.assertIn("Błąd dekompresji", str(ctx.exception))
 
         # Test GoogleDriveManager authentication, folder creation, MD5 verification, and purge_local
         sample = create_synthetic_jpeg(self.drive_a / "gdrive_test.jpg")
@@ -1700,6 +1714,36 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(jb_bad_id)})
             self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(jb_async_id)})
 
+        # Test _run_background_ai_batch exception handler
+        j_ai_fail = ProcessManager.create_job("ai_analysis", "AI Fail Job", [mv_id])
+        with patch("app.routers.actions.get_db", side_effect=RuntimeError("DBBatchFail")):
+            _run_background_ai_batch(j_ai_fail, [mv_id], analysis_type="tags")
+
+        # Test date_discrepancy stop request in _run_background_ai_batch
+        j_ano_stop = ProcessManager.create_job("ai_analysis", "Date Anomaly Stop", [mv_id])
+        AI_BATCH_STATE["stop_requested"] = True
+        _run_background_ai_batch(j_ano_stop, [mv_id], analysis_type="date_discrepancy")
+        AI_BATCH_STATE["stop_requested"] = False
+
+        # Test execute_scan with empty path and disk_usage exception
+        res_empty = execute_scan("   ")
+        self.assertEqual(res_empty["status"], "error")
+        with patch("shutil.disk_usage", side_effect=Exception("DiskUsageFail")):
+            execute_scan(str(self.drive_a))
+
+        # Test WindowsVolumeInspector exception fallbacks
+        with patch("ctypes.windll.kernel32.GetVolumeInformationW", side_effect=Exception("Kernel32Err")):
+            vsn_f, lbl_f, root_f = WindowsVolumeInspector.get_volume_info(self.drive_a)
+            self.assertEqual(lbl_f, "LOCAL_STORAGE")
+        with patch("ctypes.windll.kernel32.GetLogicalDrives", side_effect=Exception("DrivesErr")):
+            self.assertEqual(WindowsVolumeInspector.get_connected_vsn_map(), {})
+
+        # Test render_template fallback in media.py
+        from app.routers.media import render_template as media_render_template, templates as media_templates
+        fake_req = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+        with patch.object(media_templates, "TemplateResponse", side_effect=[TypeError("OldStarlette"), "ok"]):
+            self.assertEqual(media_render_template(fake_req, "partials/media_grid.html", {}), "ok")
+
         # Additional action branches: consolidate offline, rename-volume invalid, restore-from-trash all, empty-trash selected & trashed group, move-files existing volume, gdrive empty folders & sync error
         with self.TestingSessionLocal() as db:
             vol_z_obj = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "V-MV-Z"))
@@ -1788,7 +1832,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(added_cb, 2)
 
         # Test GoogleDriveManager.list_db_backups & download_and_verify_backup + BackupManager.restore_from_backup + /actions/gdrive-restore-db
-        snapshot_path = BackupManager(db_path=self.db_path, backup_dir=self.root / "cloud_snaps").create_backup("cloud_snap")
+        snapshot_path = BackupManager(db_path=self.db_path, backup_dir=self.root / "cloud_snaps").create_backup("cloud_snap", compress=False)
         snap_bytes = snapshot_path.read_bytes()
         snap_md5 = GoogleDriveManager.compute_local_md5(snapshot_path)
 
@@ -1814,6 +1858,14 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             bm_restore.restore_from_backup(self.root / "missing_backup.db")
 
+        # Check integrity failure when PRAGMA integrity_check != ['ok']
+        with patch("sqlite3.connect") as mock_conn:
+            mock_cur = MagicMock()
+            mock_cur.fetchall.return_value = [("corrupt page",)]
+            mock_conn.return_value.cursor.return_value = mock_cur
+            with self.assertRaises(RuntimeError):
+                bm_restore.check_integrity()
+
         bad_sqlite = self.root / "not_a_db.db"
         bad_sqlite.write_bytes(b"not sqlite content")
         with self.assertRaises(RuntimeError):
@@ -1826,6 +1878,19 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         c_empty.close()
         with self.assertRaises(RuntimeError):
             bm_restore.restore_from_backup(empty_sqlite)
+
+        # Corrupted PRAGMA check on existing table
+        corrupt_pragma_sqlite = self.root / "corrupt_pragma.db"
+        c_corrupt = sqlite3.connect(corrupt_pragma_sqlite.as_posix())
+        c_corrupt.execute("CREATE TABLE media_items (id TEXT);")
+        c_corrupt.commit()
+        c_corrupt.close()
+        with patch("sqlite3.connect") as mock_conn:
+            mock_cur = MagicMock()
+            mock_cur.fetchall.return_value = [("corrupted structure",)]
+            mock_conn.return_value.cursor.return_value = mock_cur
+            with self.assertRaises(RuntimeError):
+                bm_restore.restore_from_backup(corrupt_pragma_sqlite)
 
         # Mock MediaIoBaseDownload to write snapshot bytes cleanly
         class _FakeDownloader:
@@ -1877,11 +1942,491 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         with self.TestingSessionLocal() as db:
             self.assertIsNone(db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "V-AFTER-SNAP")))
 
+        # Test GDrive restore with .db.gz compressed file
+        snap_bytes_gz = gzip.compress(snap_bytes)
+        snap_gz_md5 = hashlib.md5(snap_bytes_gz).hexdigest()
+        class _FakeGzDownloader:
+            def __init__(self, fh, _req):
+                self.fh = fh
+
+            def next_chunk(self):
+                self.fh.write(snap_bytes_gz)
+                return None, True
+
+        mock_svc.files().get().execute.return_value = {
+            "id": "db_bkp_gz_1",
+            "name": "media_vault_cloud_test.db.gz",
+            "size": str(len(snap_bytes_gz)),
+            "md5Checksum": snap_gz_md5,
+            "createdTime": "2026-11-14T11:00:00Z",
+        }
+        with patch("googleapiclient.http.MediaIoBaseDownload", _FakeGzDownloader):
+            with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr):
+                r_rest_gz = self.client.post("/actions/gdrive-restore-db", data={"file_id": "db_bkp_gz_1", "folder_id": "fld1"})
+                self.assertEqual(r_rest_gz.status_code, 200)
+                self.assertIn("Przywrócono bazę SQLite", r_rest_gz.text)
+
         # Error branch for /actions/gdrive-restore-db
         with patch("app.cloud.google_drive.GoogleDriveManager", side_effect=RuntimeError("CloudRestoreErr")):
             r_rest_err = self.client.post("/actions/gdrive-restore-db", data={"file_id": "db_bkp_1", "folder_id": "fld1"})
             self.assertEqual(r_rest_err.status_code, 200)
             self.assertIn("CloudRestoreErr", r_rest_err.text)
+
+        # =========================================================================
+        # REQ 1: Always keep 1 DB backup on Google Drive (prune older backups)
+        # =========================================================================
+        mock_svc.files().list().execute.return_value = {
+            "files": [
+                {"id": "db_latest", "name": "media_vault_latest.db"},
+                {"id": "db_older_1", "name": "media_vault_older_1.db"},
+                {"id": "db_older_2", "name": "media_vault_older_2.db"},
+            ]
+        }
+        deleted_fids = []
+        def _fake_delete(fileId):
+            deleted_fids.append(fileId)
+            class _FakeExec:
+                def execute(self):
+                    return {}
+            return _FakeExec()
+
+        mock_svc.files().delete.side_effect = _fake_delete
+
+        # Prune keeping specific file ID
+        deleted = g_mgr.prune_older_db_backups(folder_id="fld1", keep_file_id="db_latest")
+        self.assertEqual(len(deleted), 2)
+        self.assertIn("db_older_1", deleted_fids)
+        self.assertIn("db_older_2", deleted_fids)
+
+        # Prune keeping newest (first) when keep_file_id is None
+        deleted_fids.clear()
+        deleted2 = g_mgr.prune_older_db_backups(folder_id="fld1", keep_file_id=None)
+        self.assertEqual(len(deleted2), 2)
+
+        # Prune with deletion failure logs warning but does not raise
+        def _failing_delete(fileId):
+            class _FailExec:
+                def execute(self):
+                    raise RuntimeError("API quota delete error")
+            return _FailExec()
+
+        mock_svc.files().delete.side_effect = _failing_delete
+        deleted_fail = g_mgr.prune_older_db_backups(folder_id="fld1", keep_file_id="db_latest")
+        self.assertEqual(deleted_fail, [])
+
+        # Restore normal delete side effect
+        mock_svc.files().delete.side_effect = _fake_delete
+
+        # Test prune_older_db_backups with service=None auto-authenticating
+        with patch.object(g_mgr, "authenticate", side_effect=_fake_auth):
+            g_mgr.service = None
+            g_mgr.prune_older_db_backups(folder_id="fld1", keep_file_id="db_latest")
+
+        # Test upload_and_verify with a .db file to trigger keep_only_one_db / is_db pruning
+        db_upload_sample = self.root / "test_db_prune.db"
+        db_upload_sample.write_bytes(b"dummy db content")
+        mock_req.next_chunk.return_value = (
+            None,
+            {
+                "id": "db_cloud_123",
+                "name": db_upload_sample.name,
+                "size": str(db_upload_sample.stat().st_size),
+                "md5Checksum": GoogleDriveManager.compute_local_md5(db_upload_sample),
+            },
+        )
+        with patch("googleapiclient.http.MediaFileUpload", return_value=MagicMock()), patch.object(
+            g_mgr, "prune_older_db_backups", return_value=["old.db"]
+        ) as mock_prune:
+            up_db_res = g_mgr.upload_and_verify(db_upload_sample, "fld1", keep_only_one_db=True)
+            self.assertTrue(up_db_res["verified"])
+            self.assertEqual(up_db_res["pruned_backups"], ["old.db"])
+            mock_prune.assert_called_once()
+
+        # Test POST /actions/gdrive-sync in mode="db_backup" prunes older backups
+        mock_upload_res = {
+            "id": "db_new_upload",
+            "name": "media_vault_gdrive_cloud_new.db",
+            "size_bytes": 1024,
+            "md5": "mocked_md5",
+            "verified": True,
+            "purged_local": False,
+            "webViewLink": "https://drive.google.com/test_db",
+        }
+        mock_svc.files().list().execute.return_value = {
+            "files": [
+                {"id": "db_new_upload", "name": "media_vault_gdrive_cloud_new.db"},
+                {"id": "db_prior", "name": "media_vault_prior.db"},
+            ]
+        }
+        with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr), patch.object(g_mgr, "upload_and_verify", return_value=mock_upload_res):
+            r_sync_db = self.client.post("/actions/gdrive-sync", data={"mode": "db_backup", "folder_id": "fld1"})
+            self.assertEqual(r_sync_db.status_code, 200)
+            self.assertIn("Kopia zapasowa bazy SQLite", r_sync_db.text)
+            self.assertIn("Usunięto starsze kopie bazy z Google Drive", r_sync_db.text)
+
+            # Test POST /actions/gdrive-sync in mode="db_backup" with exclude_embeddings=True and compress=True
+            r_sync_db_light = self.client.post(
+                "/actions/gdrive-sync",
+                data={"mode": "db_backup", "folder_id": "fld1", "exclude_embeddings": "true", "compress": "true"},
+            )
+            self.assertEqual(r_sync_db_light.status_code, 200)
+            self.assertIn("lekki backup bez wektorów CLIP", r_sync_db_light.text)
+            self.assertIn("skompresowany gzip", r_sync_db_light.text)
+
+        # =========================================================================
+        # REQ 2 & 3: DB backup on chosen medium & Restore from chosen medium
+        # =========================================================================
+        medium_dir = self.root / "medium_usb" / "daf_backup" / "db_backups"
+        bm_medium = BackupManager(db_path=self.db_path, backup_dir=self.backup_dir)
+
+        # 1. Direct BackupManager.create_backup to target_dir and list_backups_in_dir
+        saved_on_medium = bm_medium.create_backup("test_medium", target_dir=medium_dir)
+        self.assertTrue(saved_on_medium.exists())
+        backups_list = BackupManager.list_backups_in_dir(medium_dir)
+        self.assertGreaterEqual(len(backups_list), 1)
+        self.assertEqual(backups_list[0]["name"], saved_on_medium.name)
+        self.assertIn("size_mb", backups_list[0])
+
+        # Test listing empty / missing dir returns []
+        self.assertEqual(BackupManager.list_backups_in_dir(self.root / "nonexistent_dir"), [])
+
+        # 2. Add an online WindowsVolume in DB for medium backup endpoint testing
+        with self.TestingSessionLocal() as db:
+            vol_medium = WindowsVolume(
+                volume_serial_number="VSN-MED-USB1",
+                volume_label="USB_BACKUP_DRIVE",
+                file_system="NTFS",
+                last_known_drive_letter=str(self.root / "medium_usb") + "\\",
+                is_online=True,
+                total_space_bytes=100 * 1024 * 1024 * 1024,
+                free_space_bytes=50 * 1024 * 1024 * 1024,
+            )
+            db.add(vol_medium)
+            db.commit()
+            vol_medium_id = vol_medium.id
+
+        # 3. POST /actions/backup-db-to-medium via volume_id
+        r_bkp_med = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"target_volume_id": str(vol_medium_id), "folder_id": "fld1"}
+        )
+        self.assertEqual(r_bkp_med.status_code, 200)
+        self.assertIn("Kopia zapasowa bazy SQLite", r_bkp_med.text)
+        self.assertIn("została pomyślnie utworzona na nośniku", r_bkp_med.text)
+
+        # 4. POST /actions/backup-db-to-medium via custom_target_path
+        custom_out_dir = self.root / "custom_ext_drive"
+        r_bkp_custom = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"custom_target_path": str(custom_out_dir), "folder_id": "fld1"}
+        )
+        self.assertEqual(r_bkp_custom.status_code, 200)
+        self.assertIn("Kopia zapasowa bazy SQLite", r_bkp_custom.text)
+        self.assertIn("została pomyślnie utworzona", r_bkp_custom.text)
+
+        # Test custom_target_path with daf_backup in path
+        daf_custom_dir = self.root / "ext_drive" / "daf_backup" / "db_backups"
+        r_bkp_daf = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"custom_target_path": str(daf_custom_dir), "folder_id": "fld1"}
+        )
+        self.assertEqual(r_bkp_daf.status_code, 200)
+        self.assertIn("Kopia zapasowa bazy SQLite", r_bkp_daf.text)
+        self.assertIn("została pomyślnie utworzona", r_bkp_daf.text)
+
+        # Test custom_target_path as root drive letter
+        r_bkp_root = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"custom_target_path": str(self.root.anchor), "folder_id": "fld1"}
+        )
+        self.assertEqual(r_bkp_root.status_code, 200)
+
+        # Test backup-db-to-medium with exclude_embeddings=True and compress=True
+        r_bkp_med_light = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"target_volume_id": str(vol_medium_id), "folder_id": "fld1", "exclude_embeddings": "true", "compress": "true"},
+        )
+        self.assertEqual(r_bkp_med_light.status_code, 200)
+        self.assertIn("lekki backup bez wektorów CLIP", r_bkp_med_light.text)
+        self.assertIn("skompresowany gzip", r_bkp_med_light.text)
+
+        # Test backup-db-to-medium with exclude_embeddings=False and compress=False
+        r_bkp_med_raw = self.client.post(
+            "/actions/backup-db-to-medium",
+            data={"target_volume_id": str(vol_medium_id), "folder_id": "fld1", "exclude_embeddings": "false", "compress": "false"},
+        )
+        self.assertEqual(r_bkp_med_raw.status_code, 200)
+        self.assertIn("pełny backup z wektorami CLIP", r_bkp_med_raw.text)
+
+        # 5. POST /actions/backup-db-to-medium error branches (missing volume, offline volume, no inputs)
+        r_bkp_err1 = self.client.post("/actions/backup-db-to-medium", data={"target_volume_id": "99999"})
+        self.assertEqual(r_bkp_err1.status_code, 200)
+        self.assertIn("Wybrany wolumen nie istnieje", r_bkp_err1.text)
+
+        r_bkp_err2 = self.client.post("/actions/backup-db-to-medium", data={})
+        self.assertEqual(r_bkp_err2.status_code, 200)
+        self.assertIn("Wskaż podłączony nośnik", r_bkp_err2.text)
+
+        with self.TestingSessionLocal() as db:
+            vol_offline = WindowsVolume(
+                volume_serial_number="VSN-MED-OFFLINE",
+                volume_label="OFFLINE_DRIVE",
+                file_system="FAT32",
+                last_known_drive_letter="Z:\\NonExistentPath\\",
+                is_online=False,
+            )
+            db.add(vol_offline)
+            db.commit()
+            vol_off_id = vol_offline.id
+
+        r_bkp_err3 = self.client.post("/actions/backup-db-to-medium", data={"target_volume_id": str(vol_off_id)})
+        self.assertEqual(r_bkp_err3.status_code, 200)
+        self.assertIn("jest obecnie odłączony", r_bkp_err3.text)
+
+        # POST /actions/backup-db-to-medium failure after job_id is created
+        with patch.object(BackupManager, "create_backup", side_effect=RuntimeError("SimulatedDiskFullError")):
+            r_bkp_err4 = self.client.post(
+                "/actions/backup-db-to-medium",
+                data={"target_volume_id": str(vol_medium_id), "folder_id": "fld1"}
+            )
+            self.assertEqual(r_bkp_err4.status_code, 200)
+            self.assertIn("SimulatedDiskFullError", r_bkp_err4.text)
+
+        # Direct create_backup with optimize_vacuum=True and exclude_embeddings=False and progress callback
+        prog_calls = []
+        def _test_cb(msg, d, t):
+            prog_calls.append((msg, d, t))
+
+        vac_snap = bm_medium.create_backup(
+            "test_vacuum_true",
+            target_dir=medium_dir,
+            optimize_vacuum=True,
+            exclude_embeddings=False,
+            progress_callback=_test_cb,
+        )
+        self.assertTrue(vac_snap.exists())
+        self.assertGreater(len(prog_calls), 0)
+
+        # Direct create_backup with compress=False and progress callback
+        raw_calls = []
+        raw_snap = bm_medium.create_backup(
+            "test_raw_prog",
+            target_dir=medium_dir,
+            compress=False,
+            progress_callback=lambda msg, d, t: raw_calls.append((msg, d, t)),
+        )
+        self.assertTrue(raw_snap.exists())
+        self.assertGreater(len(raw_calls), 0)
+
+        # Test corrupt gzip restore
+        bad_gz = self.root / "corrupt.db.gz"
+        bad_gz.write_bytes(b"NOT_A_VALID_GZIP_FILE")
+        with self.assertRaises(RuntimeError):
+            bm_medium.restore_from_backup(bad_gz)
+
+        # Test corrupt sqlite restore
+        bad_db = self.root / "corrupt.db"
+        bad_db.write_bytes(b"SQLite format 3\x00INVALID_DATA_PADDING_CORRUPT")
+        with self.assertRaises(RuntimeError):
+            bm_medium.restore_from_backup(bad_db)
+
+        # Test /actions/backup-job-status endpoint
+        # 1. Idle status (no active job)
+        r_status_idle = self.client.get("/actions/backup-job-status")
+        self.assertEqual(r_status_idle.status_code, 200)
+        self.assertIn("backup-live-progress", r_status_idle.text)
+
+        # 2. Running job status via ProcessManager
+        dummy_jid = ProcessManager.create_job(
+            job_type="DB_BACKUP_MEDIUM",
+            title="Kopia testowa",
+            item_ids=["snap"],
+        )
+        ProcessManager.update_progress(dummy_jid, processed_count=42, total_count=100, message="Testowy postęp 42%")
+        r_status_run = self.client.get(f"/actions/backup-job-status?folder_id=fld1&medium_volume_id={vol_medium_id}")
+        self.assertEqual(r_status_run.status_code, 200)
+        self.assertIn("42%", r_status_run.text)
+        self.assertIn("Testowy postęp 42%", r_status_run.text)
+
+        # Cover ProcessManager.update_progress edge cases
+        ProcessManager.update_progress(999999, processed_count=1) # non-existent job
+        with self.TestingSessionLocal() as db:
+            ProcessManager.update_progress(dummy_jid, processed_delta=1, remaining_ids=["rem1"], status="RUNNING", db=db)
+            db.commit()
+
+        # Cover get_active_backup_job fallback to DB
+        ProcessManager._job_cache.clear()
+        with self.TestingSessionLocal() as db:
+            active_from_db = ProcessManager.get_active_backup_job(db)
+            self.assertIsNotNone(active_from_db)
+            self.assertEqual(active_from_db["id"], dummy_jid)
+
+        ProcessManager.finish_job(dummy_jid, status="COMPLETED", message="Test zakończony")
+
+        # After completion, fallback to DB when cache cleared returns None
+        ProcessManager._job_cache.clear()
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(ProcessManager.get_active_backup_job(db))
+
+        # Test backup error handling inside progress callback
+        def _exploding_cb(msg, d, t):
+            raise ValueError("ExplodingCallback")
+        # Test get_active_backup_job with db=None (own_session)
+        ProcessManager._job_cache.clear()
+        self.assertIsNone(ProcessManager.get_active_backup_job())
+
+        # Test get_active_backup_job exception branch
+        with patch.object(Session, "scalar", side_effect=Exception("ScalarFail")):
+            self.assertIsNone(ProcessManager.get_active_backup_job())
+
+        # Test update_progress exception branch
+        with patch.object(Session, "get", side_effect=Exception("GetFail")):
+            ProcessManager.update_progress(dummy_jid, status="RUNNING")
+
+        # Test OperationLogger edge cases (OSError file write, DB commit exception, get_recent_logs missing file)
+        OperationLogger.log("LOG_TEST", "msg", log_file=Path("Z:\\NonExistent_ReadOnly_Path\\test.log"))
+        with patch.object(Session, "commit", side_effect=Exception("CommitFail")):
+            OperationLogger.log("LOG_TEST", "msg")
+
+        with self.TestingSessionLocal() as empty_db:
+            # Query with empty table to test missing file fallback
+            with patch.object(Session, "scalars") as mock_sc:
+                mock_sc.return_value.all.return_value = []
+                logs_empty = OperationLogger.get_recent_logs(empty_db, log_file=self.root / "no_log_file.log")
+                self.assertEqual(logs_empty, [])
+
+        # Test create_backup when final_path already exists (overwrites)
+        snap_safe = bm_medium.create_backup("test_safe_prog", target_dir=medium_dir, compress=False, progress_callback=_exploding_cb)
+        self.assertTrue(snap_safe.exists())
+
+        # 6. POST /actions/restore-db-from-medium
+        # Make a snapshot of the current state, mutate DB, and restore from medium
+        medium_snap = bm_medium.create_backup("medium_snap_to_restore", target_dir=medium_dir, compress=False)
+        with self.TestingSessionLocal() as db:
+            db.add(WindowsVolume(volume_serial_number="VSN-MUTATION-1", volume_label="MutationTemp", last_known_drive_letter="M:\\"))
+            db.commit()
+
+        # Restore from backup_file_path
+        r_rest_med = self.client.post(
+            "/actions/restore-db-from-medium",
+            data={"backup_file_path": str(medium_snap)}
+        )
+        self.assertEqual(r_rest_med.status_code, 200)
+        self.assertIn("Pomyślnie przywrócono bazę SQLite z nośnika lokalnego", r_rest_med.text)
+
+        # Verify mutation was rolled back by restore
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "VSN-MUTATION-1")))
+
+        # Restore from target_volume_id and selected_backup_filename
+        with self.TestingSessionLocal() as db:
+            db.add(WindowsVolume(volume_serial_number="VSN-MUTATION-2", volume_label="MutationTemp2", last_known_drive_letter="N:\\"))
+            db.commit()
+
+        r_rest_med2 = self.client.post(
+            "/actions/restore-db-from-medium",
+            data={"target_volume_id": str(vol_medium_id), "selected_backup_filename": medium_snap.name}
+        )
+        self.assertEqual(r_rest_med2.status_code, 200)
+        self.assertIn("Pomyślnie przywrócono bazę SQLite z nośnika lokalnego", r_rest_med2.text)
+
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "VSN-MUTATION-2")))
+
+        # Test direct create_backup with compress=True and exclude_embeddings=True, and list_backups_in_dir
+        gz_snap = bm_medium.create_backup("medium_snap_gz", target_dir=medium_dir, compress=True, exclude_embeddings=True)
+        self.assertTrue(gz_snap.name.endswith(".db.gz"))
+        self.assertIn("_no_clip", gz_snap.name)
+        med_backups_info = BackupManager.list_backups_in_dir(medium_dir)
+        gz_info = next((b for b in med_backups_info if b["name"] == gz_snap.name), None)
+        self.assertIsNotNone(gz_info)
+        self.assertTrue(gz_info["is_compressed"])
+        self.assertFalse(gz_info["has_clip"])
+
+        # Mutate DB and restore from gz_snap
+        with self.TestingSessionLocal() as db:
+            db.add(WindowsVolume(volume_serial_number="VSN-MUTATION-GZ", volume_label="MutationTempGZ", last_known_drive_letter="P:\\"))
+            db.commit()
+
+        r_rest_gz_med = self.client.post(
+            "/actions/restore-db-from-medium",
+            data={"backup_file_path": str(gz_snap)}
+        )
+        self.assertEqual(r_rest_gz_med.status_code, 200)
+        self.assertIn("Pomyślnie przywrócono bazę SQLite z nośnika lokalnego", r_rest_gz_med.text)
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "VSN-MUTATION-GZ")))
+
+        # Restore error branches (file not found, corrupted file, missing params)
+        r_rest_err1 = self.client.post("/actions/restore-db-from-medium", data={})
+        self.assertEqual(r_rest_err1.status_code, 200)
+        self.assertIn("Wskaż plik kopii zapasowej", r_rest_err1.text)
+
+        r_rest_err2 = self.client.post("/actions/restore-db-from-medium", data={"backup_file_path": str(self.root / "missing.db")})
+        self.assertEqual(r_rest_err2.status_code, 200)
+        self.assertIn("nie istnieje", r_rest_err2.text)
+
+        # Restore error with invalid volume ID
+        r_rest_bad_vol = self.client.post(
+            "/actions/restore-db-from-medium",
+            data={"target_volume_id": "99999", "selected_backup_filename": "dummy.db"}
+        )
+        self.assertEqual(r_rest_bad_vol.status_code, 200)
+        self.assertIn("Wybrany wolumen nie istnieje", r_rest_bad_vol.text)
+
+        # Restore unexpected exception error branch
+        with patch.object(BackupManager, "restore_from_backup", side_effect=RuntimeError("MediumRestoreFail")):
+            r_rest_fail = self.client.post(
+                "/actions/restore-db-from-medium",
+                data={"backup_file_path": str(medium_snap)}
+            )
+            self.assertEqual(r_rest_fail.status_code, 200)
+            self.assertIn("MediumRestoreFail", r_rest_fail.text)
+
+        # Test BackupManager list_backups_in_dir OSError on file stat
+        mock_p = MagicMock()
+        mock_p.name = "media_vault_test.db"
+        mock_p.stat.side_effect = OSError("Disk read error")
+        with patch.object(Path, "glob", return_value=[mock_p]):
+            self.assertEqual(BackupManager.list_backups_in_dir(medium_dir), [])
+
+        # Test BackupManager _rotate unlink OSError
+        mock_rot = MagicMock()
+        mock_rot.unlink.side_effect = OSError("Locked file")
+        with patch.object(Path, "glob", return_value=[mock_rot, mock_rot, mock_rot]), patch("os.path.getmtime", return_value=12345):
+            mgr_rotate = BackupManager(db_path=self.db_path, backup_dir=self.backup_dir, max_retained_backups=1)
+            mgr_rotate._rotate()
+
+        # Test restore_from_medium with SessionLocal error post-restore
+        with patch("app.database.SessionLocal", side_effect=Exception("PostRestoreSessionErr")):
+            r_rest_session_err = self.client.post(
+                "/actions/restore-db-from-medium",
+                data={"backup_file_path": str(medium_snap)}
+            )
+            self.assertEqual(r_rest_session_err.status_code, 200)
+
+        # Test restore_from_medium with _get_volumes_and_medium_backups error in exception handler
+        with patch("app.routers.actions._get_volumes_and_medium_backups", side_effect=Exception("VolListFail")):
+            r_rest_err_branch = self.client.post("/actions/restore-db-from-medium", data={"backup_file_path": str(self.root / "missing.db")})
+            self.assertEqual(r_rest_err_branch.status_code, 200)
+
+        # Test gdrive-restore-db authenticate when service is None, and SessionLocal post-restore exception
+        with patch.object(g_mgr, "authenticate", side_effect=_fake_auth), patch("app.database.SessionLocal", side_effect=Exception("GDrivePostRestoreErr")):
+            g_mgr.service = None
+            with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr):
+                r_rest_g_auth = self.client.post("/actions/gdrive-restore-db", data={"file_id": "db_bkp_1", "folder_id": "fld1"})
+                self.assertEqual(r_rest_g_auth.status_code, 200)
+
+        # Test _get_volumes_and_medium_backups fallback branches
+        from app.routers.actions import _get_volumes_and_medium_backups
+        with patch.object(BackupManager, "list_backups_in_dir", side_effect=Exception("DiskErr")):
+            _get_volumes_and_medium_backups(None)
+
+        # 7. GET /actions/gdrive-panel loads online volumes and medium backups
+        r_panel_vols = self.client.get(f"/actions/gdrive-panel?medium_volume_id={vol_medium_id}")
+        self.assertEqual(r_panel_vols.status_code, 200)
+        self.assertIn("USB_BACKUP_DRIVE", r_panel_vols.text)
+        self.assertIn("Kopia zapasowa bazy SQLite na wybranym nośniku", r_panel_vols.text)
 
         # Test HTML5 user guide (/przewodnik) and technical docs (/dokumentacja) routes
         r_guide = self.client.get("/przewodnik")

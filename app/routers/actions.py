@@ -1764,7 +1764,9 @@ def consolidate_group_endpoint(
 def _filter_db_backups(cloud_files: list) -> list:
     return [
         f for f in cloud_files
-        if str(f.get("name", "")).lower().endswith((".db", ".sqlite", ".sqlite3"))
+        if any(str(f.get("name", "")).lower().endswith(ext) for ext in (
+            ".db", ".sqlite", ".sqlite3", ".db.gz", ".sqlite.gz", ".sqlite3.gz"
+        ))
     ]
 
 
@@ -1783,12 +1785,59 @@ def _load_gdrive_fallback(folder_id: Optional[str]) -> tuple:
     return folders, cloud_files, _filter_db_backups(cloud_files)
 
 
+def _get_volumes_and_medium_backups(
+    db: Optional[Session] = None, selected_vol_id: Optional[int] = None
+) -> Tuple[List[WindowsVolume], Optional[WindowsVolume], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    import app.database as db_module
+
+    online_vols: List[WindowsVolume] = []
+    active_vol: Optional[WindowsVolume] = None
+    if db is not None:
+        try:
+            volumes = db.scalars(select(WindowsVolume)).all()
+            for v in volumes:
+                p = Path(v.last_known_drive_letter)
+                v.is_online = p.exists()
+                if v.is_online:
+                    online_vols.append(v)
+            if selected_vol_id:
+                active_vol = next((v for v in online_vols if v.id == selected_vol_id), None)
+            if not active_vol and online_vols:
+                active_vol = online_vols[0]
+        except Exception as exc:
+            logger.debug("Failed querying volumes: %s", exc)
+
+    medium_backups: List[Dict[str, Any]] = []
+    if active_vol:
+        try:
+            target_dir = Path(active_vol.last_known_drive_letter) / "daf_backup" / "db_backups"
+            medium_backups = BackupManager.list_backups_in_dir(target_dir)
+        except Exception as exc:
+            logger.debug("Failed listing medium backups: %s", exc)
+
+    local_backups: List[Dict[str, Any]] = []
+    try:
+        local_backups = BackupManager.list_backups_in_dir(db_module.BACKUP_DIR)
+    except Exception as exc:
+        logger.debug("Failed listing local backups: %s", exc)
+
+    return online_vols, active_vol, medium_backups, local_backups
+
+
 @router.get("/gdrive-panel")
 def get_gdrive_panel(
     request: Request,
     folder_id: Optional[str] = None,
+    medium_volume_id: Optional[int] = None,
+    db: Session = Depends(get_db),
 ):
     from app.cloud.google_drive import GoogleDriveManager
+
+    online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(
+        db, selected_vol_id=medium_volume_id
+    )
+
+    active_backup_job = ProcessManager.get_active_backup_job(db)
 
     try:
         gdrive = GoogleDriveManager()
@@ -1810,6 +1859,11 @@ def get_gdrive_panel(
                 "active_folder_id": active_fid,
                 "cloud_files": cloud_files,
                 "db_backups": _filter_db_backups(cloud_files),
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "active_backup_job": active_backup_job,
                 "error_msg": None,
                 "status_report": False,
             },
@@ -1823,16 +1877,65 @@ def get_gdrive_panel(
                 "active_folder_id": "",
                 "cloud_files": [],
                 "db_backups": [],
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "active_backup_job": active_backup_job,
                 "error_msg": str(e),
                 "status_report": False,
             },
         )
 
 
+@router.get("/backup-job-status")
+def get_backup_job_status(
+    request: Request,
+    folder_id: Optional[str] = None,
+    medium_volume_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    job = ProcessManager.get_active_backup_job(db)
+    if job and job.get("status") == "RUNNING":
+        pct = max(job.get("processed_count", 0), 5)
+        title = job.get("title", "Kopia bazy SQLite")
+        msg = job.get("last_message", "")
+        return HTMLResponse(
+            f"""<div id="backup-live-progress" class="p-4 bg-indigo-950/90 border border-indigo-500 text-indigo-100 rounded-xl space-y-2.5 animate-pulse"
+                 hx-get="/actions/backup-job-status?folder_id={folder_id or ''}&medium_volume_id={medium_volume_id or ''}"
+                 hx-trigger="every 1s"
+                 hx-target="#backup-live-progress"
+                 hx-swap="outerHTML">
+                <div class="flex items-center justify-between text-xs font-semibold text-indigo-300">
+                    <span class="flex items-center space-x-2">
+                        <svg class="animate-spin h-4 w-4 text-indigo-400" viewBox="0 0 24 24" fill="none">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                        </svg>
+                        <span>⚙️ {title}</span>
+                    </span>
+                    <span class="font-mono font-bold text-indigo-200">
+                        {job.get('processed_count', 0)}%
+                    </span>
+                </div>
+                <div class="w-full bg-slate-900 rounded-full h-2.5 border border-indigo-700/60 overflow-hidden">
+                    <div class="bg-indigo-500 h-2.5 rounded-full transition-all duration-300"
+                         style="width: {pct}%;"></div>
+                </div>
+                <div class="text-[11px] text-slate-300 font-mono">
+                    {msg}
+                </div>
+            </div>"""
+        )
+    return HTMLResponse('<div id="backup-live-progress"></div>')
+
+
 @router.post("/gdrive-sync")
 def sync_to_google_drive(
     request: Request,
     mode: str = Form("media"),
+    exclude_embeddings: bool = Form(False),
+    compress: bool = Form(True),
     folder_id: Optional[str] = Form(None),
     new_folder_name: Optional[str] = Form(None),
     purge_local: bool = Form(False),
@@ -1855,6 +1958,8 @@ def sync_to_google_drive(
 ):
     from app.cloud.google_drive import GoogleDriveManager
 
+    online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(db)
+    job_id: Optional[int] = None
     try:
         gdrive = GoogleDriveManager()
         if new_folder_name and new_folder_name.strip():
@@ -1865,12 +1970,46 @@ def sync_to_google_drive(
             target_fid = gdrive.get_or_create_folder("DomoweArchiwumFoto")
 
         uploaded_results = []
+        job_id = None
         if mode == "db_backup":
+            mode_desc = "lekki backup bez wektorów CLIP" if exclude_embeddings else "pełny backup z wektorami CLIP"
+            comp_desc = "skompresowany gzip" if compress else "nieskompresowany .db"
+            job_id = ProcessManager.create_job(
+                job_type="GDRIVE_DB_BACKUP",
+                title=f"Kopia bazy SQLite w Google Drive ({mode_desc}, {comp_desc})",
+                item_ids=["db_gdrive_upload"],
+                params={"folder_id": target_fid, "compress": compress, "exclude_embeddings": exclude_embeddings},
+                db=db,
+            )
+            db.commit()
+
+            def _prog(msg: str, done: int, total: int):
+                pct = int(done * 0.6)
+                if job_id:
+                    ProcessManager.update_progress(job_id=job_id, processed_count=pct, total_count=100, message=msg)
+
+            t_start = datetime.datetime.now()
             mgr = BackupManager()
-            b_path = mgr.create_backup("gdrive_cloud")
-            res = gdrive.upload_and_verify(b_path, target_fid, purge_local_after_verify=False)
+            b_path = mgr.create_backup("gdrive_cloud", compress=compress, exclude_embeddings=exclude_embeddings, progress_callback=_prog)
+
+            if job_id:
+                ProcessManager.update_progress(job_id=job_id, processed_count=65, total_count=100, message="Wysyłanie kopii do chmury Google Drive...")
+            res = gdrive.upload_and_verify(b_path, target_fid, purge_local_after_verify=False, keep_only_one_db=True)
             uploaded_results.append(res)
-            summary = f"Kopia zapasowa bazy SQLite ({b_path.name}) została zweryfikowana i zapisana w chmurze."
+
+            if job_id:
+                ProcessManager.update_progress(job_id=job_id, processed_count=90, total_count=100, message="Porządkowanie starszych kopii na Google Drive...")
+            deleted_old = gdrive.prune_older_db_backups(target_fid, keep_file_id=res.get("id"))
+            duration_sec = round((datetime.datetime.now() - t_start).total_seconds(), 1)
+            size_mb = round(b_path.stat().st_size / (1024 * 1024), 2)
+            mode_desc_str = " (lekki backup bez wektorów CLIP)" if exclude_embeddings else " (pełny backup z wektorami CLIP)"
+            comp_desc_str = " [skompresowany gzip]" if compress else ""
+            summary = f"Kopia zapasowa bazy SQLite{mode_desc_str}{comp_desc_str} ({b_path.name}, {size_mb} MB w {duration_sec} s) została zweryfikowana i zapisana w chmurze."
+            if deleted_old:
+                summary += f" Usunięto starsze kopie bazy z Google Drive ({len(deleted_old)} szt.: {', '.join(deleted_old)}), zachowując wyłącznie 1 najnowszą."
+
+            if job_id:
+                ProcessManager.finish_job(job_id=job_id, status="COMPLETED", message=summary)
         else:
             items = resolve_target_items(
                 db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
@@ -1910,6 +2049,10 @@ def sync_to_google_drive(
                 "active_folder_id": target_fid,
                 "cloud_files": cloud_files,
                 "db_backups": _filter_db_backups(cloud_files),
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
                 "error_msg": None,
                 "status_report": True,
                 "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1921,6 +2064,8 @@ def sync_to_google_drive(
         return resp
 
     except Exception as e:
+        if job_id:
+            ProcessManager.finish_job(job_id=job_id, status="FAILED", message=f"Błąd tworzenia kopii bazy w chmurze: {e}")
         folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
         return render_template(
             request,
@@ -1930,6 +2075,10 @@ def sync_to_google_drive(
                 "active_folder_id": folder_id or "",
                 "cloud_files": cloud_files,
                 "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
                 "error_msg": str(e),
                 "status_report": False,
             },
@@ -1946,11 +2095,21 @@ def restore_db_from_google_drive(
     from app.cloud.google_drive import GoogleDriveManager
     import app.database as db_module
 
+    online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(db)
     temp_file: Optional[Path] = None
     try:
         gdrive = GoogleDriveManager()
         safe_fid = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in file_id)
-        temp_file = db_module.BACKUP_DIR / f"cloud_restore_{safe_fid}.db"
+        remote_ext = ".db"
+        try:
+            if not gdrive.service:
+                gdrive.authenticate()
+            f_meta = gdrive.service.files().get(fileId=file_id, fields="name").execute()
+            if str(f_meta.get("name", "")).lower().endswith(".gz"):
+                remote_ext = ".db.gz"
+        except Exception:
+            pass
+        temp_file = db_module.BACKUP_DIR / f"cloud_restore_{safe_fid}{remote_ext}"
         dl_info = gdrive.download_and_verify_backup(file_id, temp_file)
 
         # Release active session before overwriting database pages via SQLite backup API
@@ -1969,6 +2128,14 @@ def restore_db_from_google_drive(
         active_fid = folder_id.strip() if (folder_id and folder_id.strip()) else (folders[0]["id"] if folders else "")
         cloud_files = gdrive.list_files_in_folder(active_fid) if active_fid else []
 
+        # Fresh volumes query after restore
+        try:
+            from app.database import SessionLocal
+            with SessionLocal() as fresh_db:
+                online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(fresh_db)
+        except Exception:
+            pass
+
         resp = render_template(
             request,
             "partials/gdrive_panel.html",
@@ -1977,6 +2144,10 @@ def restore_db_from_google_drive(
                 "active_folder_id": active_fid,
                 "cloud_files": cloud_files,
                 "db_backups": _filter_db_backups(cloud_files),
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
                 "error_msg": None,
                 "status_report": True,
                 "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1997,6 +2168,10 @@ def restore_db_from_google_drive(
                 "active_folder_id": folder_id or "",
                 "cloud_files": cloud_files,
                 "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
                 "error_msg": str(e),
                 "status_report": False,
             },
@@ -2007,6 +2182,239 @@ def restore_db_from_google_drive(
                 temp_file.unlink()
             except OSError as exc:
                 logger.debug("Could not clean temporary cloud restore file %s: %s", temp_file, exc)
+
+
+@router.post("/backup-db-to-medium")
+def backup_database_to_medium(
+    request: Request,
+    target_volume_id: Optional[int] = Form(None),
+    custom_target_path: Optional[str] = Form(None),
+    exclude_embeddings: bool = Form(False),
+    compress: bool = Form(True),
+    folder_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    job_id: Optional[int] = None
+    target_label = "nośnik"
+    try:
+        target_dir: Optional[Path] = None
+        vol: Optional[WindowsVolume] = None
+        if target_volume_id:
+            vol = db.get(WindowsVolume, target_volume_id)
+            if not vol:
+                raise ValueError("Wybrany wolumen nie istnieje w bazie.")
+            drive_p = Path(vol.last_known_drive_letter)
+            if not drive_p.exists():
+                raise RuntimeError(f"Nośnik {vol.volume_label} ({vol.last_known_drive_letter}) jest obecnie odłączony (offline).")
+            target_dir = drive_p / "daf_backup" / "db_backups"
+            target_label = f"{vol.volume_label} ({vol.last_known_drive_letter})"
+        elif custom_target_path and custom_target_path.strip():
+            raw_path = Path(custom_target_path.strip())
+            if str(raw_path.resolve()) == str(raw_path.anchor) or not raw_path.name:
+                target_dir = raw_path / "daf_backup" / "db_backups"
+            elif "daf_backup" in raw_path.parts:
+                target_dir = raw_path
+            else:
+                target_dir = raw_path / "daf_backup" / "db_backups"
+            target_label = str(target_dir)
+        else:
+            raise ValueError("Wskaż podłączony nośnik lub wprowadź prawidłową ścieżkę do katalogu.")
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        mode_desc = " (lekki backup bez wektorów CLIP)" if exclude_embeddings else " (pełny backup z wektorami CLIP)"
+        comp_desc = " [skompresowany gzip]" if compress else ""
+
+        job_id = ProcessManager.create_job(
+            job_type="DB_BACKUP_MEDIUM",
+            title=f"Kopia bazy SQLite na {target_label}{mode_desc}{comp_desc}",
+            item_ids=["db_snapshot"],
+            params={
+                "target_dir": str(target_dir),
+                "compress": compress,
+                "exclude_embeddings": exclude_embeddings,
+            },
+            db=db,
+        )
+        db.commit()
+
+        def _prog(msg: str, done: int, total: int):
+            if job_id:
+                ProcessManager.update_progress(
+                    job_id=job_id,
+                    processed_count=done,
+                    total_count=total,
+                    message=msg,
+                )
+
+        t_start = datetime.datetime.now()
+        bm = BackupManager()
+        saved_file = bm.create_backup(
+            tag="medium",
+            target_dir=target_dir,
+            compress=compress,
+            exclude_embeddings=exclude_embeddings,
+            progress_callback=_prog,
+        )
+        duration_sec = round((datetime.datetime.now() - t_start).total_seconds(), 1)
+        size_mb = round(saved_file.stat().st_size / (1024 * 1024), 2)
+        summary = (
+            f"Kopia zapasowa bazy SQLite{mode_desc}{comp_desc} została pomyślnie utworzona na nośniku {target_label}: "
+            f"{saved_file.name} ({size_mb} MB w {duration_sec} s) w kartotece {target_dir}."
+        )
+
+        if job_id:
+            ProcessManager.finish_job(job_id=job_id, status="COMPLETED", message=summary)
+        OperationLogger.log("DB_BACKUP_MEDIUM", summary, status="OK", db=db)
+
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
+        online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(
+            db, selected_vol_id=vol.id if vol else target_volume_id
+        )
+
+        resp = render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": folder_id or (folders[0]["id"] if folders else ""),
+                "cloud_files": cloud_files,
+                "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "error_msg": None,
+                "status_report": True,
+                "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status_summary": summary,
+                "uploaded_results": [],
+            },
+        )
+        resp.headers["HX-Trigger"] = "refresh-all"
+        return resp
+
+    except Exception as e:
+        if job_id:
+            ProcessManager.finish_job(job_id=job_id, status="FAILED", message=f"Błąd tworzenia kopii bazy: {e}")
+        OperationLogger.log("DB_BACKUP_MEDIUM", f"Błąd tworzenia kopii bazy: {e}", status="ERROR", db=db)
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
+        online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(
+            db, selected_vol_id=target_volume_id
+        )
+        return render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": folder_id or "",
+                "cloud_files": cloud_files,
+                "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "error_msg": str(e),
+                "status_report": False,
+            },
+        )
+
+
+@router.post("/restore-db-from-medium")
+def restore_database_from_medium(
+    request: Request,
+    backup_file_path: Optional[str] = Form(None),
+    target_volume_id: Optional[int] = Form(None),
+    selected_backup_filename: Optional[str] = Form(None),
+    folder_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    try:
+        source_path: Optional[Path] = None
+        if backup_file_path and backup_file_path.strip():
+            source_path = Path(backup_file_path.strip())
+        elif target_volume_id and selected_backup_filename and selected_backup_filename.strip():
+            vol = db.get(WindowsVolume, target_volume_id)
+            if not vol:
+                raise ValueError("Wybrany wolumen nie istnieje.")
+            source_path = Path(vol.last_known_drive_letter) / "daf_backup" / "db_backups" / selected_backup_filename.strip()
+        else:
+            raise ValueError("Wskaż plik kopii zapasowej do przywrócenia.")
+
+        if not source_path.exists() or not source_path.is_file():
+            raise FileNotFoundError(f"Plik kopii zapasowej nie istnieje: {source_path}")
+
+        # Close active DB session before overwriting database
+        db.close()
+
+        bm = BackupManager()
+        bm.restore_from_backup(source_path)
+
+        size_mb = round(source_path.stat().st_size / (1024 * 1024), 2)
+        summary = (
+            f"Pomyślnie przywrócono bazę SQLite z nośnika lokalnego: {source_path.name} "
+            f"({size_mb} MB). Bieżący stan sprzed przywrócenia zabezpieczono w data/backups/."
+        )
+        OperationLogger.log("DB_RESTORE_MEDIUM", summary, status="OK")
+
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
+        online_vols, active_vol, medium_backups, local_backups = [], None, [], []
+        try:
+            from app.database import SessionLocal
+            with SessionLocal() as fresh_db:
+                online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(
+                    fresh_db, selected_vol_id=target_volume_id
+                )
+        except Exception:
+            pass
+
+        resp = render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": folder_id or "",
+                "cloud_files": cloud_files,
+                "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "error_msg": None,
+                "status_report": True,
+                "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status_summary": summary,
+                "uploaded_results": [],
+            },
+        )
+        resp.headers["HX-Trigger"] = "refresh-all"
+        return resp
+
+    except Exception as e:
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
+        online_vols, active_vol, medium_backups, local_backups = [], None, [], []
+        try:
+            online_vols, active_vol, medium_backups, local_backups = _get_volumes_and_medium_backups(
+                db, selected_vol_id=target_volume_id
+            )
+        except Exception:
+            pass
+        return render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": folder_id or "",
+                "cloud_files": cloud_files,
+                "db_backups": db_backups,
+                "online_volumes": online_vols,
+                "active_medium_vol": active_vol,
+                "medium_backups": medium_backups,
+                "local_backups": local_backups,
+                "error_msg": str(e),
+                "status_report": False,
+            },
+        )
 
 
 @router.post("/export-json-disk")

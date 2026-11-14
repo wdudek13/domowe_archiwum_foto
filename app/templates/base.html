@@ -30,6 +30,13 @@
             width: 100vw !important;
             height: 100vh !important;
         }
+        .htmx-indicator {
+            display: none !important;
+        }
+        .htmx-request.htmx-indicator,
+        .htmx-request .htmx-indicator {
+            display: block !important;
+        }
     </style>
 </head>
 <body class="bg-darkBg text-slate-100 h-screen flex flex-col font-sans antialiased overflow-hidden">
@@ -59,8 +66,9 @@
             </button>
             <button type="button"
                     onclick="openGDriveModal()"
-                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-sky-300 font-medium transition">
-                ☁️ Google Drive Archiwum
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-sky-300 font-medium transition"
+                    title="Kopie bazy danych na nośnikach USB / HDD oraz w chmurze Google Drive">
+                💾 Kopia Bazy & Chmura
             </button>
             <a href="/przewodnik"
                target="_blank"
@@ -182,8 +190,8 @@
         <div class="bg-cardBg border border-borderBg rounded-2xl max-w-3xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
             <div class="flex justify-between items-center border-b border-borderBg pb-3">
                 <div>
-                    <h3 class="font-bold text-sm text-sky-400">☁️ Archiwum Google Drive (.\data\credentials.json)</h3>
-                    <p class="text-[11px] text-slate-400">Weryfikacja sumy kontrolnej MD5 oraz podgląd plików w chmurze na żywo.</p>
+                    <h3 class="font-bold text-sm text-sky-400">💾 Kopia Zapasowa Bazy Danych (Nośniki USB / HDD & Google Drive)</h3>
+                    <p class="text-[11px] text-slate-400">Tworzenie i przywracanie kopii bazy SQLite na wybranym nośniku oraz w chmurze (Google Drive zachowuje zawsze wyłącznie 1 kopię).</p>
                 </div>
                 <button type="button" onclick="document.getElementById('gdrive-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
             </div>

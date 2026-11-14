@@ -1,4 +1,53 @@
 <div class="space-y-4 text-xs">
+    <div id="backup-live-progress"
+         {% if active_backup_job and active_backup_job.status == 'RUNNING' %}
+         hx-get="/actions/backup-job-status?folder_id={{ active_folder_id }}&medium_volume_id={{ active_medium_vol.id if active_medium_vol else '' }}"
+         hx-trigger="every 1s"
+         hx-target="#backup-live-progress"
+         hx-swap="outerHTML"
+         {% endif %}>
+        {% if active_backup_job and active_backup_job.status == 'RUNNING' %}
+        <div class="p-4 bg-indigo-950/90 border border-indigo-500 text-indigo-100 rounded-xl space-y-2.5 animate-pulse">
+            <div class="flex items-center justify-between text-xs font-semibold text-indigo-300">
+                <span class="flex items-center space-x-2">
+                    <svg class="animate-spin h-4 w-4 text-indigo-400" viewBox="0 0 24 24" fill="none">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                    </svg>
+                    <span>⚙️ {{ active_backup_job.title }}</span>
+                </span>
+                <span class="font-mono font-bold text-indigo-200">
+                    {{ active_backup_job.processed_count }}%
+                </span>
+            </div>
+            <div class="w-full bg-slate-900 rounded-full h-2.5 border border-indigo-700/60 overflow-hidden">
+                <div class="bg-indigo-500 h-2.5 rounded-full transition-all duration-300"
+                     style="width: {{ [active_backup_job.processed_count, 5]|max }}%;"></div>
+            </div>
+            <div class="text-[11px] text-slate-300 font-mono">
+                {{ active_backup_job.last_message }}
+            </div>
+            <div class="text-[10px] text-indigo-300/80 italic">
+                ℹ️ Plik kopii jest najpierw bezpiecznie tworzony w buforze lokalnym SSD, po czym kompresowany i zapisywany na nośniku docelowym.
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Wskaźnik oczekiwania przy kliknięciu przycisku backupu -->
+    <div id="backup-spinner" class="htmx-indicator p-3.5 bg-sky-950/90 border border-sky-500 text-sky-200 rounded-xl space-y-1.5 animate-pulse" style="display: none;">
+        <div class="flex items-center space-x-3">
+            <svg class="animate-spin h-5 w-5 text-sky-400" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+            </svg>
+            <span class="font-bold text-xs text-sky-200">Inicjalizacja operacji tworzenia kopii bazy SQLite...</span>
+        </div>
+        <p class="text-[11px] text-slate-300">
+            Trwa przygotowanie transakcyjnego zrzutu bazy. Pasek postępu powyżej aktualizuje stan na żywo.
+        </p>
+    </div>
+
     {% if error_msg %}
     <div class="p-3 bg-rose-950/80 border border-rose-700 text-rose-200 rounded-xl">
         <strong>Błąd Google Drive:</strong> {{ error_msg }}
@@ -39,52 +88,84 @@
     </div>
     {% endif %}
 
-    <!-- Formularz wyboru kartoteki i uruchomienia Archiwizacji -->
-    <form hx-post="/actions/gdrive-sync"
-          hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-          hx-target="#gdrive-panel-body"
-          class="bg-slate-900/90 border border-borderBg p-4 rounded-xl space-y-3">
-
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div>
-                <label class="block text-slate-400 mb-1">Wybierz istniejącą kartotekę na Google Drive:</label>
-                <select name="folder_id" onchange="htmx.ajax('GET', '/actions/gdrive-panel?folder_id=' + this.value, '#gdrive-panel-body')"
-                        class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200">
-                    {% for fld in folders %}
-                    <option value="{{ fld.id }}" {% if fld.id == active_folder_id %}selected{% endif %}>📁 {{ fld.name }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div>
-                <label class="block text-slate-400 mb-1">Lub wpisz nazwę nowej kartoteki do utworzenia:</label>
-                <input type="text" name="new_folder_name" placeholder="np. Archiwum_Wakacje_2024"
-                       class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-white">
-            </div>
+    <!-- Formularz wyboru kartoteki i uruchomienia Archiwizacji w Google Drive -->
+    <div class="bg-slate-900/90 border border-sky-800/50 p-4 rounded-xl space-y-3">
+        <div class="flex items-center justify-between">
+            <h4 class="font-bold text-sky-300 text-xs">☁️ Kopia w chmurze Google Drive (Zawsze 1 najnowszy backup bazy)</h4>
+            <span class="text-[10px] text-slate-400">Starsze kopie bazy SQLite są automatycznie usuwane z chmury po wgraniu nowej</span>
         </div>
 
-        <div class="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-borderBg">
-            <label class="flex items-center space-x-2 cursor-pointer text-amber-300 font-medium">
-                <input type="checkbox" name="purge_local" value="true" class="rounded bg-slate-900 border-borderBg text-rose-600">
-                <span>Tryb Archiwum: Usuń z dysku lokalnego po 100% weryfikacji MD5 i rozmiaru</span>
-            </label>
+        <form hx-post="/actions/gdrive-sync"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#gdrive-panel-body"
+              hx-indicator="#backup-spinner"
+              class="space-y-3">
 
-            <div class="flex items-center space-x-2">
-                <button type="submit" name="mode" value="db_backup"
-                        class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-slate-200 px-3 py-2 rounded-lg font-medium transition">
-                    📦 Wyślij Backup Bazy SQLite
-                </button>
-                <button type="submit" name="mode" value="media"
-                        class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
-                    ☁️ Wyślij wybrane zdjęcia do kartoteki
-                </button>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                    <label class="block text-slate-400 mb-1">Wybierz istniejącą kartotekę na Google Drive:</label>
+                    <select name="folder_id" onchange="htmx.ajax('GET', '/actions/gdrive-panel?folder_id=' + this.value, '#gdrive-panel-body')"
+                            class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200">
+                        {% for fld in folders %}
+                        <option value="{{ fld.id }}" {% if fld.id == active_folder_id %}selected{% endif %}>📁 {{ fld.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-slate-400 mb-1">Lub wpisz nazwę nowej kartoteki do utworzenia:</label>
+                    <input type="text" name="new_folder_name" placeholder="np. Archiwum_Wakacje_2024"
+                           class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-white">
+                </div>
             </div>
-        </div>
-    </form>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-borderBg/60 text-slate-300">
+                <div class="space-y-1">
+                    <span class="block text-slate-400 font-medium">Zawartość kopii bazy SQLite:</span>
+                    <div class="flex items-center space-x-4">
+                        <label class="flex items-center space-x-1.5 cursor-pointer">
+                            <input type="radio" name="exclude_embeddings" value="false" checked class="text-sky-500">
+                            <span>Pełna (z wektorami CLIP)</span>
+                        </label>
+                        <label class="flex items-center space-x-1.5 cursor-pointer text-amber-300" title="Zapisuje 100% metadanych, albumów, tagów, deduplikacji bez ciężkich wektorów CLIP">
+                            <input type="radio" name="exclude_embeddings" value="true" class="text-amber-500">
+                            <span>Lekka (bez wektorów CLIP)</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="flex items-center">
+                    <label class="flex items-center space-x-2 cursor-pointer text-emerald-300 font-medium">
+                        <input type="checkbox" name="compress" value="true" checked class="rounded bg-slate-900 border-borderBg text-emerald-500">
+                        <span>Kompresja w locie gzip (<code>.db.gz</code> — redukcja o ~80%)</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-borderBg">
+                <label class="flex items-center space-x-2 cursor-pointer text-amber-300 font-medium">
+                    <input type="checkbox" name="purge_local" value="true" class="rounded bg-slate-900 border-borderBg text-rose-600">
+                    <span>Tryb Archiwum: Usuń z dysku lokalnego po 100% weryfikacji MD5 i rozmiaru</span>
+                </label>
+
+                <div class="flex items-center space-x-2">
+                    <button type="submit" name="mode" value="db_backup"
+                            hx-disabled-elt="this"
+                            class="bg-slate-800 hover:bg-slate-700 border border-sky-600/70 text-sky-200 px-3 py-2 rounded-lg font-medium transition"
+                            title="Wysyła kopię bazy SQLite i automatycznie usuwa poprzednią z Google Drive">
+                        📦 Wyślij Backup Bazy SQLite do chmury
+                    </button>
+                    <button type="submit" name="mode" value="media"
+                            class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
+                        ☁️ Wyślij wybrane zdjęcia do kartoteki
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
 
     <!-- Sekcja Przywracania bazy SQLite z backupu na Google Drive -->
     <div class="bg-slate-900/90 border border-amber-700/50 p-4 rounded-xl space-y-2.5">
         <div class="flex items-center justify-between">
-            <h4 class="font-bold text-amber-300 text-xs">♻️ Przywracanie bazy SQLite z backupu na Google Drive</h4>
+            <h4 class="font-bold text-amber-300 text-xs">♻️ Przywracanie bazy SQLite z Google Drive (Zdalnie)</h4>
             <span class="text-[10px] text-slate-400">Automatyczna weryfikacja sumy MD5 + kopia bezpieczeństwa <code>pre_restore</code></span>
         </div>
         {% if db_backups %}
@@ -103,14 +184,128 @@
             </select>
             <button type="submit"
                     class="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
-                ♻️ Pobierz i przywróć wybraną bazę z Google Drive
+                ♻️ Pobierz i przywróć bazę z Google Drive
             </button>
         </form>
         {% else %}
         <div class="text-slate-400 italic text-[11px]">
-            W wybranej kartotece nie znaleziono kopii zapasowej bazy (<code>.db</code> / <code>.sqlite</code>). Użyj najpierw przycisku „Wyślij Backup Bazy SQLite”.
+            W wybranej kartotece Google Drive nie znaleziono kopii zapasowej bazy (<code>.db</code> / <code>.sqlite</code> / <code>.db.gz</code>).
         </div>
         {% endif %}
+    </div>
+
+    <!-- Sekcja Tworzenia i Przywracania kopii bazy SQLite na wybranym nośniku lokalnym / USB -->
+    <div class="bg-slate-900/90 border border-emerald-700/60 p-4 rounded-xl space-y-3">
+        <div class="flex items-center justify-between">
+            <h4 class="font-bold text-emerald-300 text-xs">💾 Kopia zapasowa bazy SQLite na wybranym nośniku (USB / Dysk zewnętrzny)</h4>
+            <span class="text-[10px] text-slate-400">Kopia zapisywana w <code>daf_backup/db_backups/</code> (wykluczonej ze skanowania galerii)</span>
+        </div>
+
+        <form hx-post="/actions/backup-db-to-medium"
+              hx-target="#gdrive-panel-body"
+              hx-indicator="#backup-spinner"
+              class="space-y-3">
+            <input type="hidden" name="folder_id" value="{{ active_folder_id }}">
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                    <label class="block text-slate-400 mb-1">Wybierz podłączony nośnik docelowy:</label>
+                    <select name="target_volume_id"
+                            onchange="htmx.ajax('GET', '/actions/gdrive-panel?folder_id={{ active_folder_id }}&medium_volume_id=' + this.value, '#gdrive-panel-body')"
+                            class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200">
+                        {% for vol in online_volumes %}
+                        <option value="{{ vol.id }}" {% if active_medium_vol and vol.id == active_medium_vol.id %}selected{% endif %}>
+                            💾 {{ vol.volume_label }} ({{ vol.last_known_drive_letter }})
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-slate-400 mb-1">Lub wskaż własną ścieżkę do katalogu / litery dysku:</label>
+                    <input type="text" name="custom_target_path" placeholder="np. E:\ lub F:\MojeKopie"
+                           class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-white">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-borderBg/60 text-slate-300">
+                <div class="space-y-1">
+                    <span class="block text-slate-400 font-medium">Zawartość kopii bazy SQLite:</span>
+                    <div class="flex items-center space-x-4">
+                        <label class="flex items-center space-x-1.5 cursor-pointer">
+                            <input type="radio" name="exclude_embeddings" value="false" checked class="text-sky-500">
+                            <span>Pełna (z wektorami CLIP)</span>
+                        </label>
+                        <label class="flex items-center space-x-1.5 cursor-pointer text-amber-300" title="Zapisuje 100% metadanych, albumów, tagów, deduplikacji bez ciężkich wektorów CLIP">
+                            <input type="radio" name="exclude_embeddings" value="true" class="text-amber-500">
+                            <span>Lekka (bez wektorów CLIP)</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="flex items-center">
+                    <label class="flex items-center space-x-2 cursor-pointer text-emerald-300 font-medium">
+                        <input type="checkbox" name="compress" value="true" checked class="rounded bg-slate-900 border-borderBg text-emerald-500">
+                        <span>Kompresja w locie gzip (<code>.db.gz</code> — redukcja o ~80%)</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="flex items-center justify-end pt-2 border-t border-borderBg">
+                <button type="submit"
+                        hx-disabled-elt="this"
+                        class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
+                    💾 Zapisz kopię bazy na wybranym nośniku
+                </button>
+            </div>
+        </form>
+
+        <!-- Przywracanie bazy z wybranego nośnika lub pliku lokalnego -->
+        <div class="pt-3 border-t border-borderBg/70 space-y-2">
+            <div class="flex items-center justify-between">
+                <h5 class="font-bold text-amber-300 text-xs">♻️ Przywracanie bazy SQLite z wybranego nośnika</h5>
+                <span class="text-[10px] text-slate-400">Weryfikacja integralności SQLite + dekompresja .gz + kopia <code>pre_restore</code> w data/backups/</span>
+            </div>
+
+            {% set all_local_candidates = medium_backups + local_backups %}
+            <form hx-post="/actions/restore-db-from-medium"
+                  hx-target="#gdrive-panel-body"
+                  hx-confirm="Czy na pewno chcesz przywrócić bazę danych z wybranego pliku? Bieżąca baza zostanie wcześniej zabezpieczona w data/backups/."
+                  class="space-y-2">
+                <input type="hidden" name="folder_id" value="{{ active_folder_id }}">
+                <input type="hidden" name="target_volume_id" value="{{ active_medium_vol.id if active_medium_vol else '' }}">
+
+                {% if all_local_candidates %}
+                <div>
+                    <label class="block text-slate-400 mb-1">Wybierz kopię zapasową wykrytą na nośniku:</label>
+                    <select name="backup_file_path"
+                            class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200 font-mono text-[11px]">
+                        {% for b in medium_backups %}
+                        <option value="{{ b.path }}">
+                            📁 [{{ active_medium_vol.volume_label if active_medium_vol else 'Nośnik' }}] {{ b.name }} ({{ b.size_mb }} MB, {{ b.mtime }}{% if b.is_compressed %}, .gz{% endif %}{% if not b.has_clip %}, lekka{% endif %})
+                        </option>
+                        {% endfor %}
+                        {% for b in local_backups %}
+                        <option value="{{ b.path }}">
+                            📁 [Lokalny data/backups] {{ b.name }} ({{ b.size_mb }} MB, {{ b.mtime }}{% if b.is_compressed %}, .gz{% endif %}{% if not b.has_clip %}, lekka{% endif %})
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
+                {% endif %}
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-2 items-center">
+                    <div class="md:col-span-2">
+                        <input type="text" name="backup_file_path" placeholder="Lub wpisz pełną ścieżkę do pliku bazy, np. E:\daf_backup\db_backups\media_vault_2026.db.gz"
+                               class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-white font-mono text-xs">
+                    </div>
+                    <div>
+                        <button type="submit"
+                                class="w-full bg-amber-700 hover:bg-amber-600 text-white px-3 py-2 rounded-lg font-semibold shadow transition text-center">
+                            ♻️ Przywróć bazę z nośnika
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
     </div>
 
     <!-- Dowód wgrania: Podgląd zawartości wybranego katalogu na Google Drive -->
@@ -143,7 +338,7 @@
                         <td class="py-1.5 px-2 text-emerald-400 text-[10px]">{{ cf.md5Checksum or 'Folder/Doc' }}</td>
                         <td class="py-1.5 px-2 text-slate-400 text-[10px]">{{ cf.createdTime[:19].replace('T', ' ') if cf.createdTime else '' }}</td>
                         <td class="py-1.5 px-2 text-right space-x-1 whitespace-nowrap">
-                            {% if cf_lower.endswith('.db') or cf_lower.endswith('.sqlite') or cf_lower.endswith('.sqlite3') %}
+                            {% if cf_lower.endswith('.db') or cf_lower.endswith('.sqlite') or cf_lower.endswith('.sqlite3') or cf_lower.endswith('.db.gz') or cf_lower.endswith('.sqlite.gz') or cf_lower.endswith('.sqlite3.gz') %}
                             <button type="button"
                                     hx-post="/actions/gdrive-restore-db"
                                     hx-vals='{"file_id": "{{ cf.id }}", "folder_id": "{{ active_folder_id }}"}'

@@ -39,7 +39,7 @@ class GoogleDriveManager:
                 creds = flow.run_local_server(port=0, open_browser=True)
             self.TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
 
-        self.service = build("drive", "v3", credentials=creds)
+        self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
     @staticmethod
     def compute_local_md5(file_path: Path) -> str:
@@ -101,8 +101,41 @@ class GoogleDriveManager:
         files = res.get("files", [])
         return [
             f for f in files
-            if str(f.get("name", "")).lower().endswith((".db", ".sqlite", ".sqlite3"))
+            if any(str(f.get("name", "")).lower().endswith(ext) for ext in (
+                ".db", ".sqlite", ".sqlite3", ".db.gz", ".sqlite.gz", ".sqlite3.gz"
+            ))
         ]
+
+    def prune_older_db_backups(self, folder_id: Optional[str] = None, keep_file_id: Optional[str] = None) -> List[str]:
+        """
+        Keeps only 1 database backup file (.db/.sqlite/.sqlite3) on Google Drive in the folder.
+        Deletes all other database backup files.
+        Returns list of deleted file names.
+        """
+        if not self.service:
+            self.authenticate()
+
+        backups = self.list_db_backups(folder_id=folder_id)
+        if not backups:
+            return []
+
+        if keep_file_id:
+            to_delete = [b for b in backups if str(b.get("id")) != str(keep_file_id)]
+        else:
+            to_delete = backups[1:]
+
+        deleted_names: List[str] = []
+        for f in to_delete:
+            fid = f.get("id")
+            fname = str(f.get("name", fid))
+            try:
+                self.service.files().delete(fileId=fid).execute()
+                deleted_names.append(fname)
+                logger.info("Deleted older Google Drive DB backup: %s (%s)", fname, fid)
+            except Exception as exc:
+                logger.warning("Could not delete older Google Drive DB backup %s: %s", fname, exc)
+
+        return deleted_names
 
     def download_and_verify_backup(self, file_id: str, dest_path: Path) -> Dict[str, Any]:
         if not self.service:
@@ -150,7 +183,11 @@ class GoogleDriveManager:
         }
 
     def upload_and_verify(
-        self, local_path: Path, folder_id: str, purge_local_after_verify: bool = False
+        self,
+        local_path: Path,
+        folder_id: str,
+        purge_local_after_verify: bool = False,
+        keep_only_one_db: bool = False,
     ) -> Dict[str, Any]:
         if not self.service:
             self.authenticate()
@@ -164,15 +201,22 @@ class GoogleDriveManager:
 
         meta = {"name": local_path.name, "parents": [folder_id]}
         media = MediaFileUpload(str(local_path.resolve()), chunksize=5 * 1024 * 1024, resumable=True)
-        req = self.service.files().create(
-            body=meta,
-            media_body=media,
-            fields="id, name, size, md5Checksum, createdTime, webViewLink",
-        )
+        try:
+            req = self.service.files().create(
+                body=meta,
+                media_body=media,
+                fields="id, name, size, md5Checksum, createdTime, webViewLink",
+            )
 
-        response = None
-        while response is None:
-            _, response = req.next_chunk()
+            response = None
+            while response is None:
+                _, response = req.next_chunk()
+        finally:
+            try:
+                if hasattr(media, "_fd") and media._fd:
+                    media._fd.close()
+            except Exception:
+                pass
 
         cloud_size = int(response.get("size", -1))
         cloud_md5 = response.get("md5Checksum", "")
@@ -189,6 +233,16 @@ class GoogleDriveManager:
             local_path.unlink()
             purged = True
 
+        pruned_backups: List[str] = []
+        is_db = any(local_path.name.lower().endswith(ext) for ext in (
+            ".db", ".sqlite", ".sqlite3", ".db.gz", ".sqlite.gz", ".sqlite3.gz"
+        ))
+        if (keep_only_one_db or is_db) and verified:
+            try:
+                pruned_backups = self.prune_older_db_backups(folder_id, keep_file_id=response.get("id"))
+            except Exception as exc:
+                logger.warning("Could not prune older Google Drive DB backups: %s", exc)
+
         return {
             "id": response.get("id"),
             "name": response.get("name"),
@@ -196,6 +250,7 @@ class GoogleDriveManager:
             "md5": cloud_md5,
             "verified": verified,
             "purged_local": purged,
+            "pruned_backups": pruned_backups,
             "webViewLink": response.get("webViewLink"),
             "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
