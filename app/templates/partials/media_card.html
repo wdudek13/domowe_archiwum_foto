@@ -1,11 +1,9 @@
 <div class="group relative bg-cardBg rounded-lg border border-borderBg overflow-hidden shadow transition hover:border-slate-500 flex flex-col">
-    <!-- Checkbox Selector -->
     <div class="absolute top-2 left-2 z-20">
         <input type="checkbox" name="selected_ids" value="{{ item.id }}" 
                class="rounded bg-slate-900/80 border-borderBg text-indigo-600 focus:ring-0 w-4 h-4 cursor-pointer">
     </div>
 
-    <!-- Offline / Online Volume Badge -->
     <div class="absolute top-2 right-2 z-20 flex space-x-1 items-center">
         {% if item.volume.is_online %}
             <span title="Dysk Online: {{ item.volume.volume_label }} ({{ item.volume.last_known_drive_letter }})" 
@@ -20,15 +18,14 @@
         {% endif %}
     </div>
 
-    <!-- Thumbnail Wrapper -->
     <div class="aspect-square w-full bg-slate-900 relative cursor-pointer overflow-hidden"
          hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container" hx-swap="innerHTML">
         <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}" 
              alt="{{ item.file_name }}"
              loading="lazy"
+             style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
              class="w-full h-full object-cover transition duration-300 group-hover:scale-105">
 
-        <!-- Indicators Overlay -->
         <div class="absolute bottom-2 left-2 flex space-x-1 items-center z-10">
             {% if item.media_type == 'video' %}
                 <span class="bg-black/70 text-white text-[10px] font-mono px-1 rounded backdrop-blur">
@@ -48,7 +45,11 @@
                 </span>
             {% endif %}
 
-            {% if not item.is_primary_duplicate %}
+            {% if item.is_backup_copy %}
+                <span title="Kopia zapasowa (backup)" class="bg-sky-900/90 text-sky-200 text-[10px] px-1 rounded">
+                    BKP
+                </span>
+            {% elif not item.is_primary_duplicate %}
                 <span title="Duplikat binarny" class="bg-rose-900/90 text-rose-300 text-[10px] px-1 rounded">
                     DUP
                 </span>
@@ -56,7 +57,6 @@
         </div>
     </div>
 
-    <!-- Metadata Footer -->
     <div class="p-2 flex flex-col justify-between flex-1 bg-cardBg/90 text-[11px]">
         <div class="truncate font-medium text-slate-300" title="{{ item.file_name }}">{{ item.file_name }}</div>
         <div class="flex justify-between items-center text-slate-500 mt-1">

@@ -2,9 +2,43 @@
     <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full max-h-[90vh] overflow-hidden shadow-2xl flex flex-col md:flex-row">
         <div class="w-full md:w-1/2 bg-black flex flex-col items-center justify-center p-4 relative">
             {% if item.media_type == 'video' %}
-                <video src="/media/{{ item.id }}/raw" controls autoplay class="max-h-[65vh] w-full rounded"></video>
+                <video src="/media/{{ item.id }}/raw" controls autoplay
+                       onerror="this.classList.add('hidden'); this.nextElementSibling && this.nextElementSibling.classList.remove('hidden');"
+                       class="max-h-[65vh] w-full rounded"></video>
+                <div class="hidden text-center text-slate-400 text-xs p-6 border border-rose-800/60 bg-slate-900 rounded-xl space-y-1">
+                    <div class="text-2xl">⚠️</div>
+                    <div class="text-rose-300 font-semibold">Nie można odtworzyć wideo</div>
+                    <div>Plik uszkodzony lub nośnik offline bez cache MP4.</div>
+                </div>
             {% else %}
-                <img src="/media/{{ item.id }}/raw" class="max-h-[65vh] object-contain rounded cursor-pointer" onclick="openLightboxById('{{ item.id }}'); this.closest('.fixed').remove();">
+                <img id="detail-modal-img" src="/media/{{ item.id }}/raw"
+                     onerror="this.onerror=null; this.classList.add('hidden'); this.nextElementSibling && this.nextElementSibling.classList.remove('hidden');"
+                     style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
+                     class="max-h-[60vh] object-contain rounded cursor-pointer transition-transform duration-200"
+                     onclick="openLightboxById('{{ item.id }}'); this.closest('.fixed').remove();">
+                <div class="hidden text-center text-slate-400 text-xs p-6 border border-rose-800/60 bg-slate-900 rounded-xl space-y-1">
+                    <div class="text-2xl">⚠️</div>
+                    <div class="text-rose-300 font-semibold">Nie można wyświetlić podglądu obrazu</div>
+                    <div>Plik źródłowy uszkodzony albo nośnik offline i brak miniatury.</div>
+                </div>
+                <div class="mt-3 flex items-center space-x-2">
+                    <button type="button"
+                            hx-post="/actions/rotate-media"
+                            hx-vals='{"media_id": "{{ item.id }}", "delta": -90}'
+                            hx-target="#global-notification"
+                            onclick="const im = document.getElementById('detail-modal-img'); const cur = parseInt(im.dataset.rot || '{{ item.rotation_angle or 0 }}'); const nxt = (cur - 90 + 360) % 360; im.dataset.rot = nxt; im.style.transform = 'rotate(' + nxt + 'deg)';"
+                            class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1 rounded-lg border border-borderBg">
+                        ⟲ Obróć -90°
+                    </button>
+                    <button type="button"
+                            hx-post="/actions/rotate-media"
+                            hx-vals='{"media_id": "{{ item.id }}", "delta": 90}'
+                            hx-target="#global-notification"
+                            onclick="const im = document.getElementById('detail-modal-img'); const cur = parseInt(im.dataset.rot || '{{ item.rotation_angle or 0 }}'); const nxt = (cur + 90) % 360; im.dataset.rot = nxt; im.style.transform = 'rotate(' + nxt + 'deg)';"
+                            class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1 rounded-lg border border-borderBg">
+                        ⟳ Obróć +90°
+                    </button>
+                </div>
             {% endif %}
         </div>
         <div class="w-full md:w-1/2 p-6 flex flex-col justify-between text-xs space-y-4 overflow-y-auto">
@@ -14,10 +48,13 @@
                     <button onclick="this.closest('.fixed').remove();" class="text-slate-400 hover:text-white text-xl">&times;</button>
                 </div>
 
-                <div class="mt-4 space-y-2">
-                    <div class="flex justify-between"><span class="text-slate-500">Efektywna data:</span><span class="font-mono text-emerald-400">{{ item.effective_date.strftime('%Y-%m-%d %H:%M:%S') }}</span></div>
-                    <div class="flex justify-between"><span class="text-slate-500">Data EXIF:</span><span class="font-mono">{{ item.exif_date or 'Brak' }}</span></div>
-                    <div class="flex justify-between"><span class="text-slate-500">Rozdzielczość:</span><span>{{ item.width or '?' }} x {{ item.height or '?' }} px</span></div>
+                <div class="mt-4 space-y-1.5">
+                    <div class="flex justify-between"><span class="text-slate-500">Efektywna data (wybrana):</span><span class="font-mono text-emerald-400">{{ item.effective_date.strftime('%Y-%m-%d %H:%M:%S') }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data EXIF / wideo:</span><span class="font-mono">{{ item.exif_date.strftime('%Y-%m-%d %H:%M:%S') if item.exif_date else 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data z nazwy pliku:</span><span class="font-mono">{{ item.filename_date.strftime('%Y-%m-%d %H:%M:%S') if item.filename_date else 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data z folderu:</span><span class="font-mono">{{ folder_date_str or 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data pliku (utworz. / modyf.):</span><span class="font-mono text-[10px]">{{ item.fs_ctime.strftime('%Y-%m-%d %H:%M') }} / {{ item.fs_mtime.strftime('%Y-%m-%d %H:%M') }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Rozdzielczość / Kąt obrotu:</span><span>{{ item.width or '?' }} x {{ item.height or '?' }} px ({{ item.rotation_angle or 0 }}°)</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Wskaźnik ostrości (Laplacian):</span><span class="font-mono">{{ "%.1f"|format(item.blur_score) if item.blur_score is not none else 'Nie badano' }}</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Wektor cech AI:</span>
                         {% if item.embedding %}
@@ -26,35 +63,114 @@
                             <span class="text-slate-500">Brak (kliknij ⚡ Analizuj AI)</span>
                         {% endif %}
                     </div>
-                    <div class="flex justify-between"><span class="text-slate-500">Dysk Windows:</span><span>{{ item.volume.volume_label }} ({{ item.volume.volume_serial_number }})</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Urządzenie Windows:</span><span>{{ item.volume.volume_label }} ({{ item.volume.volume_serial_number }})</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Ścieżka na dysku:</span><span class="font-mono text-[10px] truncate max-w-[200px]" title="{{ item.relative_path }}">{{ item.volume.last_known_drive_letter }}{{ item.relative_path }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Album:</span><span class="text-indigo-300 font-semibold">{{ item.group.name if item.group else 'Brak (Swobodna pula)' }}</span></div>
+                </div>
+
+                <!-- Diagnostyka jakości i wady (Kandydat do usunięcia) -->
+                {% if defect_labels %}
+                <div class="mt-3 p-3 rounded-xl bg-orange-950/30 border border-orange-700/60 space-y-2">
+                    <div class="flex items-center justify-between">
+                        <div class="font-bold text-orange-300 text-xs flex items-center space-x-1.5">
+                            <span>⚠️ Wykryte wady jakości (kandydat do usunięcia):</span>
+                        </div>
+                        <button type="button"
+                                hx-post="/actions/move-to-trash"
+                                hx-vals='{"scope": "selected", "selected_ids": "{{ item.id }}"}'
+                                hx-target="#global-notification"
+                                onclick="this.closest('.fixed').remove();"
+                                class="bg-rose-800 hover:bg-rose-700 text-white text-[11px] px-2.5 py-1 rounded font-semibold shadow">
+                            🗑️ Przenieś do Kosza
+                        </button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                        {% for d in defect_labels %}
+                        <button type="button"
+                                onclick="this.closest('.fixed').remove(); applySidebarFilter({_reset: true, tag: '{{ d.tag }}'})"
+                                title="{{ d.desc }} — kliknij aby filtrować wszystkie takie zdjęcia"
+                                class="{{ d.badge_class }} border text-[11px] px-2.5 py-1 rounded-full font-medium hover:brightness-125 transition flex items-center space-x-1">
+                            <span>{{ d.name }}</span>
+                            <span class="text-[9px] opacity-75">🔍</span>
+                        </button>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <!-- Szybka zmiana daty lub usunięcie z listy niezgodności dat (Req 4a) -->
+                <div class="mt-3 p-2.5 rounded-xl bg-slate-900/90 border border-borderBg space-y-2">
+                    <form hx-post="/actions/change-date"
+                          hx-target="#global-notification"
+                          hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                          class="flex items-center space-x-1.5">
+                        <input type="hidden" name="scope" value="selected">
+                        <input type="hidden" name="selected_ids" value="{{ item.id }}">
+                        <input type="text" name="new_date" value="{{ item.effective_date.strftime('%Y-%m-%d %H:%M') }}"
+                               class="bg-cardBg border border-borderBg rounded px-2 py-1 text-white font-mono flex-1">
+                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white px-2.5 py-1 rounded font-semibold">📅 Zmień datę</button>
+                    </form>
+                    {% if item.has_date_anomaly %}
+                    <div class="flex items-center justify-between text-[11px] text-amber-300 pt-1 border-t border-borderBg/50">
+                        <span>⚠️ {{ item.date_anomaly_reason }}</span>
+                        <button type="button"
+                                hx-post="/actions/clear-date-anomaly"
+                                hx-vals='{"media_id": "{{ item.id }}"}'
+                                hx-target="#global-notification"
+                                hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                                class="bg-emerald-800 hover:bg-emerald-700 text-white px-2 py-0.5 rounded font-semibold">
+                            ✓ Usuń z listy niezgodności dat (bez zmiany daty)
+                        </button>
+                    </div>
+                    {% endif %}
+                </div>
+
+                <!-- Szybki wybór albumu z listy lub nowy album (Req 2c) -->
+                <div class="mt-3 p-2.5 rounded-xl bg-slate-900/90 border border-borderBg">
+                    <form hx-post="/actions/assign-group"
+                          hx-target="#global-notification"
+                          hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                          class="flex items-center space-x-1.5">
+                        <input type="hidden" name="scope" value="selected">
+                        <input type="hidden" name="selected_ids" value="{{ item.id }}">
+                        <select name="existing_group_id" class="bg-cardBg border border-borderBg rounded px-2 py-1 text-white flex-1">
+                            <option value="">-- Wybierz album z listy --</option>
+                            {% for ch in flat_album_choices %}
+                            <option value="{{ ch.id }}" {% if item.group_id == ch.id %}selected{% endif %}>📁 {{ ch.full_label }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="text" name="group_name" placeholder="lub nowy..." class="bg-cardBg border border-borderBg rounded px-2 py-1 text-white w-28">
+                        <button type="submit" class="bg-indigo-700 hover:bg-indigo-600 text-white px-2.5 py-1 rounded font-semibold">Zapisz</button>
+                    </form>
                 </div>
 
                 <div class="mt-4">
                     <span class="text-slate-400 font-semibold">Wygenerowane Tagi AI (Kliknij aby filtrować):</span>
                     <div class="flex flex-wrap gap-1.5 mt-2">
-                        {% for t in item.tags %}
+                        {% for t in (semantic_tags if semantic_tags is defined else item.tags) %}
                         <button onclick="this.closest('.fixed').remove(); applySidebarFilter({_reset: true, tag: '{{ t.tag }}'})"
                                 class="bg-indigo-950 hover:bg-indigo-800 text-indigo-300 border border-indigo-700/60 text-[11px] px-2.5 py-1 rounded-full transition">
                             🏷️ {{ t.tag }} <span class="text-indigo-400 font-mono">({{ "%.0f"|format(t.confidence*100) }}%)</span>
                         </button>
                         {% else %}
-                        <span class="text-slate-500 italic">Brak tagów. Kliknij przycisk '⚡ Analizuj AI' na pasku.</span>
+                        <span class="text-slate-500 italic">Brak obiektów rozpoznanych przez AI.</span>
                         {% endfor %}
                     </div>
                 </div>
 
-{% if duplicate_copies and duplicate_copies|length > 1 %}
+                {% if duplicate_copies and duplicate_copies|length > 1 %}
                 <div class="mt-4 p-3 rounded-xl bg-rose-950/30 border border-rose-800/60 space-y-2">
                     <div class="font-bold text-rose-300 text-xs">👥 Identyczne kopie tego pliku ({{ duplicate_copies|length }} szt. o tym samym SHA-256):</div>
                     <div class="space-y-1.5 max-h-36 overflow-y-auto">
                         {% for dup in duplicate_copies %}
                         <div class="flex items-center justify-between p-1.5 rounded bg-slate-900/90 border border-borderBg text-[10px]">
                             <div class="truncate pr-2">
-                                {% if dup.is_primary_duplicate %}
+                                {% if dup.is_backup_copy %}
+                                    <span class="bg-sky-800 text-sky-200 px-1 rounded font-bold mr-1">BACKUP</span>
+                                {% elif dup.is_primary_duplicate %}
                                     <span class="bg-emerald-800 text-emerald-200 px-1 rounded font-bold mr-1">ORYGINAŁ</span>
                                 {% else %}
-                                    <span class="bg-rose-800 text-rose-200 px-1 rounded font-bold mr-1">KOPIA</span>
+                                    <span class="bg-rose-800 text-rose-200 px-1 rounded font-bold mr-1">DUPLIKAT</span>
                                 {% endif %}
                                 <span class="text-amber-300 font-semibold">{{ dup.volume.volume_label }}</span>
                                 <span class="font-mono text-slate-300">({{ dup.volume.last_known_drive_letter }}{{ dup.relative_path }})</span>

@@ -19,6 +19,7 @@
             <input type="hidden" name="folder_prefix" value="">
             <input type="hidden" name="group_id" value="">
             <input type="hidden" name="tag" value="">
+            <input type="hidden" name="quality_defect" value="">
             <input type="hidden" name="year" value="">
             <input type="hidden" name="page" value="1">
             <input type="checkbox" name="trashed_only" value="true" class="hidden">
@@ -26,7 +27,10 @@
             <input type="checkbox" name="blurry_only" value="true" class="hidden">
             <input type="checkbox" name="duplicates_only" value="true" class="hidden">
             <input type="checkbox" name="untagged_only" value="true" class="hidden">
+            <input type="checkbox" name="unvectored_only" value="true" class="hidden">
+            <input type="checkbox" name="unanalyzed_quality_only" value="true" class="hidden">
             <input type="checkbox" name="ungrouped_only" value="true" class="hidden">
+            <input type="checkbox" name="unbacked_only" value="true" class="hidden">
 
             <div class="flex items-center space-x-1">
                 <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
@@ -71,36 +75,47 @@
 
         <div class="flex flex-wrap items-center gap-2">
             <button type="button"
-                    hx-post="/actions/analyze-all"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-target="#global-notification"
+                    onclick="document.getElementById('ai-modal').classList.remove('hidden')"
                     class="bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white px-3.5 py-1.5 rounded-lg font-semibold shadow transition">
-                ⚡ Analizuj AI (Tagi + Wektory 512-D + Ostrość)
+                ⚡ Analizuj AI (Wybór analizy i dysków)
             </button>
             <button type="button"
                     onclick="document.getElementById('group-modal').classList.remove('hidden')"
                     class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-white px-3 py-1.5 rounded-lg font-medium transition">
-                📁 Przypisz do grupy / podfolderu
+                📁 Przypisz do albumu
             </button>
-<button type="button"
-        onclick="document.getElementById('move-files-modal').classList.remove('hidden')"
-        class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-medium transition">
-    🚚 Przenieś fizycznie pliki
-</button>
+            <button type="button"
+                    onclick="document.getElementById('date-modal').classList.remove('hidden')"
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-amber-300 px-3 py-1.5 rounded-lg font-medium transition">
+                📅 Zmień datę / Niezgodności
+            </button>
+            <button type="button"
+                    hx-post="/actions/rotate-media"
+                    hx-vals='{"delta": "90"}'
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-sky-300 px-3 py-1.5 rounded-lg font-medium transition">
+                ⟳ Obróć +90°
+            </button>
+            <button type="button"
+                    onclick="document.getElementById('move-files-modal').classList.remove('hidden')"
+                    class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-medium transition">
+                🚚 Przenieś pliki (Online / TODO)
+            </button>
             <button type="button"
                     hx-post="/actions/export-json-disk"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                     hx-target="#global-notification"
                     class="bg-emerald-800/80 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg transition">
-                📥 Zapisz JSON na dysk
+                📥 Zapisz JSON
             </button>
-<button type="button"
+            <button type="button"
                     hx-post="/actions/unindex"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                     hx-confirm="Usunąć wybrane pozycje z bazy danych (wyindeksować)? Oryginalne pliki na dysku NIE zostaną usunięte."
                     hx-target="#global-notification"
                     class="bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 px-3 py-1.5 rounded-lg transition">
-                ✖️ Usuń z bazy (bez pliku)
+                ✖️ Usuń z bazy
             </button>
             <button type="button"
                     hx-post="/actions/move-to-trash"
@@ -108,28 +123,73 @@
                     hx-confirm="Czy na pewno przenieść wybrane zdjęcia do lokalnego katalogu kosza (data/kosz)?"
                     hx-target="#global-notification"
                     class="bg-rose-900/80 hover:bg-rose-800 border border-rose-700 text-rose-200 px-3 py-1.5 rounded-lg transition">
-                🗑️ Przenieś do Kosza
+                🗑️ Do Kosza
             </button>
-<button type="button"
+            <button type="button"
                     hx-post="/actions/delete-permanently"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                     hx-confirm="UWAGA! Czy na pewno TRWALE usunąć wybrane pliki fizycznie z dysku/pendrive'a? Tej operacji NIE można cofnąć!"
                     hx-target="#global-notification"
                     class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-3 py-1.5 rounded-lg font-semibold transition">
-                🔥 Usuń trwale z dysku
+                🔥 Usuń trwale
             </button>
         </div>
     </div>
 
-<div id="media-grid" hx-get="/media/search" hx-trigger="refresh-all from:body" hx-include="#filter-form">
+    <div id="media-grid" hx-get="/media/search" hx-trigger="refresh-all from:body" hx-include="#filter-form">
         {% include "partials/media_grid.html" %}
     </div>
 </div>
 
+<!-- Granular AI Analysis Modal (Requirement 3b) -->
+<div id="ai-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
+        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+            <h3 class="font-bold text-sm text-purple-300">⚡ Uruchom Analizę AI (Pojedyncza lub Wszystkie)</h3>
+            <button type="button" onclick="document.getElementById('ai-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+        </div>
+        <form hx-post="/actions/analyze-all"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              onsubmit="document.getElementById('ai-modal').classList.add('hidden');"
+              class="space-y-4">
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">1. Wybierz rodzaj analizy AI / Indeksu:</label>
+                <select id="ai-analysis-type-select" name="analysis_type" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="all">🧠 Wszystkie analizy AI (Tagi + Wektory 512-D + Ostrość i wady)</option>
+                    <option value="tags">🏷️ Tylko Tagowanie Obiektów i Scen (ONNX MobileNetV2 + OpenCV)</option>
+                    <option value="vectors">📐 Tylko Wektory Podobieństwa Wizualnego 512-D (CIE LAB + HSV)</option>
+                    <option value="quality">🔍 Detekcja ostrości (Blur), ekspozycji, uszkodzeń i zdjęć do usunięcia</option>
+                    <option value="duplicates_fast">⚡ Szybka analiza duplikatów (indeks SHA-256 / częściowy hash wideo)</option>
+                    <option value="duplicates_exact">🔬 Dokładna analiza duplikatów 100% (pełna weryfikacja binarna na dyskach)</option>
+                    <option value="unbacked">🛡️ Analiza zdjęć bez kopii zapasowej (backupu) na innym urządzeniu</option>
+                    <option value="date_discrepancy">📅 Analiza niezgodności dat (EXIF / data utworzenia / nazwa pliku / folder)</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">2. Wybierz zakres dysków / zdjęć:</label>
+                <select name="target_drive_scope" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="current">🎯 Zgodnie z paskiem akcji (Aktualny filtr / Zaznaczone zdjęcia)</option>
+                    <option value="all_drives">🌐 Wszystkie dyski w bazie danych</option>
+                    {% for v in all_volumes %}
+                    <option value="volume:{{ v.id }}">💾 Tylko dysk: {{ v.volume_label }} ({{ v.last_known_drive_letter }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <p class="text-[11px] text-slate-400">Modele AI są ładowane do RAM wyłącznie na czas zadania i natychmiast zwalniane po zakończeniu. Proces możesz w każdej chwili zatrzymać i wznowić.</p>
+            <div class="flex justify-end space-x-2 pt-2">
+                <button type="button" onclick="document.getElementById('ai-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded-lg font-semibold text-white">▶️ Wystartuj Analizę</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Assign to Album Modal (Requirement 2a, 2c) -->
 <div id="group-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
     <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
         <div class="flex justify-between items-center border-b border-borderBg pb-3">
-            <h3 class="font-bold text-sm text-white">Przypisz do grupy lub utwórz podgrupę w drzewie</h3>
+            <h3 class="font-bold text-sm text-white">📁 Przypisz zdjęcia do albumu lub utwórz nowy album</h3>
             <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
         </div>
         <form hx-post="/actions/assign-group"
@@ -138,24 +198,93 @@
               onsubmit="document.getElementById('group-modal').classList.add('hidden');"
               class="space-y-4">
             <div>
-                <label class="block text-slate-400 mb-1">Nazwa grupy / podkatalogu:</label>
-                <input type="text" name="group_name" placeholder="np. Grecja_2024" required class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                <label class="block text-slate-300 mb-1 font-semibold">Wybierz istniejący album z listy:</label>
+                <select name="existing_group_id" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="">-- Utwórz nowy album poniżej --</option>
+                    {% for ch in flat_album_choices %}
+                    <option value="{{ ch.id }}">📁 {{ ch.full_label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="border-t border-borderBg pt-3">
+                <label class="block text-slate-300 mb-1 font-semibold">Lub podaj nazwę nowego albumu / podalbumu:</label>
+                <input type="text" name="group_name" placeholder="np. Grecja_2024" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
             </div>
             <div>
-                <label class="block text-slate-400 mb-1">ID grupy nadrzędnej (opcjonalnie, dla podfolderu w drzewie):</label>
-                <input type="number" name="parent_id" placeholder="Puste = główny poziom" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2 text-slate-300">
+                <label class="block text-slate-400 mb-1">Album nadrzędny (opcjonalnie, dla podalbumu w drzewie):</label>
+                <select name="parent_id" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2 text-slate-300">
+                    <option value="">-- Poziom główny (Root) --</option>
+                    {% for ch in flat_album_choices %}
+                    <option value="{{ ch.id }}">📁 {{ ch.full_label }}</option>
+                    {% endfor %}
+                </select>
             </div>
             <div class="flex justify-end space-x-2 pt-2">
                 <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
-                <button type="submit" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-semibold text-white">Zapisz</button>
+                <button type="submit" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-semibold text-white">Zapisz w albumie</button>
             </div>
         </form>
     </div>
 </div>
+
+<!-- Change Date & Clear Date Anomaly Modal (Requirement 4a Multimedia) -->
+<div id="date-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
+        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+            <h3 class="font-bold text-sm text-amber-300">📅 Zmiana daty zdjęć i zarządzanie listą niezgodności dat</h3>
+            <button type="button" onclick="document.getElementById('date-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+        </div>
+        <form hx-post="/actions/change-date"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              onsubmit="document.getElementById('date-modal').classList.add('hidden');"
+              class="space-y-3">
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">Nowa data (RRRR-MM-DD lub RRRR-MM-DD GG:MM):</label>
+                <input type="text" name="new_date" placeholder="np. 2023-07-15 14:30" required
+                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white font-mono">
+            </div>
+            <div>
+                <label class="block text-slate-400 mb-1">Opcjonalnie zastosuj dla całego wybranego albumu:</label>
+                <select name="album_id" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2 text-slate-200">
+                    <option value="">-- Zgodnie z zaznaczeniem / aktualnym filtrem --</option>
+                    {% for ch in flat_album_choices %}
+                    <option value="{{ ch.id }}">📁 Cały album: {{ ch.full_label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <p class="text-[11px] text-slate-400">Zmiana daty automatycznie usuwa zdjęcia z listy niezgodności dat.</p>
+            <div class="flex justify-end space-x-2 pt-1">
+                <button type="submit" class="w-full py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg font-semibold text-white">📅 Zmień datę i usuń z listy niezgodności</button>
+            </div>
+        </form>
+
+        <div class="border-t border-borderBg pt-3 space-y-2">
+            <div class="text-slate-300 font-semibold">Lub usuń z listy niezgodności dat BEZ zmiany daty:</div>
+            <button type="button"
+                    hx-post="/actions/clear-date-anomaly"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    onclick="document.getElementById('date-modal').classList.add('hidden');"
+                    class="w-full py-2 bg-emerald-800 hover:bg-emerald-700 text-white rounded-lg font-semibold">
+                ✓ Zatwierdź obecną datę (usuń z listy niezgodności bez zmiany daty)
+            </button>
+            <button type="button"
+                    hx-post="/actions/recalculate-date-anomalies"
+                    hx-target="#global-notification"
+                    onclick="document.getElementById('date-modal').classList.add('hidden');"
+                    class="w-full py-2 bg-amber-800 hover:bg-amber-700 text-white rounded-lg font-semibold">
+                🔄 Automatycznie rozpoznaj daty (folder / plik / EXIF) i wykryj rozbieżności kopiowania
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Move Files (Physical Online or Offline TODO Queue) Modal (Requirement 4b Offline) -->
 <div id="move-files-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
     <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
         <div class="flex justify-between items-center border-b border-borderBg pb-3">
-            <h3 class="font-bold text-sm text-amber-400">🚚 Fizyczne przenoszenie plików na dysku / USB</h3>
+            <h3 class="font-bold text-sm text-amber-400">🚚 Przenoszenie plików między urządzeniami (Online / Offline TODO)</h3>
             <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
         </div>
         <form hx-post="/actions/move-files"
@@ -164,14 +293,31 @@
               onsubmit="document.getElementById('move-files-modal').classList.add('hidden');"
               class="space-y-4">
             <div>
-                <label class="block text-slate-300 mb-1">Docelowa ścieżka katalogu (zostanie utworzona, jeśli nie istnieje):</label>
-                <input type="text" name="destination_path" placeholder="np. E:\Wakacje_Wybrane lub D:\Archiwum_2024" required
-                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white font-mono">
-                <p class="text-[11px] text-slate-400 mt-1">Przed przeniesieniem system automatycznie wykona kopię zapasową bazy SQLite i zaktualizuje ścieżki.</p>
+                <label class="block text-slate-300 mb-1 font-semibold">Opcja A: Wybierz zarejestrowane urządzenie docelowe (działa także Offline!):</label>
+                <select name="target_volume_id" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="">-- Lub wpisz pełną ścieżkę poniżej --</option>
+                    {% for v in all_volumes %}
+                    <option value="{{ v.id }}">
+                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} ({{ v.last_known_drive_letter }})
+                    </option>
+                    {% endfor %}
+                </select>
+                <input type="text" name="target_subfolder" placeholder="Podkatalog na dysku docelowym, np. Wakacje_2024"
+                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2 text-white font-mono mt-2">
             </div>
+            <div class="border-t border-borderBg pt-3">
+                <label class="block text-slate-300 mb-1 font-semibold">Opcja B: Lub wpisz bezpośrednią ścieżkę katalogu:</label>
+                <input type="text" name="destination_path" placeholder="np. E:\Wakacje_Wybrane lub D:\Archiwum_2024"
+                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white font-mono">
+            </div>
+            <label class="flex items-center space-x-2 text-amber-300 cursor-pointer">
+                <input type="checkbox" name="force_offline_todo" value="true" class="rounded bg-slate-900 border-borderBg text-amber-500">
+                <span>Dodaj wyłącznie do listy TODO (przenieś logicznie w bazie, a fizycznie później)</span>
+            </label>
+            <p class="text-[11px] text-slate-400">Jeśli dysk źródłowy lub docelowy jest odłączony (Offline), system automatycznie przeniesie pliki logicznie w bazie i zapisze fizyczną operację na liście TODO do wykonania po podłączeniu dysków.</p>
             <div class="flex justify-end space-x-2 pt-2">
                 <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
-                <button type="submit" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg font-semibold text-white">Przenieś pliki teraz</button>
+                <button type="submit" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg font-semibold text-white">Przenieś / Dodaj do TODO</button>
             </div>
         </form>
     </div>

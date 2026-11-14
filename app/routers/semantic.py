@@ -1,5 +1,6 @@
 import datetime
 from collections import defaultdict
+import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select, or_, and_
@@ -10,8 +11,9 @@ from app.database import get_db, THUMBNAILS_DIR
 from app.models import MediaEmbedding, MediaItem, MediaTag, MediaGroup, WindowsVolume
 from app.ai.embeddings import OnDemandClipEmbedder
 from app.ai.tagger import PL_CATEGORY_MAPPING
-from app.routers.media import render_template
+from app.routers.media import render_template, build_flat_album_choices
 
+logger = logging.getLogger("SemanticRouter")
 router = APIRouter(prefix="/semantic", tags=["Semantic Search"])
 
 SIMILARITY_MODES = {
@@ -42,8 +44,9 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
     ):
         return np.frombuffer(item.embedding.vector, dtype=np.float32)
 
+    from app.scanner import ThumbnailService
     thumb_p = THUMBNAILS_DIR / item.thumbnail_relative_path
-    if not thumb_p.exists() or thumb_p.stat().st_size < 100:
+    if not ThumbnailService.is_valid_thumbnail(thumb_p):
         if item.volume:
             src_p = Path(item.volume.last_known_drive_letter) / item.relative_path
             if src_p.exists():
@@ -53,8 +56,8 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
         try:
             blob = OnDemandClipEmbedder.generate_image_embedding(thumb_p)
             return np.frombuffer(blob, dtype=np.float32)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("In-RAM vector computation skipped: %s", exc)
 
     return np.zeros(512, dtype=np.float32)
 
@@ -81,9 +84,22 @@ def find_visually_similar(
     ).unique().first()
 
     if not target_item:
-        return render_template(request, "partials/media_grid.html", {"timeline": {}, "items_flat": [], "total_matching": 0, "total_size_mb": 0, "page": 1, "total_pages": 1, "view_mode": "grid", "similarity_scores": {}})
+        return render_template(
+            request,
+            "partials/media_grid.html",
+            {
+                "timeline": {},
+                "items_flat": [],
+                "total_matching": 0,
+                "total_size_mb": 0,
+                "page": 1,
+                "total_pages": 1,
+                "view_mode": "grid",
+                "similarity_scores": {},
+            },
+        )
 
-    # 1. Wylicz wektor 512-D wzorca w pamięci RAM (zero zapisów do bazy = zero blokad!)
+    # 1. Compute 512-D pattern vector in RAM without locking SQLite
     q_full = _compute_vector_in_ram(target_item)
     q_lab = _unit(q_full[0:192])
     q_hsv = _unit(q_full[192:448])
@@ -93,7 +109,7 @@ def find_visually_similar(
     target_aspect = (target_item.width / target_item.height) if (target_item.width and target_item.height) else 1.0
     target_parent_dir = str(target_item.relative_path).rsplit("/", 1)[0] if "/" in target_item.relative_path else ""
 
-    # 2. Zbierz pulę kandydatów z całej bazy:
+    # 2. Gather candidate pool from SQLite
     time_low = target_item.effective_date - datetime.timedelta(hours=72)
     time_high = target_item.effective_date + datetime.timedelta(hours=72)
 
@@ -142,7 +158,7 @@ def find_visually_similar(
         ).unique().all()
     )
 
-    # 3. Wielokryterialna ocena podobieństwa w RAM
+    # 3. Multi-criteria similarity scoring in RAM
     scored_results = [(target_item, 100.0)]
 
     for cand in candidates:
@@ -230,6 +246,7 @@ def find_visually_similar(
     sorted_items = [x[0] for x in top_matches]
     scores_map = {x[0].id: x[1] for x in top_matches}
     total_bytes = sum(it.file_size_bytes for it in sorted_items)
+    all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all())
 
     label = f"{SIMILARITY_MODES[mode]} — Wzorzec (100%): {target_item.file_name}"
     return render_template(
@@ -249,8 +266,9 @@ def find_visually_similar(
             "similarity_target_name": target_item.file_name,
             "similarity_mode": mode,
             "similarity_modes": SIMILARITY_MODES,
-            "all_groups": db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all(),
-            "all_volumes": db.scalars(select(WindowsVolume)).all(),
+            "all_groups": all_groups,
+            "flat_album_choices": build_flat_album_choices(all_groups),
+            "all_volumes": list(db.scalars(select(WindowsVolume)).all()),
             "similarity_scores": scores_map,
         },
     )
@@ -260,7 +278,20 @@ def find_visually_similar(
 def semantic_search(request: Request, q: str = Query(...), db: Session = Depends(get_db)):
     clean_q = q.strip().lower()
     if not clean_q:
-        return render_template(request, "partials/media_grid.html", {"timeline": {}, "items_flat": [], "total_matching": 0, "total_size_mb": 0, "page": 1, "total_pages": 1, "view_mode": "grid", "similarity_scores": {}})
+        return render_template(
+            request,
+            "partials/media_grid.html",
+            {
+                "timeline": {},
+                "items_flat": [],
+                "total_matching": 0,
+                "total_size_mb": 0,
+                "page": 1,
+                "total_pages": 1,
+                "view_mode": "grid",
+                "similarity_scores": {},
+            },
+        )
 
     search_terms = [clean_q]
     for pl_cat, en_words in PL_CATEGORY_MAPPING.items():
@@ -272,14 +303,16 @@ def semantic_search(request: Request, q: str = Query(...), db: Session = Depends
     for term in set(search_terms):
         conds.append(MediaTag.tag.ilike(f"%{term}%"))
 
-    matched_items = db.scalars(
-        select(MediaItem)
-        .options(joinedload(MediaItem.volume), joinedload(MediaItem.group), joinedload(MediaItem.tags), joinedload(MediaItem.embedding))
-        .outerjoin(MediaItem.tags)
-        .where(MediaItem.is_trashed == False, or_(*conds))
-        .distinct()
-        .limit(150)
-    ).unique().all()
+    matched_items = list(
+        db.scalars(
+            select(MediaItem)
+            .options(joinedload(MediaItem.volume), joinedload(MediaItem.group), joinedload(MediaItem.tags), joinedload(MediaItem.embedding))
+            .outerjoin(MediaItem.tags)
+            .where(MediaItem.is_trashed == False, or_(*conds))
+            .distinct()
+            .limit(150)
+        ).unique().all()
+    )
 
     grouped = defaultdict(list)
     total_bytes = 0
@@ -287,6 +320,7 @@ def semantic_search(request: Request, q: str = Query(...), db: Session = Depends
         grouped[it.effective_date.strftime("%Y-%m-%d")].append(it)
         total_bytes += it.file_size_bytes
 
+    all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all())
     return render_template(
         request,
         "partials/media_grid.html",
@@ -300,8 +334,9 @@ def semantic_search(request: Request, q: str = Query(...), db: Session = Depends
             "total_pages": 1,
             "view_mode": "grid",
             "sort_by": "semantic",
-            "all_groups": db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all(),
-            "all_volumes": db.scalars(select(WindowsVolume)).all(),
+            "all_groups": all_groups,
+            "flat_album_choices": build_flat_album_choices(all_groups),
+            "all_volumes": list(db.scalars(select(WindowsVolume)).all()),
             "similarity_scores": {},
         },
     )

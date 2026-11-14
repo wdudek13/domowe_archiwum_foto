@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Tuple
 import cv2
 import numpy as np
+from app.ai.quality import decode_image_array
 
 
 class OnDemandClipEmbedder:
@@ -22,8 +23,7 @@ class OnDemandClipEmbedder:
 
     @classmethod
     def generate_image_embedding(cls, path: Path) -> bytes:
-        file_bytes = np.fromfile(str(path.resolve()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        img = decode_image_array(path, grayscale=False)
         if img is None:
             raise ValueError("Decode failed")
 
@@ -71,9 +71,9 @@ class OnDemandClipEmbedder:
         valid_ids = []
         rows = []
         for cid, blob in candidates:
-            v = np.frombuffer(blob, dtype=np.float32)
-            if len(v) != q_dim:
+            if not blob or len(blob) != q_dim * 4:
                 continue
+            v = np.frombuffer(blob, dtype=np.float32)
             valid_ids.append(cid)
             rows.append(v)
 

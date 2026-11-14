@@ -17,12 +17,15 @@ class WindowsVolume(Base):
     file_system: Mapped[str] = mapped_column(String(32), default="NTFS", nullable=False)
     last_known_drive_letter: Mapped[str] = mapped_column(String(16), nullable=False)
     is_online: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
+    total_space_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, default=0, nullable=True)
+    free_space_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, default=0, nullable=True)
     last_seen_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
     media_items: Mapped[List["MediaItem"]] = relationship("MediaItem", back_populates="volume")
 
 
 class MediaGroup(Base):
+    """Represents a user album or subalbum in the hierarchy (table name preserved for DB compatibility)."""
     __tablename__ = "media_groups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -56,10 +59,13 @@ class MediaItem(Base):
     file_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     hash_algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
     is_primary_duplicate: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
+    is_backup_copy: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    verified_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
 
     width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rotation_angle: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     exif_date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
     filename_date: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
@@ -113,3 +119,55 @@ class MediaEmbedding(Base):
     vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
     media_item: Mapped["MediaItem"] = relationship("MediaItem", back_populates="embedding")
+
+
+class PendingFileMove(Base):
+    """Stores deferred physical file moves scheduled while source or target devices are offline."""
+    __tablename__ = "pending_file_moves"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    media_id: Mapped[str] = mapped_column(String(36), ForeignKey("media_items.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_volume_id: Mapped[int] = mapped_column(Integer, ForeignKey("windows_volumes.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_volume_id: Mapped[int] = mapped_column(Integer, ForeignKey("windows_volumes.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    target_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+    media_item: Mapped["MediaItem"] = relationship("MediaItem")
+    source_volume: Mapped["WindowsVolume"] = relationship("WindowsVolume", foreign_keys=[source_volume_id])
+    target_volume: Mapped["WindowsVolume"] = relationship("WindowsVolume", foreign_keys=[target_volume_id])
+
+
+class BackgroundJob(Base):
+    """Tracks long-running and unfinished background processes for status monitoring, stopping, and resuming."""
+    __tablename__ = "background_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True, nullable=False)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    params_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    remaining_ids_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    last_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False
+    )
+
+
+class OperationLogEntry(Base):
+    """Persistent operation audit log stored in SQLite and mirrored to data/logs/operations.log."""
+    __tablename__ = "operation_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="INFO", nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, index=True, nullable=False)

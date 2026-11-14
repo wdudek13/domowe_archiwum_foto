@@ -3,9 +3,9 @@ from pathlib import Path
 import sys
 from sqlalchemy import select, func
 
-from app.database import engine, Base, SessionLocal
+from app.database import engine, Base, SessionLocal, ensure_schema_migrations
 from app.backup import BackupManager
-from app.models import MediaItem, WindowsVolume, MediaGroup
+from app.models import MediaItem, WindowsVolume
 from app.scanner import WindowsVolumeInspector, FileScannerService
 from app.storage_ops import StorageAutomationService
 
@@ -78,7 +78,6 @@ def cmd_scan(args) -> None:
         db.commit()
         print(f"\n[+] Scan complete. Total new items indexed: {indexed_count}")
 
-        # Update duplicates
         svc = StorageAutomationService(db)
         dups = svc.flag_duplicate_clusters()
         print(f"[+] Flagged duplicate clusters. Duplicate items marked: {dups}")
@@ -96,7 +95,7 @@ def cmd_stats(_args) -> None:
         volumes = db.scalars(select(WindowsVolume)).all()
 
         print("=" * 50)
-        print("          HYDRA MEDIA VAULT - STATISTICS          ")
+        print("       DOMOWE ARCHIWUM FOTO - STATISTICS       ")
         print("=" * 50)
         print(f"Total media indexed : {total_items}")
         print(f"Total storage tracked: {total_size / (1024**3):.2f} GB")
@@ -114,21 +113,18 @@ def cmd_stats(_args) -> None:
 
 def main():
     Base.metadata.create_all(bind=engine)
-    parser = argparse.ArgumentParser(description="Hydra Media CLI Manager")
+    ensure_schema_migrations()
+    parser = argparse.ArgumentParser(description="Domowe Archiwum Foto CLI Manager")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Subcommand: integrity
     subparsers.add_parser("integrity", help="Check SQLite physical integrity")
 
-    # Subcommand: backup
     backup_p = subparsers.add_parser("backup", help="Create atomic SQLite backup")
     backup_p.add_argument("--tag", default="cli_manual", help="Backup tag identifier")
 
-    # Subcommand: scan
     scan_p = subparsers.add_parser("scan", help="Index a directory/USB drive")
     scan_p.add_argument("path", help="Path to drive or directory (e.g. E:\\Photos)")
 
-    # Subcommand: stats
     subparsers.add_parser("stats", help="Display storage and anomaly metrics")
 
     args = parser.parse_args()
