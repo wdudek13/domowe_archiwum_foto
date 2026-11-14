@@ -241,7 +241,26 @@
             updateSelectionState();
         }
 
+        window.persistedSelectedIds = new Set();
+
+        function clearPersistedSelection() {
+            window.persistedSelectedIds.clear();
+            document.querySelectorAll("input[name='selected_ids']").forEach(cb => cb.checked = false);
+            const countSpan = document.getElementById('selected-counter');
+            const scopeSelect = document.getElementById('bulk-scope-select');
+            if (countSpan) countSpan.textContent = '0';
+            if (scopeSelect) scopeSelect.value = 'filtered';
+        }
+
+        function syncPersistedSelectionFromDom() {
+            document.querySelectorAll("input[name='selected_ids']").forEach(cb => {
+                if (cb.checked) window.persistedSelectedIds.add(cb.value);
+                else window.persistedSelectedIds.delete(cb.value);
+            });
+        }
+
         function updateSelectionState() {
+            syncPersistedSelectionFromDom();
             const checked = document.querySelectorAll("input[name='selected_ids']:checked");
             const countSpan = document.getElementById('selected-counter');
             const scopeSelect = document.getElementById('bulk-scope-select');
@@ -250,26 +269,49 @@
         }
 
         function selectAllVisible(state) {
-            document.querySelectorAll("input[name='selected_ids']").forEach(cb => cb.checked = state);
+            if (!state) {
+                clearPersistedSelection();
+                return;
+            }
+            document.querySelectorAll("input[name='selected_ids']").forEach(cb => {
+                cb.checked = true;
+                window.persistedSelectedIds.add(cb.value);
+            });
             updateSelectionState();
         }
 
         function toggleDaySelection(dateStr) {
             const cbs = document.querySelectorAll(`input[data-day='${dateStr}']`);
             const allChecked = Array.from(cbs).every(c => c.checked);
-            cbs.forEach(c => c.checked = !allChecked);
+            cbs.forEach(c => {
+                c.checked = !allChecked;
+                if (c.checked) window.persistedSelectedIds.add(c.value);
+                else window.persistedSelectedIds.delete(c.value);
+            });
             updateSelectionState();
+        }
+
+        function openAiModalWithType(analysisType) {
+            const modal = document.getElementById('ai-modal');
+            const sel = document.getElementById('ai-analysis-type-select');
+            if (sel && analysisType) sel.value = analysisType;
+            if (modal) modal.classList.remove('hidden');
         }
 
         function applySidebarFilter(paramsObj) {
             const form = document.getElementById('filter-form');
             if (!form) return;
+            clearPersistedSelection();
             if (paramsObj._reset) {
                 ['volume_id', 'folder_prefix', 'group_id', 'tag', 'year'].forEach(k => {
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.value = '';
                 });
-                ['anomaly_only', 'blurry_only', 'duplicates_only', 'untagged_only', 'ungrouped_only', 'trashed_only', 'unbacked_only'].forEach(k => {
+                [
+                    'anomaly_only', 'blurry_only', 'duplicates_only',
+                    'untagged_only', 'unvectored_only', 'unanalyzed_quality_only',
+                    'ungrouped_only', 'trashed_only', 'unbacked_only'
+                ].forEach(k => {
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.checked = false;
                 });
@@ -612,6 +654,64 @@
                 document.exitFullscreen().catch(() => {});
             }
         }
+
+        document.body.addEventListener('htmx:beforeRequest', function(evt) {
+            const detail = evt.detail || {};
+            const path = (detail.pathInfo && detail.pathInfo.requestPath) || '';
+            const silentPaths = [
+                '/actions/ai-status',
+                '/actions/unindex-status',
+                '/actions/status-panel',
+                '/actions/backup-panel',
+                '/actions/todo-panel',
+                '/media/search'
+            ];
+            const isSilent = silentPaths.some(p => path.startsWith(p));
+            if (path.startsWith('/actions/') && !isSilent) {
+                const notif = document.getElementById('global-notification');
+                if (notif) {
+                    notif.innerHTML = "<span class='text-amber-300 text-xs font-semibold animate-pulse'>⏳ Trwa wykonywanie operacji — proszę czekać, nie klikaj ponownie...</span>";
+                }
+                const elt = detail.elt;
+                if (elt && elt.tagName === 'BUTTON' && !elt.disabled) {
+                    elt.dataset.busyDisabled = '1';
+                    elt.disabled = true;
+                } else if (elt && elt.tagName === 'FORM') {
+                    const subBtn = elt.querySelector("button[type='submit']");
+                    if (subBtn && !subBtn.disabled) {
+                        subBtn.dataset.busyDisabled = '1';
+                        subBtn.disabled = true;
+                    }
+                }
+            }
+        });
+
+        document.body.addEventListener('htmx:afterRequest', function(evt) {
+            document.querySelectorAll("[data-busy-disabled='1']").forEach(btn => {
+                btn.disabled = false;
+                delete btn.dataset.busyDisabled;
+            });
+            const detail = evt.detail || {};
+            const path = (detail.pathInfo && detail.pathInfo.requestPath) || '';
+            if (detail.successful && (
+                path.startsWith('/actions/move-to-trash') ||
+                path.startsWith('/actions/unindex') ||
+                path.startsWith('/actions/delete-permanently')
+            )) {
+                clearPersistedSelection();
+            }
+        });
+
+        document.body.addEventListener('htmx:afterSwap', function(evt) {
+            const tgt = evt.detail && evt.detail.target;
+            if (!tgt) return;
+            if (tgt.id === 'media-grid' || tgt.querySelector("input[name='selected_ids']")) {
+                document.querySelectorAll("input[name='selected_ids']").forEach(cb => {
+                    if (window.persistedSelectedIds.has(cb.value)) cb.checked = true;
+                });
+                updateSelectionState();
+            }
+        });
     </script>
 </body>
 </html>

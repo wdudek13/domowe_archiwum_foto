@@ -35,9 +35,12 @@
                     <button onclick="this.closest('.fixed').remove();" class="text-slate-400 hover:text-white text-xl">&times;</button>
                 </div>
 
-                <div class="mt-4 space-y-2">
-                    <div class="flex justify-between"><span class="text-slate-500">Efektywna data:</span><span class="font-mono text-emerald-400">{{ item.effective_date.strftime('%Y-%m-%d %H:%M:%S') }}</span></div>
-                    <div class="flex justify-between"><span class="text-slate-500">Data EXIF:</span><span class="font-mono">{{ item.exif_date or 'Brak' }}</span></div>
+                <div class="mt-4 space-y-1.5">
+                    <div class="flex justify-between"><span class="text-slate-500">Efektywna data (wybrana):</span><span class="font-mono text-emerald-400">{{ item.effective_date.strftime('%Y-%m-%d %H:%M:%S') }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data EXIF / wideo:</span><span class="font-mono">{{ item.exif_date.strftime('%Y-%m-%d %H:%M:%S') if item.exif_date else 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data z nazwy pliku:</span><span class="font-mono">{{ item.filename_date.strftime('%Y-%m-%d %H:%M:%S') if item.filename_date else 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data z folderu:</span><span class="font-mono">{{ folder_date_str or 'Brak' }}</span></div>
+                    <div class="flex justify-between"><span class="text-slate-500">Data pliku (utworz. / modyf.):</span><span class="font-mono text-[10px]">{{ item.fs_ctime.strftime('%Y-%m-%d %H:%M') }} / {{ item.fs_mtime.strftime('%Y-%m-%d %H:%M') }}</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Rozdzielczość / Kąt obrotu:</span><span>{{ item.width or '?' }} x {{ item.height or '?' }} px ({{ item.rotation_angle or 0 }}°)</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Wskaźnik ostrości (Laplacian):</span><span class="font-mono">{{ "%.1f"|format(item.blur_score) if item.blur_score is not none else 'Nie badano' }}</span></div>
                     <div class="flex justify-between"><span class="text-slate-500">Wektor cech AI:</span>
@@ -52,9 +55,12 @@
                     <div class="flex justify-between"><span class="text-slate-500">Album:</span><span class="text-indigo-300 font-semibold">{{ item.group.name if item.group else 'Brak (Swobodna pula)' }}</span></div>
                 </div>
 
-                <!-- Szybka zmiana daty lub usunięcie z listy anomalii (Req 4a) -->
+                <!-- Szybka zmiana daty lub usunięcie z listy niezgodności dat (Req 4a) -->
                 <div class="mt-3 p-2.5 rounded-xl bg-slate-900/90 border border-borderBg space-y-2">
-                    <form hx-post="/actions/change-date" hx-target="#global-notification" class="flex items-center space-x-1.5">
+                    <form hx-post="/actions/change-date"
+                          hx-target="#global-notification"
+                          hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                          class="flex items-center space-x-1.5">
                         <input type="hidden" name="scope" value="selected">
                         <input type="hidden" name="selected_ids" value="{{ item.id }}">
                         <input type="text" name="new_date" value="{{ item.effective_date.strftime('%Y-%m-%d %H:%M') }}"
@@ -68,9 +74,9 @@
                                 hx-post="/actions/clear-date-anomaly"
                                 hx-vals='{"media_id": "{{ item.id }}"}'
                                 hx-target="#global-notification"
-                                onclick="this.closest('div').remove();"
+                                hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
                                 class="bg-emerald-800 hover:bg-emerald-700 text-white px-2 py-0.5 rounded font-semibold">
-                            ✓ Usuń z listy anomalii (bez zmiany daty)
+                            ✓ Usuń z listy niezgodności dat (bez zmiany daty)
                         </button>
                     </div>
                     {% endif %}
@@ -78,7 +84,10 @@
 
                 <!-- Szybki wybór albumu z listy lub nowy album (Req 2c) -->
                 <div class="mt-3 p-2.5 rounded-xl bg-slate-900/90 border border-borderBg">
-                    <form hx-post="/actions/assign-group" hx-target="#global-notification" class="flex items-center space-x-1.5">
+                    <form hx-post="/actions/assign-group"
+                          hx-target="#global-notification"
+                          hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                          class="flex items-center space-x-1.5">
                         <input type="hidden" name="scope" value="selected">
                         <input type="hidden" name="selected_ids" value="{{ item.id }}">
                         <select name="existing_group_id" class="bg-cardBg border border-borderBg rounded px-2 py-1 text-white flex-1">

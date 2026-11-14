@@ -18,6 +18,15 @@
             {% if unbacked_only %}
                 <span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">🛡️ Pliki bez backupu na innym urządzeniu</span>
             {% endif %}
+            {% if untagged_only %}
+                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Brak tagów AI</span>
+            {% endif %}
+            {% if unvectored_only %}
+                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">📐 Brak wektorów 512-D</span>
+            {% endif %}
+            {% if unanalyzed_quality_only %}
+                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🔍 Niezbadana jakość / ostrość</span>
+            {% endif %}
         </div>
 
         {% if total_pages > 1 %}
@@ -29,11 +38,11 @@
         {% endif %}
     </div>
 
-    <!-- Pasek narzędzi Anomalii Daty (Rozbieżności folder / plik / EXIF / kopiowanie) -->
+    <!-- Pasek narzędzi Niezgodności Dat (Rozbieżności folder / plik / EXIF / kopiowanie) -->
     {% if anomaly_only %}
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
-            <div class="font-bold text-amber-300 text-sm">⚠️ Wykryte rozbieżności dat (folder / nazwa pliku / EXIF / data pliku) ({{ total_matching }} szt.)</div>
+            <div class="font-bold text-amber-300 text-sm">⚠️ Niezgodność dat — wykryte rozbieżności (folder / nazwa pliku / EXIF / data pliku) ({{ total_matching }} szt.)</div>
             <div class="text-slate-300 text-[11px]">Oznacza pliki z niezgodnością dat między folderem, nazwą pliku, EXIF lub datą zmodyfikowaną podczas kopiowania (ustawiono datę najbardziej prawdopodobną).</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -58,9 +67,28 @@
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                     hx-target="#global-notification"
                     class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold">
-                ✓ Usuń z listy anomalii BEZ zmiany daty
+                ✓ Usuń z listy niezgodności BEZ zmiany daty
             </button>
         </div>
+    </div>
+    {% endif %}
+
+    <!-- Pasek akcji dla zdjęć bez danych Analizy AI (Req 9) -->
+    {% if untagged_only or unvectored_only or unanalyzed_quality_only %}
+    <div class="bg-purple-950/30 border border-purple-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div>
+            <div class="font-bold text-purple-300 text-sm">
+                ⚡ Zdjęcia bez danych Analizy AI —
+                {% if untagged_only %}Brak tagów obiektów/scen AI{% elif unvectored_only %}Brak wektorów podobieństwa 512-D{% else %}Niezbadana jakość / ostrość{% endif %}
+                ({{ total_matching }} szt.)
+            </div>
+            <div class="text-slate-300 text-[11px]">Wybierz poniższe zdjęcia (lub uruchom dla całego aktualnego filtra) i uruchom odpowiedni moduł analizy AI.</div>
+        </div>
+        <button type="button"
+                onclick="openAiModalWithType('{% if untagged_only %}tags{% elif unvectored_only %}vectors{% else %}quality{% endif %}')"
+                class="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
+            ⚡ Uruchom brakującą Analizę AI &rarr;
+        </button>
     </div>
     {% endif %}
 

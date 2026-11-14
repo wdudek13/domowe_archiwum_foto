@@ -387,31 +387,31 @@ class MetadataDateResolver:
             fn_date_only = valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
             if not cls.dates_agree(valid_exif, valid_fn, date_only=fn_date_only):
                 reasons.append(
-                    f"Rozbieżność EXIF ({valid_exif.strftime('%Y-%m-%d')}) i nazwy pliku ({valid_fn.strftime('%Y-%m-%d')}) >24h"
+                    f"Niezgodność dat: EXIF ({valid_exif.strftime('%Y-%m-%d')}) vs nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) (>24h)"
                 )
 
         if valid_folder:
             f_dt, f_prec, f_seg = valid_folder
             if valid_exif and not cls.matches_folder_date(valid_exif, f_dt, f_prec):
-                reasons.append(f"EXIF ({valid_exif.strftime('%Y-%m-%d')}) niezgodny z datą folderu '{f_seg}'")
+                reasons.append(f"Niezgodność dat: EXIF ({valid_exif.strftime('%Y-%m-%d')}) z folderem '{f_seg}'")
             if valid_fn and not cls.matches_folder_date(valid_fn, f_dt, f_prec):
-                reasons.append(f"Nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) niezgodna z datą folderu '{f_seg}'")
+                reasons.append(f"Niezgodność dat: nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) z folderem '{f_seg}'")
 
         if valid_exif or valid_fn:
             ref_date_only = valid_exif is None and valid_fn is not None and valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
             if not cls.dates_agree(fs_oldest, effective, date_only=ref_date_only) or not cls.dates_agree(fs_newest, effective, date_only=ref_date_only):
                 reasons.append(
-                    f"Data pliku ({fs_newest.strftime('%Y-%m-%d')}) zmodyfikowana przy kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
+                    f"Niezgodność dat: data pliku ({fs_newest.strftime('%Y-%m-%d')}) zmodyfikowana przy kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
                 )
         elif valid_folder:
             f_dt, f_prec, f_seg = valid_folder
             if not cls.matches_folder_date(fs_oldest, f_dt, f_prec) or not cls.matches_folder_date(fs_newest, f_dt, f_prec):
                 reasons.append(
-                    f"Data pliku ({fs_newest.strftime('%Y-%m-%d')}) niezgodna z folderem '{f_seg}' po kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
+                    f"Niezgodność dat: data pliku ({fs_newest.strftime('%Y-%m-%d')}) z folderem '{f_seg}' po kopiowaniu (ustawiono {effective.strftime('%Y-%m-%d')})"
                 )
         elif abs((valid_ctime - valid_mtime).total_seconds()) > 86400:
             reasons.append(
-                f"Data utworzenia pliku ({valid_ctime.strftime('%Y-%m-%d')}) zmodyfikowana przy kopiowaniu względem modyfikacji ({valid_mtime.strftime('%Y-%m-%d')})"
+                f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) zmodyfikowane przy kopiowaniu vs modyfikacja ({valid_mtime.strftime('%Y-%m-%d')})"
             )
 
         if reasons:

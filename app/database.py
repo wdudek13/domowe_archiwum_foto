@@ -78,7 +78,7 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         m_cols = {row[1] for row in cur.fetchall()}
         if m_cols:
             if "updated_at" not in m_cols:
-                cur.execute("ALTER TABLE media_items ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP;")
+                cur.execute("ALTER TABLE media_items ADD COLUMN updated_at DATETIME;")
             if "is_trashed" not in m_cols:
                 cur.execute("ALTER TABLE media_items ADD COLUMN is_trashed BOOLEAN DEFAULT 0 NOT NULL;")
             if "rotation_angle" not in m_cols:
@@ -91,6 +91,16 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         cur.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS media_tags_fts USING fts5(media_id UNINDEXED, tag, source_model UNINDEXED);"
         )
+        # Clear legacy false-positive date anomalies caused solely by missing EXIF metadata
+        if m_cols:
+            cur.execute(
+                """
+                UPDATE media_items
+                SET has_date_anomaly = 0, date_anomaly_reason = NULL
+                WHERE date_anomaly_reason LIKE 'Brak metadanych EXIF%'
+                   OR date_anomaly_reason LIKE 'Brak EXIF%';
+                """
+            )
         conn.commit()
     except sqlite3.Error as exc:
         logger.warning("Schema migration warning: %s", exc)

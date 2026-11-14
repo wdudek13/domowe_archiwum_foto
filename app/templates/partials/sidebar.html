@@ -39,7 +39,7 @@
                 <span class="font-mono text-[10px]">{{ total_unbacked or 0 }}</span>
             </button>
             <button onclick="applySidebarFilter({_reset: true, anomaly_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-amber-300">
-                <span>⚠️ Anomalie daty</span>
+                <span>⚠️ Niezgodność dat</span>
                 <span class="font-mono text-[10px]">{{ total_anomalies }}</span>
             </button>
             <button onclick="applySidebarFilter({_reset: true, duplicates_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-rose-300">
@@ -47,19 +47,33 @@
                 <span class="font-mono text-[10px]">{{ total_dups }}</span>
             </button>
             <button onclick="applySidebarFilter({_reset: true, blurry_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-orange-300">
-                <span>🔍 Rozmyte / Nieostre</span>
+                <span>🔍 Rozmyte / Nieostre / Wadliwe</span>
                 <span class="font-mono text-[10px]">{{ total_blurry }}</span>
-            </button>
-            <button type="button" onclick="openTodoModal()"
-                    class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-amber-950/60 text-amber-300 font-semibold border border-amber-800/40 mt-1">
-                <span>📋 Lista TODO Przeniesień</span>
-                <span class="font-mono text-[10px] bg-amber-950 px-1.5 py-0.5 rounded">{{ total_pending_moves or 0 }}</span>
             </button>
             <button type="button" onclick="applySidebarFilter({_reset: true, trashed_only: true})"
                     class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 font-semibold border border-rose-900/40 mt-1">
                 <span>🗑️ Kosz (Usunięte)</span>
                 <span class="font-mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded">{{ total_trashed }}</span>
             </button>
+
+            <div class="pt-2 mt-1 border-t border-borderBg/60 space-y-1">
+                <div class="px-1 text-[10px] font-bold text-purple-300 uppercase tracking-wider">⚡ Zdjęcia bez danych Analizy AI</div>
+                <button type="button" onclick="applySidebarFilter({_reset: true, untagged_only: true})"
+                        class="w-full flex justify-between items-center px-2.5 py-1 rounded-lg hover:bg-purple-950/50 text-purple-200 text-[11px]">
+                    <span>🏷️ Brak tagów AI</span>
+                    <span class="font-mono text-[10px] bg-purple-950/70 px-1.5 py-0.5 rounded">{{ total_untagged or 0 }}</span>
+                </button>
+                <button type="button" onclick="applySidebarFilter({_reset: true, unvectored_only: true})"
+                        class="w-full flex justify-between items-center px-2.5 py-1 rounded-lg hover:bg-purple-950/50 text-purple-200 text-[11px]">
+                    <span>📐 Brak wektorów 512-D</span>
+                    <span class="font-mono text-[10px] bg-purple-950/70 px-1.5 py-0.5 rounded">{{ total_unvectored or 0 }}</span>
+                </button>
+                <button type="button" onclick="applySidebarFilter({_reset: true, unanalyzed_quality_only: true})"
+                        class="w-full flex justify-between items-center px-2.5 py-1 rounded-lg hover:bg-purple-950/50 text-purple-200 text-[11px]">
+                    <span>🔍 Niezbadana jakość / ostrość</span>
+                    <span class="font-mono text-[10px] bg-purple-950/70 px-1.5 py-0.5 rounded">{{ total_unanalyzed_quality or 0 }}</span>
+                </button>
+            </div>
 
             {% if jobs_summary and (jobs_summary.has_running or jobs_summary.has_unfinished) %}
             <button type="button" onclick="openStatusModal()"
@@ -93,13 +107,6 @@
                 <span class="font-mono font-bold">{{ total_vectors }} / {{ total_all }}</span>
             </div>
         </div>
-    </div>
-
-    <div class="p-2.5 rounded-xl bg-indigo-950/30 border border-indigo-800/50 space-y-1.5">
-        <div class="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">1-Klik Auto-Organizacja</div>
-        <p class="text-[10px] text-slate-400 leading-relaxed">
-            Dostępna po wybraniu konkretnego <strong>urządzenia (dysku)</strong> poniżej oraz <strong>katalogu fizycznego</strong> na pasku nad galerią.
-        </p>
     </div>
 
     <div>

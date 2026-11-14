@@ -2094,6 +2094,343 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(r_dl.status_code, 200)
             self.assertIn("RAPORT PROCEDURY BACKUPU", r_dl.text)
 
+    # =========================================================================
+    # 12. QUALITY DEFECT TAGS, ON-DEMAND DUP/UNBACKED, PAIR MODES & UNINDEX JOB
+    # =========================================================================
+    def test_advanced_quality_ai_unindex_backup_modes_and_ui_updates(self):
+        # 1) DB Migration clears legacy missing-EXIF anomaly rows
+        mig_db_path = self.root / "mig_exif_cleanup.db"
+        conn = sqlite3.connect(mig_db_path.as_posix())
+        conn.execute(
+            "CREATE TABLE media_items (id TEXT PRIMARY KEY, file_name TEXT, "
+            "has_date_anomaly INTEGER DEFAULT 0, date_anomaly_reason TEXT);"
+        )
+        conn.execute(
+            "INSERT INTO media_items VALUES ('x1', 'a.jpg', 1, 'Brak metadanych EXIF DateTimeOriginal')"
+        )
+        conn.execute(
+            "INSERT INTO media_items VALUES ('x2', 'b.jpg', 1, 'Niezgodność dat: folder wskazuje inny rok')"
+        )
+        conn.commit()
+        conn.close()
+        ensure_schema_migrations(mig_db_path)
+        conn = sqlite3.connect(mig_db_path.as_posix())
+        row_x1 = conn.execute("SELECT has_date_anomaly, date_anomaly_reason FROM media_items WHERE id='x1'").fetchone()
+        row_x2 = conn.execute("SELECT has_date_anomaly, date_anomaly_reason FROM media_items WHERE id='x2'").fetchone()
+        conn.close()
+        self.assertEqual(row_x1[0], 0)
+        self.assertIsNone(row_x1[1])
+        self.assertEqual(row_x2[0], 1)
+
+        # 2) Multi-criteria quality defect classification (dark, overexposed, blank, low-res, corrupt)
+        q_dir = self.root / "quality_samples"
+        q_dir.mkdir(parents=True, exist_ok=True)
+        dark_p = q_dir / "dark.png"
+        bright_p = q_dir / "bright.png"
+        lowres_p = q_dir / "tiny.png"
+        corrupt_p = q_dir / "broken.jpg"
+
+        cv2.imwrite(str(dark_p), np.full((600, 600, 3), 4, dtype=np.uint8))
+        cv2.imwrite(str(bright_p), np.full((600, 600, 3), 253, dtype=np.uint8))
+        cv2.imwrite(str(lowres_p), np.full((120, 140, 3), 120, dtype=np.uint8))
+        corrupt_p.write_bytes(b"NOT_AN_IMAGE_AT_ALL")
+
+        d_res = MediaQualityAnalyzer.analyze_image_detailed(dark_p)
+        b_res = MediaQualityAnalyzer.analyze_image_detailed(bright_p)
+        l_res = MediaQualityAnalyzer.analyze_image_detailed(lowres_p, orig_dims=(120, 140))
+        c_res = MediaQualityAnalyzer.analyze_image_detailed(corrupt_p)
+        self.assertIn("do_usuniecia:niedoswietlone", d_res["quality_tags"])
+        self.assertIn("do_usuniecia:przeswietlone", b_res["quality_tags"])
+        self.assertIn("do_usuniecia:niska_rozdzielczosc", l_res["quality_tags"])
+        self.assertIn("do_usuniecia:brak_detali", l_res["quality_tags"])
+        self.assertTrue(c_res["is_corrupted"])
+        self.assertIn("do_usuniecia:uszkodzone", c_res["quality_tags"])
+
+        # classify_quality_tags direct branches (corrupted, low_res + fallback blur reason)
+        _, ct1 = MediaQualityAnalyzer.classify_quality_tags(dark_p, True, False, None)
+        self.assertIn("do_usuniecia:uszkodzone", ct1)
+        sharp_p = q_dir / "sharp_small.png"
+        checker = np.indices((50, 50)).sum(axis=0) % 2 * 255
+        cv2.imwrite(str(sharp_p), checker.astype(np.uint8))
+        _, ct2 = MediaQualityAnalyzer.classify_quality_tags(sharp_p, False, True, 50.0, orig_dims=(120, 140))
+        self.assertIn("do_usuniecia:niska_rozdzielczosc", ct2)
+        _, ct3 = MediaQualityAnalyzer.classify_quality_tags(sharp_p, False, True, 50.0, orig_dims=(500, 500))
+        self.assertEqual(ct3, ["do_usuniecia", "do_usuniecia:rozmyte"])
+
+        # 3) Prepare 3 volumes: A (2 identical + 1 collision), B (backup target), C (separate pair)
+        import app.routers.actions as actions_module
+
+        drv_a = self.root / "VolPairA"
+        drv_b = self.root / "VolPairB"
+        drv_c = self.root / "VolPairC"
+        (drv_a / "2023").mkdir(parents=True, exist_ok=True)
+        drv_b.mkdir(parents=True, exist_ok=True)
+        drv_c.mkdir(parents=True, exist_ok=True)
+
+        img_a1 = drv_a / "2023" / "2023-06-15_wakacje.jpg"
+        create_synthetic_jpeg(img_a1, width=500, height=500, sharp=True, color=(40, 120, 200))
+        (drv_a / "duplikaty").mkdir(parents=True, exist_ok=True)
+        img_a_dup = drv_a / "duplikaty" / "kopia_wakacje.jpg"
+        shutil.copy2(img_a1, img_a_dup)
+
+        # Dark image placed on Drive A to verify AI batch quality tags and unanalyzed filter
+        img_a_dark = drv_a / "2023" / "ciemne_foto.png"
+        cv2.imwrite(str(img_a_dark), np.full((500, 500, 3), 3, dtype=np.uint8))
+
+        # File on Drive C for multi-pair filtering
+        img_c1 = drv_c / "rodzina_c.jpg"
+        create_synthetic_jpeg(img_c1, width=500, height=500, sharp=True, color=(180, 60, 40))
+
+        vsn_map = {
+            drv_a.resolve(): ("AAAA-1111", "Dysk_A", str(drv_a) + "\\"),
+            drv_b.resolve(): ("BBBB-2222", "Dysk_B", str(drv_b) + "\\"),
+            drv_c.resolve(): ("CCCC-3333", "Dysk_C", str(drv_c) + "\\"),
+        }
+
+        def fake_vol_info(path_obj: Path):
+            res_p = path_obj.resolve()
+            for root_p, info in vsn_map.items():
+                if res_p == root_p or str(res_p).startswith(str(root_p)):
+                    return info
+            return ("ZZZZ-0000", "Other", str(path_obj.resolve()) + "\\")
+
+        with patch.object(WindowsVolumeInspector, "get_volume_info", side_effect=fake_vol_info), \
+             patch.object(StorageAutomationService, "refresh_volumes_online_status"):
+
+            # Scan A and C: confirm scan does NOT auto-cluster duplicates (dup_total == 0)
+            s_a = actions_module.execute_scan(str(drv_a))
+            self.assertEqual(s_a["dup_total"], 0)
+            actions_module.execute_scan(str(drv_c))
+
+            with self.TestingSessionLocal() as db:
+                vol_a = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "AAAA-1111"))
+                vol_c = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "CCCC-3333"))
+                vol_b = WindowsVolume(
+                    volume_serial_number="BBBB-2222",
+                    volume_label="Dysk_B",
+                    last_known_drive_letter=str(drv_b) + "\\",
+                    is_online=True,
+                    total_space_bytes=100 * 1024**3,
+                    free_space_bytes=50 * 1024**3,
+                )
+                vol_a.is_online = True
+                vol_c.is_online = True
+                vol_d_offline = WindowsVolume(
+                    volume_serial_number="DDDD-4444",
+                    volume_label="Dysk_D_Offline",
+                    last_known_drive_letter="Z:\\",
+                    is_online=False,
+                    total_space_bytes=100 * 1024**3,
+                    free_space_bytes=50 * 1024**3,
+                )
+                db.add_all([vol_b, vol_d_offline])
+                db.commit()
+                va_id, vb_id, vc_id = vol_a.id, vol_b.id, vol_c.id
+
+                items_a = list(db.scalars(select(MediaItem).where(MediaItem.volume_id == va_id)).all())
+                # All items must start with is_primary_duplicate == True before user clicks Analyze AI
+                self.assertTrue(all(x.is_primary_duplicate for x in items_a))
+
+                # Add a synthetic hash collision + an offline item to exercise exact collision splitting & offline skip
+                fake_col_path = drv_a / "kolizja_inna.jpg"
+                create_synthetic_jpeg(fake_col_path, width=500, height=500, sharp=True, color=(20, 200, 50))
+                orig_a1 = next(x for x in items_a if x.file_name == "2023-06-15_wakacje.jpg")
+                shared_hash = orig_a1.file_hash
+                now_dt = datetime.datetime.now()
+                col_item = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=va_id,
+                    relative_path="kolizja_inna.jpg",
+                    file_name="kolizja_inna.jpg",
+                    file_size_bytes=fake_col_path.stat().st_size,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash=shared_hash,
+                    hash_algorithm="sha256",
+                    width=500,
+                    height=500,
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=now_dt,
+                    thumbnail_relative_path="col.webp",
+                )
+                off_item = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=vol_d_offline.id,
+                    relative_path="offline.jpg",
+                    file_name="offline.jpg",
+                    file_size_bytes=1234,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash=shared_hash,
+                    hash_algorithm="sha256",
+                    width=500,
+                    height=500,
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=now_dt,
+                    thumbnail_relative_path="off.webp",
+                )
+                db.add_all([col_item, off_item])
+                db.commit()
+                a1_id = orig_a1.id
+                col_id = col_item.id
+
+            # 4) Verify Sidebar & Home UI updates (no auto-organize info box, no TODO in sidebar, AI missing section present)
+            r_home = self.client.get("/")
+            self.assertEqual(r_home.status_code, 200)
+            self.assertIn("persistedSelectedIds", r_home.text)
+            self.assertIn("duplicates_fast", r_home.text)
+            self.assertIn("duplicates_exact", r_home.text)
+            self.assertIn("Trwa wykonywanie operacji", r_home.text)
+
+            r_sb = self.client.get("/media/sidebar")
+            self.assertEqual(r_sb.status_code, 200)
+            self.assertIn("Niezgodność dat", r_sb.text)
+            self.assertIn("Zdjęcia bez danych Analizy AI", r_sb.text)
+            self.assertNotIn("1-Klik Auto-Organizacja", r_sb.text)
+            self.assertNotIn("Lista TODO Przeniesień", r_sb.text)
+
+            # New missing-AI-data search filters
+            self.assertEqual(self.client.get("/media/search?unvectored_only=true").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?unanalyzed_quality_only=true").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?untagged_only=true").status_code, 200)
+
+            # File details modal displays all 5 date sources & auto-refresh hook
+            r_det = self.client.get(f"/media/{a1_id}/detail")
+            self.assertEqual(r_det.status_code, 200)
+            self.assertIn("Data z nazwy pliku:", r_det.text)
+            self.assertIn("Data z folderu:", r_det.text)
+            self.assertIn("htmx.ajax(", r_det.text)
+
+            # 5) On-demand Analyze AI: quality, duplicates_fast, duplicates_exact, unbacked
+            r_q = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "quality", "scope": "all_drives", "run_sync": "true"},
+            )
+            self.assertEqual(r_q.status_code, 200)
+
+            with self.TestingSessionLocal() as db:
+                dark_obj = db.scalar(select(MediaItem).where(MediaItem.file_name == "ciemne_foto.png"))
+                self.assertTrue(dark_obj.is_blurry)
+                q_tags = {
+                    t.tag for t in db.scalars(
+                        select(MediaTag).where(MediaTag.media_id == dark_obj.id, MediaTag.source_model == "quality_check")
+                    ).all()
+                }
+                self.assertIn("do_usuniecia", q_tags)
+                self.assertIn("do_usuniecia:niedoswietlone", q_tags)
+
+            r_df = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "duplicates_fast", "scope": "all_drives", "run_sync": "true"},
+            )
+            self.assertIn("Szybka analiza duplikatów", r_df.text)
+
+            r_de = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "duplicates_exact", "scope": "all_drives", "run_sync": "true"},
+            )
+            self.assertIn("Dokładna analiza duplikatów 100%", r_de.text)
+
+            with self.TestingSessionLocal() as db:
+                col_reloaded = db.get(MediaItem, col_id)
+                self.assertEqual(col_reloaded.hash_algorithm, "sha256_verified")
+                self.assertTrue(col_reloaded.is_primary_duplicate)
+                # Delete synthetic collision & offline items before backup tests
+                db.delete(col_reloaded)
+                off_obj = db.scalar(select(MediaItem).where(MediaItem.file_name == "offline.jpg"))
+                if off_obj:
+                    db.delete(off_obj)
+                db.commit()
+
+            r_ub = self.client.post(
+                "/actions/analyze-all",
+                data={"analysis_type": "unbacked", "scope": "all_drives", "run_sync": "true"},
+            )
+            self.assertIn("Analiza kopii zapasowych", r_ub.text)
+
+            # 6) Backup & Deduplication: parse_pair_keys, pair selection, backup_only vs dedup_only modes
+            self.assertIsNone(StorageAutomationService.parse_pair_keys(None))
+            self.assertEqual(StorageAutomationService.parse_pair_keys([]), set())
+            self.assertEqual(StorageAutomationService.parse_pair_keys([f"{vb_id}:{va_id}"]), {(min(va_id, vb_id), max(va_id, vb_id))})
+
+            pair_ab = f"{min(va_id, vb_id)}:{max(va_id, vb_id)}"
+            r_bp = self.client.get("/actions/backup-panel")
+            self.assertEqual(r_bp.status_code, 200)
+            self.assertIn("filterUnbackedBySelectedPairs", r_bp.text)
+            self.assertIn("Zakres operacji", r_bp.text)
+
+            r_off_mode = self.client.post(
+                "/actions/prepare-offline-report",
+                data={
+                    "preferred_target_volume_id": str(vb_id),
+                    "operation_mode": "backup_only",
+                    "pairs_submitted": "1",
+                    "selected_pairs": [pair_ab],
+                    "target_panel": "backup",
+                },
+            )
+            self.assertEqual(r_off_mode.status_code, 200)
+            self.assertIn("Tylko Backup", r_off_mode.text)
+
+            # Execute backup_only ONLY on pair {A, B}: backup created on B, A's duplicate still preserved, C untouched
+            r_exec_bkp = self.client.post(
+                "/actions/execute-backup",
+                data={
+                    "preferred_target_volume_id": str(vb_id),
+                    "operation_mode": "backup_only",
+                    "pairs_submitted": "1",
+                    "selected_pairs": [pair_ab],
+                },
+            )
+            self.assertEqual(r_exec_bkp.status_code, 200)
+            self.assertTrue(img_a_dup.exists())
+            self.assertTrue(any((drv_b / "backup").rglob("2023-06-15_wakacje.jpg")))
+            with self.TestingSessionLocal() as db:
+                svc_chk = StorageAutomationService(db)
+                unbacked_after_ab = svc_chk.detect_files_without_backup(recluster=True)
+                self.assertTrue(any(u.volume_id == vc_id for u in unbacked_after_ab))
+
+            # Now execute dedup_only ONLY on pair {A, B}: redundant same-device duplicate deleted cleanly
+            r_exec_dedup = self.client.post(
+                "/actions/execute-backup",
+                data={
+                    "preferred_target_volume_id": str(vb_id),
+                    "operation_mode": "dedup_only",
+                    "pairs_submitted": "1",
+                    "selected_pairs": [pair_ab],
+                },
+            )
+            self.assertEqual(r_exec_dedup.status_code, 200)
+            self.assertFalse(img_a_dup.exists())
+            self.assertTrue(img_a1.exists())
+
+            # 7) Fast chunked Unindex + BackgroundJob + /actions/unindex-status polling paths
+            actions_module.UNINDEX_BATCH_STATE["running"] = True
+            actions_module.UNINDEX_BATCH_STATE["processed"] = 5
+            actions_module.UNINDEX_BATCH_STATE["total"] = 20
+            try:
+                self.assertIn("Wyindeksowanie dysku z bazy w toku", self.client.get("/actions/unindex-status").text)
+            finally:
+                actions_module.UNINDEX_BATCH_STATE["running"] = False
+
+            self.assertIn("Usunięto z indeksu bazy", self.client.get("/actions/unindex-status").text)
+
+            r_un_c = self.client.post(
+                "/actions/unindex",
+                data={"unindex_volume_id": str(vc_id), "run_sync": "true"},
+            )
+            self.assertEqual(r_un_c.status_code, 200)
+            self.assertIn("Usunięto z indeksu bazy", r_un_c.text)
+            with self.TestingSessionLocal() as db:
+                self.assertIsNone(db.get(WindowsVolume, vc_id))
+                job_un = db.scalar(select(BackgroundJob).where(BackgroundJob.job_type == "unindex"))
+                self.assertIsNotNone(job_un)
+                self.assertEqual(job_un.status, "COMPLETED")
+                # Original file on Disk C remains untouched on disk
+                self.assertTrue(img_c1.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

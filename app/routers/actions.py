@@ -22,6 +22,7 @@ from app.models import (
     MediaGroup,
     MediaTag,
     MediaEmbedding,
+    PendingFileMove,
     BackgroundJob,
 )
 from app.operation_log import OperationLogger, ProcessManager
@@ -53,6 +54,8 @@ def resolve_target_items(
     untagged_only: bool = False,
     ungrouped_only: bool = False,
     unbacked_only: bool = False,
+    unvectored_only: bool = False,
+    unanalyzed_quality_only: bool = False,
     limit: Optional[int] = None,
 ) -> List[MediaItem]:
     if scope == "selected" and selected_ids:
@@ -80,6 +83,8 @@ def resolve_target_items(
             ungrouped_only,
             False,
             unbacked_only,
+            unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         ).distinct()
     if limit:
         stmt = stmt.limit(limit)
@@ -276,8 +281,9 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                     indexed += _commit_scan_batch(db, pending_batch, vol.id)
                     pending_batch.clear()
 
-            svc = StorageAutomationService(db)
-            dup_total = svc.flag_duplicate_clusters()
+            # Duplicate clustering and unbacked analysis are strictly on-demand
+            # (triggered from 'Analizuj AI' or 'Backup i Deduplikacja').
+            dup_total = 0
 
             if job_id and not stopped_early:
                 ProcessManager.finish_job(
@@ -346,7 +352,50 @@ AI_BATCH_STATE = {
     "tagged": 0,
     "vectors": 0,
     "blurry": 0,
+    "result_summary": "",
 }
+
+
+def _run_storage_analysis_in_batch(job_id: int, item_ids: List[str], analysis_type: str) -> str:
+    """Executes on-demand duplicate clustering (fast/exact) or unbacked files scan inside the AI batch worker."""
+    with SessionLocal() as db:
+        svc = StorageAutomationService(db)
+        if analysis_type == "duplicates_fast":
+            dup_total = svc.flag_duplicate_clusters()
+            AI_BATCH_STATE["processed"] = len(item_ids)
+            msg = f"Szybka analiza duplikatów (baza SHA-256 / hash): oznaczono {dup_total} duplikatów w indeksie."
+            OperationLogger.log("DUP_SCAN_FAST", msg, status="OK", db=db)
+            return msg
+
+        if analysis_type == "duplicates_exact":
+            processed_local = {"n": 0}
+
+            def _progress(_fname: str):
+                processed_local["n"] += 1
+                AI_BATCH_STATE["processed"] = processed_local["n"]
+                if processed_local["n"] % 10 == 0:
+                    ProcessManager.update_progress(
+                        job_id,
+                        processed_delta=10,
+                        message=f"Weryfikacja 100% plików na dyskach: {processed_local['n']} porównań...",
+                    )
+
+            res = svc.run_exact_duplicate_analysis(target_ids=item_ids, progress_cb=_progress)
+            AI_BATCH_STATE["processed"] = len(item_ids)
+            return (
+                f"Dokładna analiza duplikatów 100%: klastry={res['clusters']}, "
+                f"potwierdzone={res['verified_identical']}, kolizje={res['mismatches_separated']}, "
+                f"pominięte offline={res['offline_skipped']}, duplikatów={res['dup_total']}."
+            )
+
+        unbacked_list = svc.detect_files_without_backup(recluster=True)
+        AI_BATCH_STATE["processed"] = len(item_ids)
+        msg = (
+            f"Analiza kopii zapasowych: wykryto {len(unbacked_list)} oryginałów "
+            f"bez backupu na innym urządzeniu fizycznym."
+        )
+        OperationLogger.log("UNBACKED_SCAN", msg, status="OK", db=db)
+        return msg
 
 
 def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: str = "all"):
@@ -359,14 +408,29 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
     AI_BATCH_STATE["tagged"] = 0
     AI_BATCH_STATE["vectors"] = 0
     AI_BATCH_STATE["blurry"] = 0
+    AI_BATCH_STATE["result_summary"] = ""
 
     run_tags = analysis_type in ("all", "tags")
     run_vectors = analysis_type in ("all", "vectors")
     run_quality = analysis_type in ("all", "quality")
+    is_storage_analysis = analysis_type in ("duplicates_fast", "duplicates_exact", "unbacked")
 
     stopped_midway = False
     tagger = OnDemandObjectTagger() if run_tags else None
     try:
+        if is_storage_analysis:
+            if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
+                stopped_midway = True
+                ProcessManager.update_progress(
+                    job_id,
+                    remaining_ids=item_ids,
+                    status="STOPPED",
+                    message=f"Zatrzymano analizę ({analysis_type}).",
+                )
+            else:
+                AI_BATCH_STATE["result_summary"] = _run_storage_analysis_in_batch(job_id, item_ids, analysis_type)
+            return
+
         if tagger is not None:
             tagger.open_session()
 
@@ -393,13 +457,15 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                         MediaItem.thumbnail_relative_path,
                         MediaItem.relative_path,
                         WindowsVolume.last_known_drive_letter,
+                        MediaItem.width,
+                        MediaItem.height,
                     )
                     .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
                     .where(MediaItem.id.in_(batch_ids))
                 ).all()
 
             computed_batch = []
-            for idx_in_batch, (mid, mtype, thumb_rel, rel_p, drive_let) in enumerate(rows):
+            for idx_in_batch, (mid, mtype, thumb_rel, rel_p, drive_let, orig_w, orig_h) in enumerate(rows):
                 if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
                     stopped_midway = True
                     remaining = item_ids[start + idx_in_batch :]
@@ -437,15 +503,23 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                         logger.debug("Vector embedding skipped for %s: %s", mid, exc)
 
                 corrupted, blurry, score = False, False, None
+                quality_tags: List[str] = []
                 if run_quality:
-                    corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(readable_path)
+                    if mtype == "video" and readable_path == src_p:
+                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_video(readable_path)
+                    else:
+                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(readable_path)
+                    extra_blurry, quality_tags = MediaQualityAnalyzer.classify_quality_tags(
+                        readable_path, corrupted, blurry, score, orig_dims=(orig_w, orig_h)
+                    )
+                    blurry = bool(blurry or extra_blurry)
 
-                computed_batch.append((mid, tags, vec_blob, corrupted, blurry, score))
+                computed_batch.append((mid, tags, vec_blob, corrupted, blurry, score, quality_tags))
                 AI_BATCH_STATE["processed"] += 1
 
             if computed_batch:
                 with SessionLocal() as db:
-                    for mid, tags, vec_blob, corrupted, blurry, score in computed_batch:
+                    for mid, tags, vec_blob, corrupted, blurry, score, quality_tags in computed_batch:
                         if run_tags:
                             db.execute(delete(MediaTag).where(MediaTag.media_id == mid))
                             for t_name, conf in tags:
@@ -470,15 +544,23 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                                 it_obj.is_corrupted = corrupted
                                 it_obj.is_blurry = blurry
                                 it_obj.blur_score = score
-                                if blurry:
+                                if blurry or corrupted:
                                     AI_BATCH_STATE["blurry"] += 1
+                            db.execute(
+                                delete(MediaTag).where(
+                                    MediaTag.media_id == mid,
+                                    MediaTag.source_model == "quality_check",
+                                )
+                            )
+                            for qt in quality_tags:
+                                db.add(MediaTag(media_id=mid, tag=qt, confidence=1.0, source_model="quality_check"))
                     db.commit()
 
                 ProcessManager.update_progress(
                     job_id,
                     processed_delta=len(computed_batch),
                     remaining_ids=item_ids[start + len(computed_batch) :],
-                    message=f"Przetworzono {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} (Tagi: {AI_BATCH_STATE['tagged']}, Wektory: {AI_BATCH_STATE['vectors']}, Rozmyte: {AI_BATCH_STATE['blurry']})",
+                    message=f"Przetworzono {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} (Tagi: {AI_BATCH_STATE['tagged']}, Wektory: {AI_BATCH_STATE['vectors']}, Rozmyte/Wadliwe: {AI_BATCH_STATE['blurry']})",
                 )
     except Exception as exc:
         logger.error("AI batch failure: %s", exc)
@@ -492,13 +574,14 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
         gc.collect()
         AI_BATCH_STATE["running"] = False
         if not stopped_midway:
+            final_msg = AI_BATCH_STATE.get("result_summary") or (
+                f"Zakończono analizę AI ({analysis_type}): {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} | "
+                f"Otagowano: {AI_BATCH_STATE['tagged']} | Wektory: {AI_BATCH_STATE['vectors']} | Rozmyte/Wadliwe: {AI_BATCH_STATE['blurry']}"
+            )
             ProcessManager.finish_job(
                 job_id,
                 status="COMPLETED",
-                message=(
-                    f"Zakończono analizę AI ({analysis_type}): {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} | "
-                    f"Otagowano: {AI_BATCH_STATE['tagged']} | Wektory: {AI_BATCH_STATE['vectors']} | Rozmyte: {AI_BATCH_STATE['blurry']}"
-                ),
+                message=final_msg,
             )
 
 
@@ -510,7 +593,7 @@ def get_ai_batch_status():
         return HTMLResponse(
             f"<div hx-get='/actions/ai-status' hx-trigger='every 1.5s' hx-swap='outerHTML' class='flex items-center space-x-3 text-xs'>"
             f"<span class='text-purple-300 font-semibold animate-pulse'>⚡ Przetwarzanie AI ({st['analysis_type']}) w tle: {st['processed']} / {st['total']} ({pct}%)</span>"
-            f"<span class='text-slate-400 font-mono'>[Tagi: {st['tagged']} | Wektory: {st['vectors']} | Rozmyte: {st['blurry']}]</span>"
+            f"<span class='text-slate-400 font-mono'>[Tagi: {st['tagged']} | Wektory: {st['vectors']} | Wady/Blur: {st['blurry']}]</span>"
             f"<button hx-post='/actions/ai-stop' hx-target='#global-notification' class='bg-rose-800 hover:bg-rose-700 text-white px-2 py-0.5 rounded text-[10px]'>⏹️ Zatrzymaj</button>"
             f"</div>"
         )
@@ -521,9 +604,14 @@ def get_ai_batch_status():
             f"</span>",
             headers={"HX-Trigger": "refresh-all"},
         )
+    if st.get("result_summary"):
+        return HTMLResponse(
+            f"<span class='text-emerald-400 text-xs font-semibold'>✓ {st['result_summary']}</span>",
+            headers={"HX-Trigger": "refresh-all"},
+        )
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>"
-        f"✓ Analiza AI ({st['analysis_type']}) zakończona! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Wektory 512-D: {st['vectors']} | Rozmyte: {st['blurry']}"
+        f"✓ Analiza AI ({st['analysis_type']}) zakończona! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Wektory 512-D: {st['vectors']} | Rozmyte/Wadliwe: {st['blurry']}"
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -552,6 +640,9 @@ def trigger_full_ai_analysis(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     run_sync: bool = Form(False),
     db: Session = Depends(get_db),
 ):
@@ -573,16 +664,22 @@ def trigger_full_ai_analysis(
         anomaly_only,
         blurry_only,
         duplicates_only,
+        untagged_only=untagged_only,
+        unvectored_only=unvectored_only,
+        unanalyzed_quality_only=unanalyzed_quality_only,
         limit=None,
     )
     if not items:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w wybranym zakresie do analizy AI.</span>")
 
     type_labels = {
-        "all": "Pełna analiza AI (Tagi + Wektory 512-D + Ostrość)",
+        "all": "Pełna analiza AI (Tagi + Wektory 512-D + Ostrość i wady)",
         "tags": "Tagowanie obiektów i scen AI",
         "vectors": "Generowanie wektorów podobieństwa 512-D",
-        "quality": "Analiza ostrości (Blur) i integralności",
+        "quality": "Analiza ostrości, ekspozycji i uszkodzonych plików",
+        "duplicates_fast": "Szybka analiza duplikatów (baza SHA-256 / hash wideo)",
+        "duplicates_exact": "Dokładna analiza duplikatów 100% (weryfikacja binarna na dyskach)",
+        "unbacked": "Analiza plików bez kopii zapasowej na innym urządzeniu",
     }
     item_ids = [it.id for it in items]
     job_id = ProcessManager.create_job(
@@ -694,43 +791,85 @@ def control_background_process(
     return resp
 
 
-@router.get("/backup-panel")
-def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, db: Session = Depends(get_db)):
+def _render_backup_panel_response(
+    request: Request,
+    db: Session,
+    pref_vid: Optional[int] = None,
+    selected_pairs: Optional[List[str]] = None,
+    operation_mode: str = "both",
+    execution_result: Optional[dict] = None,
+    offline_report: Optional[dict] = None,
+    trigger_refresh: bool = False,
+):
+    """Builds and renders the Backup & Deduplication modal partial with pair filtering state."""
     svc = StorageAutomationService(db)
-    pref_vid = to_int(target_volume_id)
     plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
-    unbacked_files = svc.detect_files_without_backup()
+    norm_mode = operation_mode if operation_mode in ("both", "backup_only", "dedup_only") else "both"
+    all_pair_key_strs = [p["pair_key_str"] for p in plan["ordered_pairs"]]
+    effective_pair_keys = (
+        [k for k in selected_pairs if k and ":" in k]
+        if selected_pairs is not None
+        else all_pair_key_strs
+    )
+    all_unbacked = svc.detect_files_without_backup(recluster=True)
+    pair_map = plan.get("unbacked_pair_map", {})
+    if selected_pairs is not None:
+        selected_set = set(effective_pair_keys)
+        filtered_unbacked_count = sum(1 for uf in all_unbacked if pair_map.get(uf.id, "") in selected_set)
+    else:
+        filtered_unbacked_count = len(all_unbacked)
+
     volumes_list = list(plan["volumes"].values())
     vol_space = svc.get_volume_space_map(volumes_list)
     latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
 
-    return render_template(
+    resp = render_template(
         request,
         "partials/backup_panel.html",
         {
             "plan": plan,
-            "unbacked_files": unbacked_files[:200],
-            "unbacked_total": len(unbacked_files),
+            "unbacked_files": all_unbacked[:300],
+            "unbacked_total": filtered_unbacked_count,
+            "unbacked_all_total": len(all_unbacked),
             "volumes": volumes_list,
             "vol_space": vol_space,
-            "execution_result": None,
-            "offline_report": None,
+            "execution_result": execution_result,
+            "offline_report": offline_report,
             "latest_report_exists": latest_report_exists,
+            "selected_operation_mode": norm_mode,
+            "selected_pair_keys": effective_pair_keys,
         },
     )
+    if trigger_refresh:
+        resp.headers["HX-Trigger"] = "refresh-all"
+    return resp
+
+
+@router.get("/backup-panel")
+def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, db: Session = Depends(get_db)):
+    pref_vid = to_int(target_volume_id)
+    return _render_backup_panel_response(request, db, pref_vid=pref_vid)
 
 
 @router.post("/prepare-offline-report")
 def prepare_offline_report_action(
     request: Request,
     preferred_target_volume_id: Optional[str] = Form(None),
+    operation_mode: str = Form("both"),
+    selected_pairs: List[str] = Form(default=[]),
+    pairs_submitted: bool = Form(False),
     target_panel: str = Form("backup"),
     db: Session = Depends(get_db),
 ):
     """Prepares the offline backup/dedup/move procedure and saves a local text report before physical execution."""
     svc = StorageAutomationService(db)
     pref_vid = to_int(preferred_target_volume_id)
-    report_res = svc.generate_offline_procedure_report(preferred_target_volume_id=pref_vid)
+    effective_pairs = selected_pairs if pairs_submitted else (selected_pairs or None)
+    report_res = svc.generate_offline_procedure_report(
+        preferred_target_volume_id=pref_vid,
+        operation_mode=operation_mode,
+        selected_pair_keys=effective_pairs,
+    )
 
     if target_panel == "todo":
         return render_template(
@@ -743,23 +882,13 @@ def prepare_offline_report_action(
             },
         )
 
-    plan = report_res["plan"]
-    unbacked_files = svc.detect_files_without_backup()
-    volumes_list = list(plan["volumes"].values())
-    vol_space = svc.get_volume_space_map(volumes_list)
-    return render_template(
+    return _render_backup_panel_response(
         request,
-        "partials/backup_panel.html",
-        {
-            "plan": plan,
-            "unbacked_files": unbacked_files[:200],
-            "unbacked_total": len(unbacked_files),
-            "volumes": volumes_list,
-            "vol_space": vol_space,
-            "execution_result": None,
-            "offline_report": report_res,
-            "latest_report_exists": True,
-        },
+        db,
+        pref_vid=pref_vid,
+        selected_pairs=effective_pairs,
+        operation_mode=operation_mode,
+        offline_report=report_res,
     )
 
 
@@ -781,6 +910,9 @@ def execute_backup_action(
     request: Request,
     preferred_target_volume_id: Optional[str] = Form(None),
     new_backup_drive_path: Optional[str] = Form(None),
+    operation_mode: str = Form("both"),
+    selected_pairs: List[str] = Form(default=[]),
+    pairs_submitted: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     pref_vid = to_int(preferred_target_volume_id)
@@ -805,14 +937,24 @@ def execute_backup_action(
             pref_vid = vol.id
 
     svc = StorageAutomationService(db)
+    effective_pairs = selected_pairs if pairs_submitted else (selected_pairs or None)
     job_id = ProcessManager.create_job(
         job_type="backup_dedup",
         title="Automatyczny Backup na inne urządzenie i 100% bezpieczna deduplikacja",
         item_ids=[],
-        params={"preferred_target_volume_id": pref_vid},
+        params={
+            "preferred_target_volume_id": pref_vid,
+            "operation_mode": operation_mode,
+            "selected_pairs": effective_pairs,
+        },
         db=db,
     )
-    exec_result = svc.execute_backup_and_deduplication(preferred_target_volume_id=pref_vid, job_id=job_id)
+    exec_result = svc.execute_backup_and_deduplication(
+        preferred_target_volume_id=pref_vid,
+        job_id=job_id,
+        operation_mode=operation_mode,
+        selected_pair_keys=effective_pairs,
+    )
     if exec_result["pending_offline_pairs_count"] > 0:
         ProcessManager.update_progress(
             job_id,
@@ -824,28 +966,15 @@ def execute_backup_action(
         ProcessManager.finish_job(job_id, status="COMPLETED", message=exec_result["summary"], db=db)
     db.commit()
 
-    plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
-    unbacked_files = svc.detect_files_without_backup()
-    volumes_list = list(plan["volumes"].values())
-    vol_space = svc.get_volume_space_map(volumes_list)
-    latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
-
-    resp = render_template(
+    return _render_backup_panel_response(
         request,
-        "partials/backup_panel.html",
-        {
-            "plan": plan,
-            "unbacked_files": unbacked_files[:200],
-            "unbacked_total": len(unbacked_files),
-            "volumes": volumes_list,
-            "vol_space": vol_space,
-            "execution_result": exec_result,
-            "offline_report": None,
-            "latest_report_exists": latest_report_exists,
-        },
+        db,
+        pref_vid=pref_vid,
+        selected_pairs=effective_pairs,
+        operation_mode=operation_mode,
+        execution_result=exec_result,
+        trigger_refresh=True,
     )
-    resp.headers["HX-Trigger"] = "refresh-all"
-    return resp
 
 
 @router.get("/todo-panel")
@@ -925,11 +1054,16 @@ def assign_group(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-        group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+        untagged_only=untagged_only, unvectored_only=unvectored_only,
+        unanalyzed_quality_only=unanalyzed_quality_only,
     )
 
     ex_id = to_int(existing_group_id)
@@ -989,6 +1123,9 @@ def auto_group_endpoint(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
@@ -1007,7 +1144,9 @@ def auto_group_endpoint(
 
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-        group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+        untagged_only=untagged_only, unvectored_only=unvectored_only,
+        unanalyzed_quality_only=unanalyzed_quality_only,
     )
     if not items:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w wybranym katalogu urządzenia.</span>")
@@ -1099,6 +1238,9 @@ def change_media_date(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
@@ -1128,7 +1270,9 @@ def change_media_date(
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
 
     if not items:
@@ -1140,7 +1284,7 @@ def change_media_date(
         it.date_anomaly_reason = None
 
     db.commit()
-    msg = f"Zmieniono datę na {parsed_dt.strftime('%Y-%m-%d %H:%M')} dla {len(items)} zdjęć (usunięto z listy anomalii daty)."
+    msg = f"Zmieniono datę na {parsed_dt.strftime('%Y-%m-%d %H:%M')} dla {len(items)} zdjęć (usunięto z listy niezgodności dat)."
     OperationLogger.log("DATE_CHANGE", msg, status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>📅 {msg}</span>",
@@ -1164,6 +1308,9 @@ def clear_date_anomaly_without_changing_date(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
@@ -1179,7 +1326,9 @@ def clear_date_anomaly_without_changing_date(
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
 
     if not items:
@@ -1193,7 +1342,7 @@ def clear_date_anomaly_without_changing_date(
         it.date_anomaly_reason = None
 
     db.commit()
-    msg = f"Usunięto z listy nieprawidłowych dat bez zmiany daty: {len(items)} zdjęć."
+    msg = f"Usunięto z listy niezgodności dat bez zmiany daty: {len(items)} zdjęć."
     OperationLogger.log("DATE_ANOMALY_CLEAR", msg, status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>✓ {msg}</span>",
@@ -1235,6 +1384,9 @@ def rotate_media_action(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
@@ -1261,7 +1413,9 @@ def rotate_media_action(
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
 
     if not items:
@@ -1412,6 +1566,9 @@ def sync_to_google_drive(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     from app.cloud.google_drive import GoogleDriveManager
@@ -1435,7 +1592,9 @@ def sync_to_google_drive(
         else:
             items = resolve_target_items(
                 db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-                group_id, tag, year, anomaly_only, blurry_only, duplicates_only, limit=100
+                group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+                untagged_only=untagged_only, unvectored_only=unvectored_only,
+                unanalyzed_quality_only=unanalyzed_quality_only, limit=100,
             )
             if purge_local:
                 BackupManager().create_backup("pre_gdrive_purge")
@@ -1582,11 +1741,16 @@ def export_json_to_disk(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-        group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+        untagged_only=untagged_only, unvectored_only=unvectored_only,
+        unanalyzed_quality_only=unanalyzed_quality_only,
     )
     if not items:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików do eksportu.</span>")
@@ -1649,6 +1813,9 @@ def move_physical_files_action(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
@@ -1658,7 +1825,9 @@ def move_physical_files_action(
     """
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-        group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+        untagged_only=untagged_only, unvectored_only=unvectored_only,
+        unanalyzed_quality_only=unanalyzed_quality_only,
     )
     if not items:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików do przeniesienia.</span>")
@@ -1811,6 +1980,9 @@ def move_items_to_local_trash(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     BackupManager().create_backup("pre_trash_move")
@@ -1827,7 +1999,9 @@ def move_items_to_local_trash(
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
 
     if not items and not t_gid:
@@ -1980,6 +2154,98 @@ def rename_volume_action(
     )
 
 
+UNINDEX_BATCH_STATE = {
+    "running": False,
+    "job_id": None,
+    "processed": 0,
+    "total": 0,
+    "removed_vol_label": None,
+}
+
+
+def _run_unindex_worker(
+    job_id: int,
+    item_rows: List[Tuple[str, str]],
+    u_vid: Optional[int],
+):
+    UNINDEX_BATCH_STATE["running"] = True
+    UNINDEX_BATCH_STATE["job_id"] = job_id
+    UNINDEX_BATCH_STATE["processed"] = 0
+    UNINDEX_BATCH_STATE["total"] = len(item_rows)
+    removed_cnt = 0
+    try:
+        chunk_size = 500
+        for start in range(0, len(item_rows), chunk_size):
+            batch = item_rows[start : start + chunk_size]
+            batch_ids = [r[0] for r in batch]
+            for _, thumb_rel in batch:
+                if thumb_rel:
+                    thumb_p = THUMBNAILS_DIR / thumb_rel
+                    if thumb_p.exists():
+                        try:
+                            thumb_p.unlink()
+                        except OSError as exc:
+                            logger.debug("Unindex thumbnail cleanup warning: %s", exc)
+
+            with SessionLocal() as db:
+                db.execute(delete(MediaTag).where(MediaTag.media_id.in_(batch_ids)))
+                db.execute(delete(MediaEmbedding).where(MediaEmbedding.media_id.in_(batch_ids)))
+                db.execute(delete(PendingFileMove).where(PendingFileMove.media_id.in_(batch_ids)))
+                db.execute(delete(MediaItem).where(MediaItem.id.in_(batch_ids)))
+                db.commit()
+
+            removed_cnt += len(batch_ids)
+            UNINDEX_BATCH_STATE["processed"] = removed_cnt
+            ProcessManager.update_progress(
+                job_id,
+                processed_delta=len(batch_ids),
+                remaining_ids=[r[0] for r in item_rows[start + chunk_size :]],
+                message=f"Wyindeksowano {removed_cnt} / {len(item_rows)} pozycji...",
+            )
+
+        with SessionLocal() as db:
+            if u_vid:
+                vol = db.get(WindowsVolume, u_vid)
+                if vol:
+                    db.delete(vol)
+            OperationLogger.log(
+                "UNINDEX",
+                f"Wyindeksowano z bazy {removed_cnt} pozycji (bez usuwania plików).",
+                status="OK",
+                db=db,
+            )
+            ProcessManager.finish_job(
+                job_id,
+                status="COMPLETED",
+                message=f"Usunięto z indeksu bazy {removed_cnt} pozycji.",
+                db=db,
+            )
+            db.commit()
+    except Exception as exc:
+        logger.error("Unindex worker failure: %s", exc)
+        ProcessManager.finish_job(job_id, status="FAILED", message=f"Błąd wyindeksowania: {exc}")
+    finally:
+        UNINDEX_BATCH_STATE["running"] = False
+
+
+@router.get("/unindex-status")
+def get_unindex_status():
+    st = UNINDEX_BATCH_STATE
+    if st["running"]:
+        pct = int((st["processed"] / st["total"]) * 100) if st["total"] else 0
+        return HTMLResponse(
+            f"<div hx-get='/actions/unindex-status' hx-trigger='every 1s' hx-swap='outerHTML' class='flex items-center space-x-2 text-xs'>"
+            f"<span class='text-sky-300 font-semibold animate-pulse'>⏳ Wyindeksowanie dysku z bazy w toku: {st['processed']} / {st['total']} ({pct}%)...</span>"
+            f"</div>"
+        )
+    return HTMLResponse(
+        f"<span class='text-sky-300 text-xs font-semibold'>"
+        f"✖️ Usunięto z indeksu bazy: {st['processed']} pozycji (oryginalne pliki na dysku pozostały nienaruszone)."
+        f"</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
 @router.post("/unindex")
 def unindex_items_from_db(
     scope: str = Form("selected"),
@@ -1995,41 +2261,50 @@ def unindex_items_from_db(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
+    run_sync: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     u_vid = to_int(unindex_volume_id)
     if u_vid:
-        items = list(db.scalars(select(MediaItem).where(MediaItem.volume_id == u_vid)).all())
+        rows = db.execute(
+            select(MediaItem.id, MediaItem.thumbnail_relative_path).where(MediaItem.volume_id == u_vid)
+        ).all()
+        item_rows = [(str(r[0]), str(r[1] or "")) for r in rows]
+        vol = db.get(WindowsVolume, u_vid)
+        vol_label = vol.volume_label if vol else f"#{u_vid}"
+        title = f"Wyindeksowanie dysku {vol_label} ({len(item_rows)} poz.)"
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
+        item_rows = [(it.id, it.thumbnail_relative_path or "") for it in items]
+        title = f"Wyindeksowanie z bazy ({len(item_rows)} poz.)"
 
-    if not items and not u_vid:
+    if not item_rows and not u_vid:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych elementów do wyindeksowania z bazy.</span>")
 
-    removed_cnt = 0
-    for it in items:
-        thumb_p = THUMBNAILS_DIR / it.thumbnail_relative_path
-        if thumb_p.exists():
-            try:
-                thumb_p.unlink()
-            except OSError as exc:
-                logger.debug("Unindex thumbnail cleanup warning: %s", exc)
-        db.delete(it)
-        removed_cnt += 1
+    job_id = ProcessManager.create_job(
+        job_type="unindex",
+        title=title,
+        item_ids=[r[0] for r in item_rows],
+        params={"unindex_volume_id": u_vid},
+        db=db,
+    )
 
-    if u_vid:
-        vol = db.get(WindowsVolume, u_vid)
-        if vol:
-            db.delete(vol)
+    if len(item_rows) > 300 and not run_sync:
+        ProcessManager.start_background_thread(job_id, _run_unindex_worker, item_rows, u_vid)
+        return get_unindex_status()
 
-    db.commit()
-    OperationLogger.log("UNINDEX", f"Wyindeksowano z bazy {removed_cnt} pozycji (bez usuwania plików).", status="OK", db=db)
+    _run_unindex_worker(job_id, item_rows, u_vid)
     return HTMLResponse(
         f"<span class='text-sky-300 text-xs font-semibold'>"
-        f"✖️ Usunięto z indeksu bazy: {removed_cnt} pozycji (oryginalne pliki na dysku pozostały nienaruszone)."
+        f"✖️ Usunięto z indeksu bazy: {len(item_rows)} pozycji (oryginalne pliki na dysku pozostały nienaruszone)."
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -2107,6 +2382,9 @@ def delete_files_permanently_from_disk(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    untagged_only: bool = Form(False),
+    unvectored_only: bool = Form(False),
+    unanalyzed_quality_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     BackupManager().create_backup("pre_permanent_disk_delete")
@@ -2121,7 +2399,9 @@ def delete_files_permanently_from_disk(
     else:
         items = resolve_target_items(
             db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
         )
 
     if not items and not grp_to_delete:

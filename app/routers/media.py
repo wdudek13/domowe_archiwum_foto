@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, joinedload, aliased
 from app.database import get_db, THUMBNAILS_DIR
 from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, PendingFileMove
 from app.operation_log import ProcessManager
+from app.scanner import MetadataDateResolver
 from app.storage_ops import StorageAutomationService
 
 logger = logging.getLogger("MediaRouter")
@@ -89,6 +90,8 @@ def apply_media_filters(
     ungrouped_only: bool = False,
     trashed_only: bool = False,
     unbacked_only: bool = False,
+    unvectored_only: bool = False,
+    unanalyzed_quality_only: bool = False,
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
@@ -110,7 +113,11 @@ def apply_media_filters(
     if tag and tag.strip():
         stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == tag.strip())
     if untagged_only:
-        stmt = stmt.outerjoin(MediaItem.tags).where(MediaTag.id.is_(None))
+        stmt = stmt.where(~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
+    if unvectored_only:
+        stmt = stmt.where(~MediaItem.id.in_(select(MediaEmbedding.media_id)))
+    if unanalyzed_quality_only:
+        stmt = stmt.where(MediaItem.blur_score.is_(None))
     if year:
         stmt = stmt.where(extract("year", MediaItem.effective_date) == year)
     if anomaly_only:
@@ -217,6 +224,15 @@ def build_sidebar_context(db: Session) -> dict:
     total_blurry = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_blurry == True)) or 0
     total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
     total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id))) or 0
+    total_untagged = db.scalar(
+        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, ~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
+    ) or 0
+    total_unvectored = db.scalar(
+        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, ~MediaItem.id.in_(select(MediaEmbedding.media_id)))
+    ) or 0
+    total_unanalyzed_quality = db.scalar(
+        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.blur_score.is_(None))
+    ) or 0
     total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
     total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
     jobs_summary = ProcessManager.get_jobs_summary(db)
@@ -237,6 +253,9 @@ def build_sidebar_context(db: Session) -> dict:
         "total_blurry": total_blurry,
         "total_trashed": total_trashed,
         "total_vectors": total_vectors,
+        "total_untagged": total_untagged,
+        "total_unvectored": total_unvectored,
+        "total_unanalyzed_quality": total_unanalyzed_quality,
         "total_unbacked": total_unbacked,
         "total_pending_moves": total_pending_moves,
         "jobs_summary": jobs_summary,
@@ -259,6 +278,8 @@ def build_search_context(request: Request, db: Session) -> dict:
     ungrouped_only = to_bool(qp.get("ungrouped_only"))
     trashed_only = to_bool(qp.get("trashed_only"))
     unbacked_only = to_bool(qp.get("unbacked_only"))
+    unvectored_only = to_bool(qp.get("unvectored_only"))
+    unanalyzed_quality_only = to_bool(qp.get("unanalyzed_quality_only"))
     sort_by = qp.get("sort_by", "date_desc")
     view_mode = qp.get("view_mode", "grid")
     page_int = max(1, to_int(qp.get("page")) or 1)
@@ -267,7 +288,8 @@ def build_search_context(request: Request, db: Session) -> dict:
     base_stmt = select(MediaItem)
     filtered_stmt = apply_media_filters(
         base_stmt, db, q, media_type, vol_id_int, folder_prefix, grp_id_int, tag, yr_int,
-        anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only
+        anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only,
+        unvectored_only, unanalyzed_quality_only
     ).distinct()
 
     count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
@@ -351,6 +373,9 @@ def build_search_context(request: Request, db: Session) -> dict:
         "duplicates_only": duplicates_only,
         "anomaly_only": anomaly_only,
         "unbacked_only": unbacked_only,
+        "untagged_only": untagged_only,
+        "unvectored_only": unvectored_only,
+        "unanalyzed_quality_only": unanalyzed_quality_only,
         "trashed_groups": trashed_groups,
         "subfolders": subfolders,
         "all_groups": all_groups,
@@ -489,6 +514,12 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             .order_by(desc(MediaItem.is_primary_duplicate), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
         ).unique().all()
     )
+    folder_info = MetadataDateResolver.parse_folder_date(Path(it.relative_path), rel_path=it.relative_path)
+    folder_date_str = None
+    if folder_info:
+        f_dt, f_prec, f_seg = folder_info
+        folder_date_str = f"{f_dt.strftime('%Y-%m-%d')} ({f_prec}, katalog: '{f_seg}')"
+
     return render_template(
         request,
         "partials/modal_detail.html",
@@ -497,5 +528,6 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,
+            "folder_date_str": folder_date_str,
         },
     )
