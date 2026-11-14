@@ -99,6 +99,15 @@ def apply_media_filters(
     else:
         stmt = stmt.where(MediaItem.is_trashed == False)
 
+    # Exclude backup copies from media browsing/displaying (Req 2: daf_backup is a backup vault, not a media collection)
+    stmt = stmt.where(
+        MediaItem.is_backup_copy == False,
+        ~MediaItem.relative_path.ilike("daf_backup/%"),
+        ~MediaItem.relative_path.ilike("daf_backup\\%"),
+        ~MediaItem.relative_path.ilike("backup/%"),
+        ~MediaItem.relative_path.ilike("backup\\%"),
+    )
+
     if media_type in ("image", "video"):
         stmt = stmt.where(MediaItem.media_type == media_type)
     if volume_id:
@@ -184,7 +193,7 @@ def build_sidebar_context(db: Session) -> dict:
     vol_counts = dict(
         db.execute(
             select(MediaItem.volume_id, func.count(MediaItem.id))
-            .where(MediaItem.is_trashed == False)
+            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
             .group_by(MediaItem.volume_id)
         ).all()
     )
@@ -195,7 +204,7 @@ def build_sidebar_context(db: Session) -> dict:
     direct_counts = dict(
         db.execute(
             select(MediaItem.group_id, func.count(MediaItem.id))
-            .where(MediaItem.is_trashed == False)
+            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
             .group_by(MediaItem.group_id)
         ).all()
     )
@@ -217,7 +226,7 @@ def build_sidebar_context(db: Session) -> dict:
     top_tags = db.execute(
         select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
         .join(MediaItem, MediaItem.id == MediaTag.media_id)
-        .where(MediaItem.is_trashed == False, MediaTag.source_model != "quality_check")
+        .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model != "quality_check")
         .group_by(MediaTag.tag)
         .order_by(desc("cnt"))
         .limit(35)
@@ -227,24 +236,25 @@ def build_sidebar_context(db: Session) -> dict:
         db.execute(
             select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)))
             .join(MediaItem, MediaItem.id == MediaTag.media_id)
-            .where(MediaItem.is_trashed == False, MediaTag.source_model == "quality_check")
+            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model == "quality_check")
             .group_by(MediaTag.tag)
         ).all()
     )
 
     years = db.execute(
         select(extract("year", MediaItem.effective_date).label("yr"), func.count(MediaItem.id))
-        .where(MediaItem.is_trashed == False)
+        .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
         .group_by("yr")
         .order_by(desc("yr"))
     ).all()
 
-    total_all = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False)) or 0
-    total_anomalies = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.has_date_anomaly == True)) or 0
-    total_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_primary_duplicate == False)) or 0
+    total_all = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)) or 0
+    total_anomalies = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.has_date_anomaly == True)) or 0
+    total_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.is_primary_duplicate == False)) or 0
     total_blurry = db.scalar(
         select(func.count(MediaItem.id)).where(
             MediaItem.is_trashed == False,
+            MediaItem.is_backup_copy == False,
             or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
         )
     ) or 0
@@ -259,16 +269,17 @@ def build_sidebar_context(db: Session) -> dict:
         "lowres": defect_counts_raw.get("do_usuniecia:niska_rozdzielczosc", 0),
     }
     total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
-    total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id))) or 0
+    total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id)).join(MediaItem, MediaItem.id == MediaEmbedding.media_id).where(MediaItem.is_backup_copy == False)) or 0
     total_untagged = db.scalar(
-        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, ~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
+        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, ~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
     ) or 0
     total_unvectored = db.scalar(
-        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, ~MediaItem.id.in_(select(MediaEmbedding.media_id)))
+        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, ~MediaItem.id.in_(select(MediaEmbedding.media_id)))
     ) or 0
     total_unanalyzed_quality = db.scalar(
         select(func.count(MediaItem.id)).where(
             MediaItem.is_trashed == False,
+            MediaItem.is_backup_copy == False,
             MediaItem.blur_score.is_(None),
             MediaItem.is_corrupted == False,
         )
@@ -386,13 +397,19 @@ def build_search_context(request: Request, db: Session) -> dict:
     subfolders = []
     if vol_id_int and not trashed_only:
         paths = db.scalars(
-            select(MediaItem.relative_path).where(MediaItem.volume_id == vol_id_int, MediaItem.is_trashed == False)
+            select(MediaItem.relative_path).where(
+                MediaItem.volume_id == vol_id_int,
+                MediaItem.is_trashed == False,
+                MediaItem.is_backup_copy == False,
+            )
         ).all()
         folder_counts = defaultdict(int)
         for p in paths:
             parent_str = Path(p).parent.as_posix()
             if parent_str != ".":
                 top_part = parent_str.split("/")[0]
+                if top_part.lower() in ("daf_backup", "backup"):
+                    continue
                 folder_counts[top_part] += 1
             else:
                 folder_counts["."] += 1

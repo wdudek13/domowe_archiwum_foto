@@ -568,7 +568,7 @@ class FileScannerService:
     @staticmethod
     def is_in_backup_folder(rel_path: str) -> bool:
         parts = [p.lower() for p in Path(rel_path).parts if p not in ("", ".", "/", "\\")]
-        return bool(parts and parts[0] == "backup")
+        return bool(parts and parts[0] in ("daf_backup", "backup"))
 
     @classmethod
     def process_file(cls, path: Path, volume: WindowsVolume, rel_override: Optional[str] = None) -> Optional[MediaItem]:

@@ -155,7 +155,7 @@
     <div class="bg-emerald-950/30 border border-emerald-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
             <div class="font-bold text-emerald-300 text-sm">🛡️ Wykryto {{ total_matching }} plików bez kopii zapasowej (backupu) na innym urządzeniu</div>
-            <div class="text-slate-300 text-[11px]">Kopia zapasowa zostanie zapisana w katalogu <code>backup/</code> na innym dysku niż oryginał, ze sprawdzaniem wolnego miejsca i 100% weryfikacją.</div>
+            <div class="text-slate-300 text-[11px]">Kopia zapasowa zostanie zapisana w katalogu <code>daf_backup/</code> na innym dysku niż oryginał, ze sprawdzaniem wolnego miejsca i 100% weryfikacją.</div>
         </div>
         <button type="button" onclick="openBackupModal()"
                 class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
@@ -204,7 +204,7 @@
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
             <div class="font-bold text-amber-300 text-sm">👥 Porównywanie Duplikatów Binarnych (Zgrupowane wg SHA-256)</div>
-            <div class="text-slate-300 text-[11px]">Zielony znacznik <strong>ORYGINAŁ</strong> wskazuje główną kopię (preferowaną na dysku z duplikatem do albumu <em>Ważne</em>), niebieski <strong>BACKUP</strong> to kopia w kartotece <code>backup/</code>, a czerwony <strong>DUPLIKAT</strong> to kopia nadmiarowa.</div>
+            <div class="text-slate-300 text-[11px]">Zielony znacznik <strong>ORYGINAŁ</strong> wskazuje główną kopię (preferowaną na dysku z duplikatem do albumu <em>Ważne</em>), niebieski <strong>BACKUP</strong> to kopia w kartotece <code>daf_backup/</code>, a czerwony <strong>DUPLIKAT</strong> to kopia nadmiarowa.</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
             <button type="button"

@@ -21,6 +21,7 @@ class StorageAutomationService:
     """Handles duplicate clustering, 100%-verified backup & deduplication, album management, and offline move queues."""
 
     MIN_FREE_SPACE_BUFFER_BYTES = 20 * 1024 * 1024  # 20 MB safety reserve on target drives
+    BACKUP_DIR_NAME = "daf_backup"
 
     def __init__(self, db: Session):
         self.db = db
@@ -109,7 +110,8 @@ class StorageAutomationService:
         mark_backup_sql = text("""
             UPDATE media_items
             SET is_backup_copy = CASE
-                WHEN LOWER(relative_path) LIKE 'backup/%' OR LOWER(relative_path) LIKE 'backup\\%' THEN 1
+                WHEN LOWER(relative_path) LIKE 'daf_backup/%' OR LOWER(relative_path) LIKE 'daf_backup\\%'
+                  OR LOWER(relative_path) LIKE 'backup/%' OR LOWER(relative_path) LIKE 'backup\\%' THEN 1
                 ELSE 0
             END;
         """)
@@ -575,7 +577,7 @@ class StorageAutomationService:
                 target_vol = pick_backup_volume(best_orig.volume_id)
                 if target_vol:
                     pair_key = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
-                    dst_rel = f"backup/{best_orig.effective_date.strftime('%Y/%Y-%m')}/{best_orig.file_name}"
+                    dst_rel = f"{self.BACKUP_DIR_NAME}/{best_orig.effective_date.strftime('%Y/%Y-%m')}/{best_orig.file_name}"
                     required_bytes_by_vol[target_vol.id] += int(best_orig.file_size_bytes or 0)
                     pair_tasks[pair_key]["backups_to_copy"].append(
                         {
@@ -592,7 +594,7 @@ class StorageAutomationService:
             else:
                 pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
                 if (selected_pairs_set is None or pair_key in selected_pairs_set) and not chosen_backup.is_backup_copy:
-                    dst_rel = f"backup/{chosen_backup.effective_date.strftime('%Y/%Y-%m')}/{chosen_backup.file_name}"
+                    dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%Y-%m')}/{chosen_backup.file_name}"
                     pair_tasks[pair_key]["backups_to_relocate"].append(
                         {
                             "backup_item_id": chosen_backup.id,
@@ -880,7 +882,7 @@ class StorageAutomationService:
 
                     dst_root = Path(dst_vol.last_known_drive_letter)
                     sub_month = orig_item.effective_date.strftime("%Y/%Y-%m")
-                    backup_dir = dst_root / "backup" / sub_month
+                    backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_month
                     backup_dir.mkdir(parents=True, exist_ok=True)
                     dest_path = backup_dir / orig_item.file_name
                     c = 1
@@ -960,7 +962,7 @@ class StorageAutomationService:
                     if not curr_path.exists():
                         continue
                     sub_month = bkp_item.effective_date.strftime("%Y/%Y-%m")
-                    target_bkp_dir = vol_root / "backup" / sub_month
+                    target_bkp_dir = vol_root / self.BACKUP_DIR_NAME / sub_month
                     target_bkp_dir.mkdir(parents=True, exist_ok=True)
                     target_bkp_path = target_bkp_dir / bkp_item.file_name
                     if curr_path.resolve() != target_bkp_path.resolve():
@@ -1069,7 +1071,7 @@ class StorageAutomationService:
         }
         summary_msg = (
             f"Tryb: {mode_labels[norm_mode]} | "
-            f"Backup utworzony: {backups_created} | Przeniesiono do 'backup/': {backups_relocated} | "
+            f"Backup utworzony: {backups_created} | Przeniesiono do '{self.BACKUP_DIR_NAME}/': {backups_relocated} | "
             f"Usunięto duplikatów (100% weryfikacji): {duplicates_deleted} | "
             f"Dodano do albumu 'Ważne': {important_assigned}"
         )
@@ -1609,14 +1611,14 @@ class StorageAutomationService:
                         sz_mb = (ct["file_size"] or 0) / (1024 * 1024)
                         lines.append(
                             f"     [KOPIOWANIE BACKUPU] {(sv.volume_label if sv else '?')}:{ct.get('src_relative_path', ct['file_name'])} "
-                            f"-> {(dv.volume_label if dv else '?')}:{ct.get('dst_relative_path', 'backup/')} ({sz_mb:.2f} MB)"
+                            f"-> {(dv.volume_label if dv else '?')}:{ct.get('dst_relative_path', f'{self.BACKUP_DIR_NAME}/')} ({sz_mb:.2f} MB)"
                         )
 
                     for rt in tasks["backups_to_relocate"]:
                         rv = volumes.get(rt["vol_id"])
                         lines.append(
-                            f"     [PRZENIESIENIE DO backup/] {(rv.volume_label if rv else '?')}:{rt.get('src_relative_path', '')} "
-                            f"-> {(rv.volume_label if rv else '?')}:{rt.get('dst_relative_path', 'backup/')}"
+                            f"     [PRZENIESIENIE DO {self.BACKUP_DIR_NAME}/] {(rv.volume_label if rv else '?')}:{rt.get('src_relative_path', '')} "
+                            f"-> {(rv.volume_label if rv else '?')}:{rt.get('dst_relative_path', f'{self.BACKUP_DIR_NAME}/')}"
                         )
 
                 if do_dedup:

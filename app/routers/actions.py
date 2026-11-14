@@ -62,10 +62,10 @@ def resolve_target_items(
     if scope == "selected" and selected_ids:
         stmt = select(MediaItem).where(MediaItem.id.in_(selected_ids))
     elif scope == "all_drives":
-        stmt = select(MediaItem).where(MediaItem.is_trashed == False)
+        stmt = select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
     elif scope.startswith("volume:"):
         vid = to_int(scope.split(":", 1)[1])
-        stmt = select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.volume_id == vid)
+        stmt = select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.volume_id == vid)
     else:
         stmt = apply_media_filters(
             select(MediaItem),

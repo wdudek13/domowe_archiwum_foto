@@ -385,13 +385,19 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertFalse(item.is_backup_copy)
             self.assertIsNotNone(item.embedding)
 
-            # File inside backup/ folder must be flagged is_backup_copy=True
-            bkp_sub = self.drive_a / "backup" / "2021"
+            # File inside daf_backup/ or backup/ folder must be flagged is_backup_copy=True
+            bkp_sub = self.drive_a / "daf_backup" / "2021"
             bkp_sub.mkdir(parents=True, exist_ok=True)
             bkp_img = create_synthetic_jpeg(bkp_sub / "IMG_20210510_123045.jpg")
             bkp_item = FileScannerService.process_file(bkp_img, vol)
             self.assertTrue(bkp_item.is_backup_copy)
             self.assertFalse(bkp_item.is_primary_duplicate)
+
+            bkp_legacy = self.drive_a / "backup" / "2021"
+            bkp_legacy.mkdir(parents=True, exist_ok=True)
+            bkp_legacy_img = create_synthetic_jpeg(bkp_legacy / "IMG_20210510_123046.jpg")
+            bkp_legacy_item = FileScannerService.process_file(bkp_legacy_img, vol)
+            self.assertTrue(bkp_legacy_item.is_backup_copy)
 
             # Corrupted image file handling in FileScannerService.process_file
             corrupt_jpg = self.drive_a / "corrupt_scan.jpg"
@@ -2062,7 +2068,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(r_prep_bkp.status_code, 200)
             self.assertIn("Zapisano raport procedury Offline", r_prep_bkp.text)
             self.assertIn("[KOPIOWANIE BACKUPU]", r_prep_bkp.text)
-            self.assertIn("[PRZENIESIENIE DO backup/]", r_prep_bkp.text)
+            self.assertIn("[PRZENIESIENIE DO daf_backup/]", r_prep_bkp.text)
             self.assertIn("[USUNIĘCIE DUPLIKATU]", r_prep_bkp.text)
             self.assertIn("[PRZENIESIENIE TODO", r_prep_bkp.text)
 
@@ -2430,6 +2436,33 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(self.client.get("/media/search?sort_by=name_asc").status_code, 200)
             self.assertEqual(self.client.get("/media/search?sort_by=blur_asc").status_code, 200)
 
+            # Verify that files in daf_backup or with is_backup_copy=True are NOT displayed in media search (Req 2)
+            with self.TestingSessionLocal() as db:
+                daf_bkp_item = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=va_id,
+                    relative_path="daf_backup/2023/2023-01/daf_vault_copy.jpg",
+                    file_name="daf_vault_copy.jpg",
+                    file_size_bytes=100,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash="fake_daf_bkp_hash",
+                    hash_algorithm="sha256",
+                    is_primary_duplicate=False,
+                    is_backup_copy=True,
+                    verified_sha256="fake_daf_bkp_hash",
+                    effective_date=datetime.datetime(2023, 1, 1),
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    thumbnail_relative_path="daf_bkp.webp",
+                )
+                db.add(daf_bkp_item)
+                db.commit()
+
+            r_search_daf = self.client.get("/media/search?q=daf_vault_copy")
+            self.assertEqual(r_search_daf.status_code, 200)
+            self.assertNotIn("daf_vault_copy.jpg", r_search_daf.text)
+
             r_df = self.client.post(
                 "/actions/analyze-all",
                 data={"analysis_type": "duplicates_fast", "scope": "all_drives", "run_sync": "true"},
@@ -2550,7 +2583,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             )
             self.assertEqual(r_exec_bkp.status_code, 200)
             self.assertTrue(img_a_dup.exists())
-            self.assertTrue(any((drv_b / "backup").rglob("2023-06-15_wakacje.jpg")))
+            self.assertTrue(any((drv_b / "daf_backup").rglob("2023-06-15_wakacje.jpg")))
             with self.TestingSessionLocal() as db:
                 svc_chk = StorageAutomationService(db)
                 unbacked_after_ab = svc_chk.detect_files_without_backup(recluster=True)
@@ -3144,8 +3177,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual(r_exec.status_code, 200)
         self.assertIn("Raport wykonania Backupu", r_exec.text)
 
-        # Verify physical backup on Vol C was created
-        backup_files_c = list((drive_c / "backup").glob("**/*"))
+        # Verify physical backup on Vol C was created in daf_backup/
+        backup_files_c = list((drive_c / "daf_backup").glob("**/*"))
         self.assertTrue(len(backup_files_c) > 0)
 
         # Step 6: Test execute backup with a new external backup drive path
@@ -3242,7 +3275,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
 
             # Test backup filename collision (while dest_path.exists())
             sub_m = item_a.effective_date.strftime("%Y/%Y-%m")
-            col_target = drive_c / "backup" / sub_m / item_a.file_name
+            col_target = drive_c / "daf_backup" / sub_m / item_a.file_name
             col_target.parent.mkdir(parents=True, exist_ok=True)
             col_target.write_bytes(b"existing_file")
 
