@@ -422,7 +422,11 @@ class StorageAutomationService:
                 return has_space, int(fallback_free_bytes)
             return False, 0
 
-    def build_backup_and_dedup_plan(self, preferred_target_volume_id: Optional[int] = None) -> Dict[str, Any]:
+    def build_backup_and_dedup_plan(
+        self,
+        preferred_target_volume_id: Optional[int] = None,
+        selected_pair_keys: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
         Analyzes the entire database to build a pairwise device execution plan and offline capacity balance for:
         1) Assigning Originals with same-device duplicates to 'Ważne - <device>' -> YYYY -> YYYY-MM (Rule 2b, 2d).
@@ -446,26 +450,64 @@ class StorageAutomationService:
         for it in all_items:
             by_hash[it.file_hash].append(it)
 
-        sorted_vols = sorted(volumes.values(), key=lambda v: (not v.is_online, v.id))
+        vol_ids = sorted(volumes.keys())
+        all_possible_pairs: List[Tuple[int, int]] = []
+        for i in range(len(vol_ids)):
+            for j in range(i + 1, len(vol_ids)):
+                all_possible_pairs.append((vol_ids[i], vol_ids[j]))
+
+        selected_pairs_set: Optional[Set[Tuple[int, int]]] = self.parse_pair_keys(selected_pair_keys)
+
+        reclaimed_bytes_by_vol: Dict[int, int] = defaultdict(int)
+        required_bytes_by_vol: Dict[int, int] = defaultdict(int)
 
         def pick_backup_volume(src_vol_id: int) -> Optional[WindowsVolume]:
-            if preferred_target_volume_id and preferred_target_volume_id != src_vol_id and preferred_target_volume_id in volumes:
+            candidates: List[WindowsVolume] = []
+            for cand in volumes.values():
+                if cand.id == src_vol_id:
+                    continue
+                if selected_pairs_set is not None:
+                    pk = (min(src_vol_id, cand.id), max(src_vol_id, cand.id))
+                    if pk not in selected_pairs_set:
+                        continue
+                candidates.append(cand)
+
+            if not candidates:
+                return None
+
+            if preferred_target_volume_id and any(c.id == preferred_target_volume_id for c in candidates):
                 return volumes[preferred_target_volume_id]
-            for cand in sorted_vols:
-                if cand.id != src_vol_id:
-                    return cand
-            return None
+
+            candidates.sort(
+                key=lambda c: (
+                    not c.is_online,
+                    -(int(c.free_space_bytes or 0) + reclaimed_bytes_by_vol.get(c.id, 0) - required_bytes_by_vol.get(c.id, 0)),
+                    c.id,
+                )
+            )
+            return candidates[0]
 
         pair_tasks: Dict[Tuple[int, int], Dict[str, List[Dict[str, Any]]]] = defaultdict(
             lambda: {"backups_to_copy": [], "backups_to_relocate": [], "duplicates_to_delete": []}
         )
+        pair_metrics: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(
+            lambda: {
+                "backups_to_copy_count": 0,
+                "backups_to_relocate_count": 0,
+                "duplicates_to_delete_count": 0,
+                "important_to_assign_count": 0,
+            }
+        )
         important_candidates: List[Tuple[MediaItem, WindowsVolume]] = []
+        unbacked_items: List[MediaItem] = []
         unbacked_pair_map: Dict[str, str] = {}
+        unbacked_pair_keys_str: Dict[str, str] = {}
         unbacked_count = 0
+        unbacked_count_by_vol: Dict[int, int] = defaultdict(int)
+        cross_dup_by_pair: Dict[str, int] = defaultdict(int)
+        same_vol_dup_by_vol: Dict[int, int] = defaultdict(int)
         redundant_duplicates_count = 0
         single_device_warning = len(volumes) < 2
-        reclaimed_bytes_by_vol: Dict[int, int] = defaultdict(int)
-        required_bytes_by_vol: Dict[int, int] = defaultdict(int)
 
         for fhash, cluster in by_hash.items():
             non_backup_by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
@@ -494,13 +536,45 @@ class StorageAutomationService:
                 )
                 chosen_backup = other_vol_copies[0]
 
+            # Compute pair_metrics for all possible pairs
+            for (va, vb) in all_possible_pairs:
+                if chosen_backup is None:
+                    if best_orig.volume_id == va or best_orig.volume_id == vb:
+                        pair_metrics[(va, vb)]["backups_to_copy_count"] += 1
+                else:
+                    pair_k = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                    if (va, vb) == pair_k and not chosen_backup.is_backup_copy:
+                        pair_metrics[(va, vb)]["backups_to_relocate_count"] += 1
+
+                for item in cluster:
+                    if item.id == best_orig.id:
+                        continue
+                    if chosen_backup and item.id == chosen_backup.id:
+                        continue
+                    if item.volume_id != best_orig.volume_id:
+                        p_k = (min(best_orig.volume_id, item.volume_id), max(best_orig.volume_id, item.volume_id))
+                        if (va, vb) == p_k:
+                            pair_metrics[(va, vb)]["duplicates_to_delete_count"] += 1
+                    else:
+                        if best_orig.volume_id in (va, vb):
+                            pair_metrics[(va, vb)]["duplicates_to_delete_count"] += 1
+
             target_vol: Optional[WindowsVolume] = None
             if chosen_backup is None:
                 unbacked_count += 1
+                unbacked_items.append(best_orig)
+                unbacked_count_by_vol[best_orig.volume_id] += 1
+                eligible_pks = [
+                    f"{min(best_orig.volume_id, vo)}:{max(best_orig.volume_id, vo)}"
+                    for vo in volumes if vo != best_orig.volume_id
+                ]
+                pks_str = ",".join(eligible_pks)
+                unbacked_pair_map[best_orig.id] = pks_str
+                unbacked_pair_keys_str[best_orig.id] = pks_str
+
                 target_vol = pick_backup_volume(best_orig.volume_id)
                 if target_vol:
                     pair_key = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
-                    unbacked_pair_map[best_orig.id] = f"{pair_key[0]}:{pair_key[1]}"
                     dst_rel = f"backup/{best_orig.effective_date.strftime('%Y/%Y-%m')}/{best_orig.file_name}"
                     required_bytes_by_vol[target_vol.id] += int(best_orig.file_size_bytes or 0)
                     pair_tasks[pair_key]["backups_to_copy"].append(
@@ -515,11 +589,9 @@ class StorageAutomationService:
                             "file_hash": best_orig.file_hash,
                         }
                     )
-                else:
-                    unbacked_pair_map[best_orig.id] = f"{best_orig.volume_id}:0"
             else:
-                if not chosen_backup.is_backup_copy:
-                    pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                if (selected_pairs_set is None or pair_key in selected_pairs_set) and not chosen_backup.is_backup_copy:
                     dst_rel = f"backup/{chosen_backup.effective_date.strftime('%Y/%Y-%m')}/{chosen_backup.file_name}"
                     pair_tasks[pair_key]["backups_to_relocate"].append(
                         {
@@ -541,26 +613,70 @@ class StorageAutomationService:
                 ref_vol_id = best_orig.volume_id
                 if item.volume_id != ref_vol_id:
                     pair_key = (min(ref_vol_id, item.volume_id), max(ref_vol_id, item.volume_id))
-                elif chosen_backup and chosen_backup.volume_id != ref_vol_id:
-                    pair_key = (min(ref_vol_id, chosen_backup.volume_id), max(ref_vol_id, chosen_backup.volume_id))
-                elif target_vol and target_vol.id != ref_vol_id:
-                    pair_key = (min(ref_vol_id, target_vol.id), max(ref_vol_id, target_vol.id))
+                    cross_dup_by_pair[f"{pair_key[0]}:{pair_key[1]}"] += 1
                 else:
-                    pair_key = (ref_vol_id, item.volume_id)
-                reclaimed_bytes_by_vol[item.volume_id] += int(item.file_size_bytes or 0)
-                pair_tasks[pair_key]["duplicates_to_delete"].append(
-                    {
-                        "dup_item_id": item.id,
-                        "dup_vol_id": item.volume_id,
-                        "ref_item_id": best_orig.id,
-                        "ref_vol_id": best_orig.volume_id,
-                        "backup_item_id": chosen_backup.id if chosen_backup else None,
-                        "file_name": item.file_name,
-                        "file_size": item.file_size_bytes,
-                        "dup_relative_path": item.relative_path,
-                        "ref_relative_path": best_orig.relative_path,
-                    }
-                )
+                    same_vol_dup_by_vol[item.volume_id] += 1
+                    partner_vid = None
+                    if target_vol and target_vol.id != ref_vol_id:
+                        partner_vid = target_vol.id
+                    elif chosen_backup and chosen_backup.volume_id != ref_vol_id:
+                        partner_vid = chosen_backup.volume_id
+                    else:
+                        cand_list = selected_pairs_set if selected_pairs_set is not None else all_possible_pairs
+                        for cand_p in cand_list:
+                            if ref_vol_id in cand_p:
+                                partner_vid = cand_p[1] if cand_p[0] == ref_vol_id else cand_p[0]
+                                break
+                    if partner_vid is not None:
+                        pair_key = (min(ref_vol_id, partner_vid), max(ref_vol_id, partner_vid))
+                    else:
+                        pair_key = (ref_vol_id, item.volume_id)
+
+                if selected_pairs_set is None or pair_key in selected_pairs_set:
+                    reclaimed_bytes_by_vol[item.volume_id] += int(item.file_size_bytes or 0)
+                    pair_tasks[pair_key]["duplicates_to_delete"].append(
+                        {
+                            "dup_item_id": item.id,
+                            "dup_vol_id": item.volume_id,
+                            "ref_item_id": best_orig.id,
+                            "ref_vol_id": best_orig.volume_id,
+                            "backup_item_id": chosen_backup.id if chosen_backup else None,
+                            "file_name": item.file_name,
+                            "file_size": item.file_size_bytes,
+                            "dup_relative_path": item.relative_path,
+                            "ref_relative_path": best_orig.relative_path,
+                        }
+                    )
+
+        important_count_by_vol: Dict[int, int] = defaultdict(int)
+        for orig_item, orig_vol in important_candidates:
+            important_count_by_vol[orig_vol.id] += 1
+
+        for (va, vb) in all_possible_pairs:
+            pair_metrics[(va, vb)]["important_to_assign_count"] = (
+                important_count_by_vol[va] + important_count_by_vol[vb]
+            )
+
+        important_rows: List[Dict[str, Any]] = []
+        for orig_item, orig_vol in important_candidates:
+            eligible_pks = [
+                f"{min(orig_vol.id, vo)}:{max(orig_vol.id, vo)}"
+                for vo in volumes if vo != orig_vol.id
+            ]
+            important_rows.append(
+                {
+                    "item_id": orig_item.id,
+                    "file_name": orig_item.file_name,
+                    "file_size": int(orig_item.file_size_bytes or 0),
+                    "vol_id": orig_vol.id,
+                    "vol_label": orig_vol.volume_label,
+                    "vol_letter": orig_vol.last_known_drive_letter,
+                    "relative_path": orig_item.relative_path,
+                    "target_album": f"Ważne - {orig_vol.volume_label} / {orig_item.effective_date.strftime('%Y / %Y-%m')}",
+                    "pair_keys": eligible_pks,
+                    "pair_keys_str": ",".join(eligible_pks),
+                }
+            )
 
         volume_space_summary: Dict[int, Dict[str, Any]] = {}
         for vid, v in volumes.items():
@@ -582,52 +698,72 @@ class StorageAutomationService:
             }
 
         ordered_pairs = []
-        for (va_id, vb_id), tasks in pair_tasks.items():
+        for (va_id, vb_id) in all_possible_pairs:
             va = volumes.get(va_id)
             vb = volumes.get(vb_id)
             both_online = bool(va and vb and va.is_online and vb.is_online)
             one_online = bool((va and va.is_online) or (vb and vb.is_online))
+            tasks = pair_tasks[(va_id, vb_id)]
+            metrics = pair_metrics[(va_id, vb_id)]
             total_ops = (
                 len(tasks["backups_to_copy"])
                 + len(tasks["backups_to_relocate"])
                 + len(tasks["duplicates_to_delete"])
             )
-            if total_ops > 0:
-                ordered_pairs.append(
-                    {
-                        "pair_key": (va_id, vb_id),
-                        "pair_key_str": f"{va_id}:{vb_id}",
-                        "vol_a": va,
-                        "vol_b": vb,
-                        "both_online": both_online,
-                        "one_online": one_online,
-                        "tasks": tasks,
-                        "total_ops": total_ops,
-                    }
-                )
+            ordered_pairs.append(
+                {
+                    "pair_key": (va_id, vb_id),
+                    "pair_key_str": f"{va_id}:{vb_id}",
+                    "vol_a": va,
+                    "vol_b": vb,
+                    "both_online": both_online,
+                    "one_online": one_online,
+                    "tasks": tasks,
+                    "total_ops": total_ops,
+                    "metrics": metrics,
+                }
+            )
 
         ordered_pairs.sort(key=lambda p: (not p["both_online"], not p["one_online"], p["pair_key"]))
 
         duplicate_rows: List[Dict[str, Any]] = []
-        for pair_entry in ordered_pairs:
-            p_key_str = pair_entry["pair_key_str"]
-            for dup in pair_entry["tasks"]["duplicates_to_delete"]:
-                dup_v = volumes.get(dup["dup_vol_id"])
-                ref_v = volumes.get(dup["ref_vol_id"])
+        for fhash, cluster in by_hash.items():
+            if len(cluster) <= 1:
+                continue
+            primary = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
+            other_vol_copies = [x for x in cluster if x.volume_id != primary.volume_id and x.id != primary.id]
+            chosen_backup = other_vol_copies[0] if other_vol_copies else None
+
+            for item in cluster:
+                if item.id == primary.id:
+                    continue
+                if chosen_backup and item.id == chosen_backup.id:
+                    continue
+                dup_v = volumes.get(item.volume_id)
+                ref_v = volumes.get(primary.volume_id)
+                if item.volume_id != primary.volume_id:
+                    p_keys = [f"{min(primary.volume_id, item.volume_id)}:{max(primary.volume_id, item.volume_id)}"]
+                    p_key_str = p_keys[0]
+                else:
+                    p_keys = [f"{min(item.volume_id, vo)}:{max(item.volume_id, vo)}" for vo in volumes if vo != item.volume_id]
+                    p_key_str = p_keys[0] if p_keys else f"{item.volume_id}:0"
+
                 duplicate_rows.append(
                     {
                         "pair_key_str": p_key_str,
-                        "dup_item_id": dup["dup_item_id"],
-                        "file_name": dup["file_name"],
-                        "file_size": int(dup.get("file_size") or 0),
-                        "dup_vol_id": dup["dup_vol_id"],
+                        "pair_keys": p_keys,
+                        "pair_keys_str": ",".join(p_keys),
+                        "dup_item_id": item.id,
+                        "file_name": item.file_name,
+                        "file_size": int(item.file_size_bytes or 0),
+                        "dup_vol_id": item.volume_id,
                         "dup_vol_label": dup_v.volume_label if dup_v else "?",
                         "dup_vol_letter": dup_v.last_known_drive_letter if dup_v else "?",
-                        "dup_relative_path": dup["dup_relative_path"],
-                        "ref_vol_id": dup["ref_vol_id"],
+                        "dup_relative_path": item.relative_path,
+                        "ref_vol_id": primary.volume_id,
                         "ref_vol_label": ref_v.volume_label if ref_v else "?",
                         "ref_vol_letter": ref_v.last_known_drive_letter if ref_v else "?",
-                        "ref_relative_path": dup["ref_relative_path"],
+                        "ref_relative_path": primary.relative_path,
                     }
                 )
 
@@ -635,12 +771,19 @@ class StorageAutomationService:
             "volumes": volumes,
             "volume_space_summary": volume_space_summary,
             "important_candidates": important_candidates,
+            "important_rows": important_rows,
+            "important_count_by_vol": dict(important_count_by_vol),
             "ordered_pairs": ordered_pairs,
             "duplicate_rows": duplicate_rows,
+            "unbacked_items": unbacked_items,
             "unbacked_pair_map": unbacked_pair_map,
+            "unbacked_pair_keys_str": unbacked_pair_keys_str,
             "unbacked_count": unbacked_count,
             "redundant_duplicates_count": redundant_duplicates_count,
             "single_device_warning": single_device_warning,
+            "unbacked_count_by_vol": dict(unbacked_count_by_vol),
+            "cross_dup_by_pair": dict(cross_dup_by_pair),
+            "same_vol_dup_by_vol": dict(same_vol_dup_by_vol),
         }
 
     def execute_backup_and_deduplication(
@@ -665,12 +808,18 @@ class StorageAutomationService:
         selected_pairs_set = self.parse_pair_keys(selected_pair_keys)
 
         self.backup_mgr.create_backup("pre_auto_backup_dedup")
-        plan = self.build_backup_and_dedup_plan(preferred_target_volume_id=preferred_target_volume_id)
+        plan = self.build_backup_and_dedup_plan(
+            preferred_target_volume_id=preferred_target_volume_id,
+            selected_pair_keys=selected_pair_keys,
+        )
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
 
         # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> YYYY-MM (Rule 2b, 2d)
         important_assigned = 0
+        active_vols = {v for p in selected_pairs_set for v in p} if selected_pairs_set is not None else None
         for orig_item, orig_vol in plan["important_candidates"]:
+            if active_vols is not None and orig_vol.id not in active_vols:
+                continue
             self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
             important_assigned += 1
         if important_assigned > 0:
@@ -1382,7 +1531,10 @@ class StorageAutomationService:
         do_dedup = norm_mode in ("both", "dedup_only")
         selected_pairs_set = self.parse_pair_keys(selected_pair_keys)
 
-        plan = self.build_backup_and_dedup_plan(preferred_target_volume_id=preferred_target_volume_id)
+        plan = self.build_backup_and_dedup_plan(
+            preferred_target_volume_id=preferred_target_volume_id,
+            selected_pair_keys=selected_pair_keys,
+        )
         pending_summary = self.get_pending_moves_summary()
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
         vol_space_summary: Dict[int, Dict[str, Any]] = plan["volume_space_summary"]
@@ -1489,10 +1641,15 @@ class StorageAutomationService:
                 )
 
         lines.extend(["", "4. ORYGINAŁY Z DUPLIKATAMI NA TYM SAMYM DYSKU (DO ALBUMU 'WAŻNE'):"])
-        if not plan["important_candidates"]:
+        active_vols = {v for p in selected_pairs_set for v in p} if selected_pairs_set is not None else None
+        imp_candidates = [
+            (it, v) for it, v in plan["important_candidates"]
+            if active_vols is None or v.id in active_vols
+        ]
+        if not imp_candidates:
             lines.append("   Brak nowych kandydatów.")
         else:
-            for orig_it, orig_v in plan["important_candidates"]:
+            for orig_it, orig_v in imp_candidates:
                 lines.append(
                     f"   - {orig_v.volume_label}:{orig_it.relative_path} -> Album: Ważne - {orig_v.volume_label} / {orig_it.effective_date.strftime('%Y / %Y-%m')}"
                 )

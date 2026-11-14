@@ -1,3 +1,4 @@
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
@@ -7,8 +8,8 @@ from pathlib import Path
 import shutil
 import threading
 import traceback
-from typing import List, Optional, Tuple
-from fastapi import APIRouter, Depends, Form, Request
+from typing import Any, Dict, List, Optional, Tuple
+from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from sqlalchemy import select, delete, update
 from sqlalchemy.orm import Session
@@ -916,6 +917,160 @@ def control_background_process(
     return resp
 
 
+def _balanced_sample_unbacked(items: List[MediaItem], max_total: int = 300) -> List[MediaItem]:
+    """Provides a fair representation of unbacked files across all active volumes up to max_total."""
+    if len(items) <= max_total:
+        return items
+    by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
+    for it in items:
+        by_vol[it.volume_id].append(it)
+    num_vols = len(by_vol)
+    if num_vols == 0:
+        return []
+    share_per_vol = max(1, max_total // num_vols)
+    sampled: List[MediaItem] = []
+    remaining: List[MediaItem] = []
+    for vid, v_items in by_vol.items():
+        sampled.extend(v_items[:share_per_vol])
+        remaining.extend(v_items[share_per_vol:])
+    if len(sampled) < max_total and remaining:
+        sampled.extend(remaining[: max_total - len(sampled)])
+    return sampled[:max_total]
+
+
+def _balanced_sample_duplicates(rows: List[Dict[str, Any]], max_total: int = 300) -> List[Dict[str, Any]]:
+    """Provides a fair representation of duplicate rows across all active pairs up to max_total."""
+    if len(rows) <= max_total:
+        return rows
+    by_key: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        pk = r.get("pair_key_str", "other")
+        by_key[pk].append(r)
+    num_keys = len(by_key)
+    if num_keys == 0:
+        return []
+    share = max(1, max_total // num_keys)
+    sampled: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for k, k_rows in by_key.items():
+        sampled.extend(k_rows[:share])
+        remaining.extend(k_rows[share:])
+    if len(sampled) < max_total and remaining:
+        sampled.extend(remaining[: max_total - len(sampled)])
+    return sampled[:max_total]
+
+
+def _balanced_sample_important(rows: List[Dict[str, Any]], max_total: int = 300) -> List[Dict[str, Any]]:
+    """Provides a fair representation of important candidate rows across all active volumes up to max_total."""
+    if len(rows) <= max_total:
+        return rows
+    by_vol: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        vid = int(r.get("vol_id") or 0)
+        by_vol[vid].append(r)
+    num_vols = len(by_vol)
+    if num_vols == 0:
+        return []
+    share = max(1, max_total // num_vols)
+    sampled: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for vid, v_rows in by_vol.items():
+        sampled.extend(v_rows[:share])
+        remaining.extend(v_rows[share:])
+    if len(sampled) < max_total and remaining:
+        sampled.extend(remaining[: max_total - len(sampled)])
+    return sampled[:max_total]
+
+
+def _prepare_backup_panel_context(
+    db: Session,
+    pref_vid: Optional[int] = None,
+    selected_pairs: Optional[List[str]] = None,
+    operation_mode: str = "both",
+) -> dict:
+    svc = StorageAutomationService(db)
+    norm_mode = operation_mode if operation_mode in ("both", "backup_only", "dedup_only") else "both"
+    plan = svc.build_backup_and_dedup_plan(
+        preferred_target_volume_id=pref_vid,
+        selected_pair_keys=selected_pairs,
+    )
+    all_pair_key_strs = [p["pair_key_str"] for p in plan["ordered_pairs"]]
+    effective_pair_keys = (
+        [k for k in selected_pairs if k and ":" in k]
+        if selected_pairs is not None
+        else all_pair_key_strs
+    )
+    all_unbacked = plan.get("unbacked_items", [])
+    all_duplicate_rows = plan.get("duplicate_rows", [])
+    all_important_rows = plan.get("important_rows", [])
+
+    unbacked_by_vol = plan.get("unbacked_count_by_vol", {})
+    cross_dup_by_pair = plan.get("cross_dup_by_pair", {})
+    same_vol_dup_by_vol = plan.get("same_vol_dup_by_vol", {})
+    important_by_vol = plan.get("important_count_by_vol", {})
+
+    if selected_pairs is not None:
+        selected_set = set(effective_pair_keys)
+        active_vols = {
+            int(v) for p in selected_set if ":" in p for v in (p.split(":")[0], p.split(":")[1])
+        }
+        filtered_unbacked = [uf for uf in all_unbacked if uf.volume_id in active_vols]
+        filtered_duplicate_rows = [
+            dr for dr in all_duplicate_rows
+            if any(pk in selected_set for pk in dr.get("pair_keys", [dr.get("pair_key_str", "")]))
+        ]
+        filtered_important_rows = [
+            ir for ir in all_important_rows
+            if ir.get("vol_id") in active_vols
+        ]
+        filtered_unbacked_count = sum(cnt for vid, cnt in unbacked_by_vol.items() if vid in active_vols)
+        filtered_dups_count = sum(cnt for pk, cnt in cross_dup_by_pair.items() if pk in selected_set) + sum(
+            cnt for vid, cnt in same_vol_dup_by_vol.items() if vid in active_vols
+        )
+        filtered_important_count = sum(cnt for vid, cnt in important_by_vol.items() if vid in active_vols)
+    else:
+        filtered_unbacked = all_unbacked
+        filtered_duplicate_rows = all_duplicate_rows
+        filtered_important_rows = all_important_rows
+        filtered_unbacked_count = len(all_unbacked)
+        filtered_dups_count = len(all_duplicate_rows)
+        filtered_important_count = len(all_important_rows)
+
+    pair_counts = {
+        "unbacked_by_vol": {str(k): v for k, v in unbacked_by_vol.items()},
+        "cross_dup_by_pair": cross_dup_by_pair,
+        "same_vol_dup_by_vol": {str(k): v for k, v in same_vol_dup_by_vol.items()},
+        "important_by_vol": {str(k): v for k, v in important_by_vol.items()},
+    }
+
+    volumes_list = list(plan["volumes"].values())
+    vol_space = svc.get_volume_space_map(volumes_list)
+    latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
+
+    sample_unbacked = _balanced_sample_unbacked(filtered_unbacked, 300)
+    sample_dups = _balanced_sample_duplicates(filtered_duplicate_rows, 300)
+    sample_important = _balanced_sample_important(filtered_important_rows, 300)
+
+    return {
+        "plan": plan,
+        "unbacked_files": sample_unbacked,
+        "unbacked_total": filtered_unbacked_count,
+        "unbacked_all_total": len(all_unbacked),
+        "duplicate_files": sample_dups,
+        "duplicates_total": filtered_dups_count,
+        "duplicates_all_total": len(all_duplicate_rows),
+        "important_files": sample_important,
+        "important_total": filtered_important_count,
+        "important_all_total": len(all_important_rows),
+        "pair_counts": json.dumps(pair_counts),
+        "volumes": volumes_list,
+        "vol_space": vol_space,
+        "latest_report_exists": latest_report_exists,
+        "selected_operation_mode": norm_mode,
+        "selected_pair_keys": effective_pair_keys,
+    }
+
+
 def _render_backup_panel_response(
     request: Request,
     db: Session,
@@ -927,59 +1082,55 @@ def _render_backup_panel_response(
     trigger_refresh: bool = False,
 ):
     """Builds and renders the Backup & Deduplication modal partial with pair filtering state."""
-    svc = StorageAutomationService(db)
-    plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
-    norm_mode = operation_mode if operation_mode in ("both", "backup_only", "dedup_only") else "both"
-    all_pair_key_strs = [p["pair_key_str"] for p in plan["ordered_pairs"]]
-    effective_pair_keys = (
-        [k for k in selected_pairs if k and ":" in k]
-        if selected_pairs is not None
-        else all_pair_key_strs
+    ctx = _prepare_backup_panel_context(
+        db, pref_vid=pref_vid, selected_pairs=selected_pairs, operation_mode=operation_mode
     )
-    all_unbacked = svc.detect_files_without_backup(recluster=True)
-    pair_map = plan.get("unbacked_pair_map", {})
-    all_duplicate_rows = plan.get("duplicate_rows", [])
-    if selected_pairs is not None:
-        selected_set = set(effective_pair_keys)
-        filtered_unbacked_count = sum(1 for uf in all_unbacked if pair_map.get(uf.id, "") in selected_set)
-        filtered_dups_count = sum(1 for dr in all_duplicate_rows if dr.get("pair_key_str", "") in selected_set)
-    else:
-        filtered_unbacked_count = len(all_unbacked)
-        filtered_dups_count = len(all_duplicate_rows)
-
-    volumes_list = list(plan["volumes"].values())
-    vol_space = svc.get_volume_space_map(volumes_list)
-    latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
-
-    resp = render_template(
-        request,
-        "partials/backup_panel.html",
-        {
-            "plan": plan,
-            "unbacked_files": all_unbacked[:300],
-            "unbacked_total": filtered_unbacked_count,
-            "unbacked_all_total": len(all_unbacked),
-            "duplicate_files": all_duplicate_rows[:300],
-            "duplicates_total": filtered_dups_count,
-            "duplicates_all_total": len(all_duplicate_rows),
-            "volumes": volumes_list,
-            "vol_space": vol_space,
-            "execution_result": execution_result,
-            "offline_report": offline_report,
-            "latest_report_exists": latest_report_exists,
-            "selected_operation_mode": norm_mode,
-            "selected_pair_keys": effective_pair_keys,
-        },
-    )
+    ctx["execution_result"] = execution_result
+    ctx["offline_report"] = offline_report
+    resp = render_template(request, "partials/backup_panel.html", ctx)
     if trigger_refresh:
         resp.headers["HX-Trigger"] = "refresh-all"
     return resp
 
 
+def _render_backup_tables_response(
+    request: Request,
+    db: Session,
+    pref_vid: Optional[int] = None,
+    selected_pairs: Optional[List[str]] = None,
+):
+    """Renders only the preview tables container for live pair-checkbox switching."""
+    ctx = _prepare_backup_panel_context(db, pref_vid=pref_vid, selected_pairs=selected_pairs)
+    return render_template(request, "partials/backup_preview_tables.html", ctx)
+
+
+@router.post("/backup-panel-tables")
+def get_backup_panel_tables(
+    request: Request,
+    selected_pairs: List[str] = Form(default=[]),
+    pairs_submitted: bool = Form(False),
+    preferred_target_volume_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    pref_vid = to_int(preferred_target_volume_id)
+    effective_pairs = selected_pairs if pairs_submitted else (selected_pairs or None)
+    return _render_backup_tables_response(request, db, pref_vid=pref_vid, selected_pairs=effective_pairs)
+
+
 @router.get("/backup-panel")
-def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, db: Session = Depends(get_db)):
+def get_backup_panel(
+    request: Request,
+    target_volume_id: Optional[str] = None,
+    selected_pairs: Optional[List[str]] = Query(None),
+    db: Session = Depends(get_db),
+):
     pref_vid = to_int(target_volume_id)
-    return _render_backup_panel_response(request, db, pref_vid=pref_vid)
+    return _render_backup_panel_response(
+        request,
+        db,
+        pref_vid=pref_vid,
+        selected_pairs=selected_pairs,
+    )
 
 
 @router.post("/prepare-offline-report")

@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -2857,6 +2858,404 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertFalse(healed.is_corrupted)
                 self.assertIsNotNone(healed.blur_score)
                 self.assertEqual((healed.width, healed.height), (320, 240))
+
+    def test_pairwise_schedule_and_backup_dedup_filtering(self):
+        """
+        Tests the pairwise schedule (A <-> B) logic, multi-pair eligibility,
+        pair-scoped execution planning, and live filtering of unbacked files and duplicate lists.
+        """
+        drive_c = self.root / "DriveC"
+        drive_c.mkdir(parents=True, exist_ok=True)
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-PW-A",
+                volume_label="DriveA",
+                last_known_drive_letter=str(self.drive_a) + "\\",
+                is_online=True,
+                free_space_bytes=50000000,
+                total_space_bytes=100000000,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-PW-B",
+                volume_label="DriveB",
+                last_known_drive_letter=str(self.drive_b) + "\\",
+                is_online=True,
+                free_space_bytes=50000000,
+                total_space_bytes=100000000,
+            )
+            vol_c = WindowsVolume(
+                volume_serial_number="VSN-PW-C",
+                volume_label="DriveC",
+                last_known_drive_letter=str(drive_c) + "\\",
+                is_online=True,
+                free_space_bytes=50000000,
+                total_space_bytes=100000000,
+            )
+            db.add_all([vol_a, vol_b, vol_c])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_c)
+            va_id, vb_id, vc_id = vol_a.id, vol_b.id, vol_c.id
+
+        img_a = Image.new("RGB", (100, 100), (255, 0, 0))
+        path_a = self.drive_a / "unbacked_on_a.jpg"
+        img_a.save(path_a)
+        hash_a = hashlib.sha256(path_a.read_bytes()).hexdigest()
+
+        img_dup = Image.new("RGB", (100, 100), (0, 255, 0))
+        path_dup1 = self.drive_a / "same_dup1.jpg"
+        path_dup2 = self.drive_a / "same_dup2.jpg"
+        img_dup.save(path_dup1)
+        img_dup.save(path_dup2)
+        hash_dup = hashlib.sha256(path_dup1.read_bytes()).hexdigest()
+
+        img_cross = Image.new("RGB", (100, 100), (0, 0, 255))
+        path_cb = self.drive_b / "cross_dup.jpg"
+        path_cc = drive_c / "cross_dup.jpg"
+        img_cross.save(path_cb)
+        img_cross.save(path_cc)
+        shutil.copy(path_cc, drive_c / "cross_dup_extra.jpg")
+        hash_cross = hashlib.sha256(path_cb.read_bytes()).hexdigest()
+
+        now_dt = datetime.datetime.now()
+        with self.TestingSessionLocal() as db:
+            item_a = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=va_id,
+                relative_path="unbacked_on_a.jpg",
+                file_name="unbacked_on_a.jpg",
+                file_size_bytes=path_a.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_a,
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                verified_sha256=hash_a,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="a.webp",
+            )
+            item_dup1 = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=va_id,
+                relative_path="same_dup1.jpg",
+                file_name="same_dup1.jpg",
+                file_size_bytes=path_dup1.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_dup,
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                verified_sha256=hash_dup,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="dup1.webp",
+            )
+            item_dup2 = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=va_id,
+                relative_path="same_dup2.jpg",
+                file_name="same_dup2.jpg",
+                file_size_bytes=path_dup2.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_dup,
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                verified_sha256=hash_dup,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="dup2.webp",
+            )
+            item_cb = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vb_id,
+                relative_path="cross_dup.jpg",
+                file_name="cross_dup.jpg",
+                file_size_bytes=path_cb.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_cross,
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                verified_sha256=hash_cross,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="cb.webp",
+            )
+            item_cc = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vc_id,
+                relative_path="cross_dup.jpg",
+                file_name="cross_dup.jpg",
+                file_size_bytes=path_cc.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_cross,
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                verified_sha256=hash_cross,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="cc.webp",
+            )
+            item_cc2 = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vc_id,
+                relative_path="cross_dup_extra.jpg",
+                file_name="cross_dup_extra.jpg",
+                file_size_bytes=path_cc.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash=hash_cross,
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                verified_sha256=hash_cross,
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="cc2.webp",
+            )
+            db.add_all([item_a, item_dup1, item_dup2, item_cb, item_cc, item_cc2])
+            db.commit()
+
+        # Step 1: StorageAutomationService plan verification
+        with self.TestingSessionLocal() as db:
+            svc = StorageAutomationService(db)
+            plan = svc.build_backup_and_dedup_plan()
+            self.assertGreaterEqual(len(plan["ordered_pairs"]), 3)
+            pair_keys = [p["pair_key"] for p in plan["ordered_pairs"]]
+            self.assertIn((min(va_id, vb_id), max(va_id, vb_id)), pair_keys)
+            self.assertIn((min(va_id, vc_id), max(va_id, vc_id)), pair_keys)
+            self.assertIn((min(vb_id, vc_id), max(vb_id, vc_id)), pair_keys)
+
+            # Check pair metrics
+            p_bc = next(p for p in plan["ordered_pairs"] if p["pair_key"] == (min(vb_id, vc_id), max(vb_id, vc_id)))
+            self.assertGreaterEqual(p_bc["metrics"]["duplicates_to_delete_count"], 1)
+
+            p_ab = next(p for p in plan["ordered_pairs"] if p["pair_key"] == (min(va_id, vb_id), max(va_id, vb_id)))
+            self.assertGreaterEqual(p_ab["metrics"]["important_to_assign_count"], 1)
+
+            # Step 2: Build plan restricted to Pair (va, vc)
+            p_ac_key_str = f"{min(va_id, vc_id)}:{max(va_id, vc_id)}"
+            plan_ac = svc.build_backup_and_dedup_plan(selected_pair_keys=[p_ac_key_str])
+            p_ac_entry = next(p for p in plan_ac["ordered_pairs"] if p["pair_key_str"] == p_ac_key_str)
+            self.assertGreaterEqual(p_ac_entry["metrics"]["important_to_assign_count"], 1)
+            # The unbacked file on Vol A must have copy task scheduled to Vol C
+            copy_tasks_ac = p_ac_entry["tasks"]["backups_to_copy"]
+            self.assertTrue(any(t["orig_item_id"] == item_a.id and t["dst_vol_id"] == vc_id for t in copy_tasks_ac))
+            # The same-device duplicate on Vol A must be scheduled in Pair (va, vc)
+            dup_tasks_ac = p_ac_entry["tasks"]["duplicates_to_delete"]
+            self.assertTrue(any(t["dup_item_id"] == item_dup2.id for t in dup_tasks_ac))
+
+        # Step 3: Test GET /actions/backup-panel with selected_pairs
+        r_all = self.client.get("/actions/backup-panel")
+        self.assertEqual(r_all.status_code, 200)
+        self.assertIn("backup-pair-counts-data", r_all.text)
+        self.assertIn("Lista oryginałów dodawanych do albumu „Ważne…”", r_all.text)
+
+        r_filtered = self.client.get(f"/actions/backup-panel?selected_pairs={p_ac_key_str}")
+        self.assertEqual(r_filtered.status_code, 200)
+        self.assertIn("unbacked_on_a.jpg", r_filtered.text)
+        self.assertIn("same_dup1.jpg", r_filtered.text)
+
+        # Step 3b: Test POST /actions/backup-panel-tables with selected pairs and empty pairs
+        r_tables = self.client.post(
+            "/actions/backup-panel-tables",
+            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true"},
+        )
+        self.assertEqual(r_tables.status_code, 200)
+        self.assertIn("unbacked_on_a.jpg", r_tables.text)
+        self.assertIn("same_dup1.jpg", r_tables.text)
+        self.assertIn("backup-pair-counts-data", r_tables.text)
+
+        r_tables_empty = self.client.post(
+            "/actions/backup-panel-tables",
+            data={"pairs_submitted": "true"},
+        )
+        self.assertEqual(r_tables_empty.status_code, 200)
+
+        # Directly test _balanced_sample_unbacked, _balanced_sample_duplicates, and _balanced_sample_important
+        from app.routers.actions import _balanced_sample_unbacked, _balanced_sample_duplicates, _balanced_sample_important
+        fake_unbacked = [
+            MediaItem(id=f"u_{i}", volume_id=1 if i < 20 else 2, relative_path=f"f_{i}.jpg")
+            for i in range(50)
+        ]
+        sampled_u = _balanced_sample_unbacked(fake_unbacked, max_total=10)
+        self.assertEqual(len(sampled_u), 10)
+        self.assertEqual(_balanced_sample_unbacked([], max_total=10), [])
+
+        fake_dups = [
+            {"id": f"d_{i}", "pair_key_str": "1:2" if i < 15 else "1:3"}
+            for i in range(40)
+        ]
+        sampled_d = _balanced_sample_duplicates(fake_dups, max_total=10)
+        self.assertEqual(len(sampled_d), 10)
+        self.assertEqual(_balanced_sample_duplicates([], max_total=10), [])
+
+        fake_important = [
+            {"id": f"imp_{i}", "vol_id": 1 if i < 15 else 2}
+            for i in range(40)
+        ]
+        sampled_imp = _balanced_sample_important(fake_important, max_total=10)
+        self.assertEqual(len(sampled_imp), 10)
+        self.assertEqual(_balanced_sample_important([], max_total=10), [])
+        self.assertEqual(len(sampled_d), 10)
+        self.assertEqual(_balanced_sample_duplicates([], max_total=10), [])
+
+        # Step 4: Test prepare offline report with selected pair
+        r_report = self.client.post(
+            "/actions/prepare-offline-report",
+            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "operation_mode": "both"},
+        )
+        self.assertEqual(r_report.status_code, 200)
+        self.assertIn("Zapisano raport procedury Offline", r_report.text)
+
+        # Step 5: Test execute backup restricted to pair (va, vc)
+        r_exec = self.client.post(
+            "/actions/execute-backup",
+            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "operation_mode": "both"},
+        )
+        self.assertEqual(r_exec.status_code, 200)
+        self.assertIn("Raport wykonania Backupu", r_exec.text)
+
+        # Verify physical backup on Vol C was created
+        backup_files_c = list((drive_c / "backup").glob("**/*"))
+        self.assertTrue(len(backup_files_c) > 0)
+
+        # Step 6: Test execute backup with a new external backup drive path
+        drive_d = self.root / "DriveD"
+        drive_d.mkdir(parents=True, exist_ok=True)
+        r_new_drive = self.client.post(
+            "/actions/execute-backup",
+            data={
+                "new_backup_drive_path": str(drive_d) + "\\",
+                "operation_mode": "backup_only",
+                "pairs_submitted": "true",
+            },
+        )
+        self.assertEqual(r_new_drive.status_code, 200)
+
+        # Step 7: Test downloading offline report when file is missing
+        latest_file = self.reports_dir / "raport_procedura_offline_ostatni.txt"
+        if latest_file.exists():
+            latest_file.unlink()
+        r_dl = self.client.get("/actions/download-offline-report")
+        self.assertEqual(r_dl.status_code, 200)
+        self.assertTrue(latest_file.exists())
+
+        # Step 8: Test cluster where all copies have is_backup_copy=True and relocation candidate
+        with self.TestingSessionLocal() as db:
+            all_bkp1 = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=va_id,
+                relative_path="all_bkp1.jpg",
+                file_name="all_bkp1.jpg",
+                file_size_bytes=100,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="fake_all_bkp_hash",
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=True,
+                verified_sha256="fake_all_bkp_hash",
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="ab1.webp",
+            )
+            reloc_orig = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=va_id,
+                relative_path="reloc_orig.jpg",
+                file_name="reloc_orig.jpg",
+                file_size_bytes=100,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="fake_reloc_hash",
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                verified_sha256="fake_reloc_hash",
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="ro.webp",
+            )
+            reloc_copy = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vb_id,
+                relative_path="reloc_copy.jpg",
+                file_name="reloc_copy.jpg",
+                file_size_bytes=100,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="fake_reloc_hash",
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                verified_sha256="fake_reloc_hash",
+                width=100,
+                height=100,
+                effective_date=now_dt,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                thumbnail_relative_path="rc.webp",
+            )
+            db.add_all([all_bkp1, reloc_orig, reloc_copy])
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            plan_reloc = svc.build_backup_and_dedup_plan()
+            p_ab_key = (min(va_id, vb_id), max(va_id, vb_id))
+            p_ab = next(p for p in plan_reloc["ordered_pairs"] if p["pair_key"] == p_ab_key)
+            self.assertGreaterEqual(p_ab["metrics"]["backups_to_relocate_count"], 1)
+
+            # Test backup filename collision (while dest_path.exists())
+            sub_m = item_a.effective_date.strftime("%Y/%Y-%m")
+            col_target = drive_c / "backup" / sub_m / item_a.file_name
+            col_target.parent.mkdir(parents=True, exist_ok=True)
+            col_target.write_bytes(b"existing_file")
+
+            res_bkp_only = svc.execute_backup_and_deduplication(
+                operation_mode="backup_only",
+                selected_pair_keys=[p_ac_key_str],
+            )
+            self.assertIn("backups_created", res_bkp_only)
+            res_dedup_only = svc.execute_backup_and_deduplication(
+                operation_mode="dedup_only",
+                selected_pair_keys=[p_ac_key_str],
+            )
+            self.assertIn("duplicates_deleted", res_dedup_only)
 
 
 if __name__ == "__main__":
