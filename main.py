@@ -1,7 +1,5 @@
 from contextlib import asynccontextmanager
 import logging
-from pathlib import Path
-import sqlite3
 import sys
 import traceback
 
@@ -9,7 +7,9 @@ from fastapi import FastAPI, Request, Depends
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
-from app.database import engine, Base, get_db, THUMBNAILS_DIR, DB_PATH
+from app.backup import BackupManager
+from app.database import engine, Base, get_db, THUMBNAILS_DIR, ensure_schema_migrations
+from app.operation_log import OperationLogger
 from app.routers import media, actions, semantic
 
 logging.basicConfig(
@@ -17,48 +17,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("HydraCore")
+logger = logging.getLogger("DomoweArchiwumFoto")
 
 
-def run_safe_migrations():
-    if not DB_PATH.exists():
-        return
-    conn = sqlite3.connect(DB_PATH.as_posix(), timeout=5.0)
-    try:
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(media_groups);")
-        g_cols = {r[1] for r in cur.fetchall()}
-        if g_cols and "parent_id" not in g_cols:
-            cur.execute("ALTER TABLE media_groups ADD COLUMN parent_id INTEGER;")
-        if g_cols and "target_volume_id" not in g_cols:
-            cur.execute("ALTER TABLE media_groups ADD COLUMN target_volume_id INTEGER;")
-        if g_cols and "is_trashed" not in g_cols:
-            cur.execute("ALTER TABLE media_groups ADD COLUMN is_trashed BOOLEAN DEFAULT 0 NOT NULL;")
-
-        cur.execute("PRAGMA table_info(media_items);")
-        m_cols = {r[1] for r in cur.fetchall()}
-        if m_cols and "updated_at" not in m_cols:
-            cur.execute("ALTER TABLE media_items ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP;")
-        if m_cols and "is_trashed" not in m_cols:
-            cur.execute("ALTER TABLE media_items ADD COLUMN is_trashed BOOLEAN DEFAULT 0 NOT NULL;")
-        conn.commit()
-    except Exception as e:
-        logger.warning("Migration warning: %s", e)
-    finally:
-        conn.close()
+def run_safe_migrations() -> None:
+    ensure_schema_migrations()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Uruchamianie silnika Hydra Media Vault...")
+async def lifespan(_app: FastAPI):
+    logger.info("Uruchamianie silnika Domowe Archiwum Foto...")
     Base.metadata.create_all(bind=engine)
     run_safe_migrations()
     THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("Gotowe! Serwer nasluchuje.")
+    OperationLogger.log("APP_STARTUP", "Uruchomiono serwer Domowe Archiwum Foto.", status="INFO")
+    logger.info("Gotowe! Serwer Domowe Archiwum Foto nasłuchuje.")
     yield
+    try:
+        BackupManager().create_backup("shutdown")
+        OperationLogger.log("APP_SHUTDOWN", "Zatrzymano serwer i utworzono kopię zapasową SQLite.", status="INFO")
+    except Exception as exc:
+        logger.warning("Shutdown backup warning: %s", exc)
 
 
-app = FastAPI(title="Hydra Media Vault", lifespan=lifespan, debug=True)
+app = FastAPI(title="Domowe Archiwum Foto", lifespan=lifespan, debug=True)
 
 
 @app.exception_handler(Exception)

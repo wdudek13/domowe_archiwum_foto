@@ -1,109 +1,1599 @@
 import datetime
+import io
+import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
+import uuid
+
+import cv2
+from fastapi.testclient import TestClient
 import numpy as np
+from PIL import Image, JpegImagePlugin
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
-from app.scanner import FastHasher, MetadataDateResolver
+from app.database import Base, ensure_schema_migrations, get_db, set_sqlite_pragma
+from app.models import (
+    WindowsVolume,
+    MediaGroup,
+    MediaItem,
+    MediaTag,
+    MediaEmbedding,
+    PendingFileMove,
+    BackgroundJob,
+    OperationLogEntry,
+)
 from app.backup import BackupManager
+from app.operation_log import OperationLogger, ProcessManager
+from app.scanner import (
+    WindowsVolumeInspector,
+    FastHasher,
+    MetadataDateResolver,
+    ThumbnailService,
+    FileScannerService,
+)
+from app.storage_ops import StorageAutomationService
 from app.ai.embeddings import OnDemandClipEmbedder
+from app.ai.quality import MediaQualityAnalyzer
+from app.ai.tagger import OnDemandObjectTagger
+from app.cloud.google_drive import GoogleDriveManager
+import main as main_module
+from app.routers import actions as actions_module
+from app.routers import media as media_module
+from app.routers import semantic as semantic_module
 
 
-class TestHydraArchitecture(unittest.TestCase):
+def create_synthetic_jpeg(
+    path: Path,
+    width: int = 320,
+    height: int = 240,
+    sharp: bool = True,
+    color=(40, 120, 200),
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    img[:] = color
+    if sharp:
+        for y in range(0, height, 16):
+            for x in range(0, width, 16):
+                if ((x // 16) + (y // 16)) % 2 == 0:
+                    img[y : y + 16, x : x + 16] = (240, 240, 240)
+        cv2.rectangle(img, (20, 20), (width - 20, height - 20), (10, 250, 10), 2)
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    pil_img.save(path, format="JPEG", quality=95)
+    return path
+
+
+class TestDomoweArchiwumFotoSuite(unittest.TestCase):
     def setUp(self):
-        self.test_dir = tempfile.TemporaryDirectory()
-        self.test_path = Path(self.test_dir.name)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.db_path = self.root / "test_vault.db"
+        self.backup_dir = self.root / "backups"
+        self.thumbs_dir = self.root / "thumbnails"
+        self.logs_dir = self.root / "logs"
+        self.log_file = self.logs_dir / "operations.log"
+        self.drive_a = self.root / "DriveA"
+        self.drive_b = self.root / "DriveB"
+        self.drive_c_offline = self.root / "DriveC_Offline"
 
-    def tearDown(self):
-        self.test_dir.cleanup()
+        for d in (self.backup_dir, self.thumbs_dir, self.logs_dir, self.drive_a, self.drive_b):
+            d.mkdir(parents=True, exist_ok=True)
 
-    def test_video_partial_hash_efficiency(self):
-        """
-        Verify partial hashing reads only first 64KB, middle 64KB, and last 64KB,
-        producing distinct hashes for gigabyte-scale structures.
-        """
-        file_path = self.test_path / "test_video.mp4"
-        # Create a synthetic 1 MB file
-        size_bytes = 1024 * 1024
-        with open(file_path, "wb") as f:
-            f.write(b"A" * size_bytes)
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path.as_posix()}",
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        from sqlalchemy import event
+        def fast_test_pragma(dbapi_connection, connection_record):
+            set_sqlite_pragma(dbapi_connection, connection_record)
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA synchronous = OFF;")
+            cur.close()
 
-        hash1 = FastHasher.hash_video_partial(file_path, size_bytes)
-        self.assertEqual(len(hash1), 64, "Partial hash must be valid SHA-256 hex string")
+        event.listen(self.engine, "connect", fast_test_pragma)
+        Base.metadata.create_all(bind=self.engine)
+        ensure_schema_migrations(self.db_path)
 
-        # Mutate byte in the middle chunk
-        with open(file_path, "r+b") as f:
-            f.seek(size_bytes // 2)
-            f.write(b"Z")
-
-        hash2 = FastHasher.hash_video_partial(file_path, size_bytes)
-        self.assertNotEqual(hash1, hash2, "Altering the middle chunk must alter the partial hash")
-
-    def test_date_anomaly_resolution(self):
-        """
-        Verify that effective_date selects the oldest date, and flags
-        discrepancies > 24 hours between EXIF and filesystem timestamp.
-        """
-        test_file = self.test_path / "IMG_20210510_120000.jpg"
-        test_file.write_bytes(b"\xFF\xD8\xFF\xE0" + b"\x00" * 100)  # Minimal JPEG header
-
-        exif_dt, fn_dt, ctime, mtime, effective_dt, has_anomaly, reason = (
-            MetadataDateResolver.resolve_dates(test_file, is_image=True)
+        self.TestingSessionLocal = sessionmaker(
+            bind=self.engine, autocommit=False, autoflush=False, expire_on_commit=False
         )
 
-        self.assertIsNotNone(fn_dt)
-        self.assertEqual(fn_dt.year, 2021)
-        self.assertEqual(fn_dt.month, 5)
-        self.assertEqual(fn_dt.day, 10)
-        self.assertTrue(has_anomaly, "Missing EXIF must flag has_date_anomaly = True")
+        # Patch global paths and session factories so routers and background jobs use isolated test environment
+        self.vsn_patch = patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={})
+        self.patches = [
+            patch("app.database.DB_PATH", self.db_path),
+            patch("app.database.BACKUP_DIR", self.backup_dir),
+            patch("app.database.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.database.OPERATIONS_LOG_FILE", self.log_file),
+            patch("app.database.SessionLocal", self.TestingSessionLocal),
+            patch("app.scanner.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.routers.media.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.routers.semantic.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.routers.actions.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.routers.actions.DATA_DIR", self.root),
+            patch("app.routers.actions.SessionLocal", self.TestingSessionLocal),
+            self.vsn_patch,
+        ]
+        for p in self.patches:
+            p.start()
+
+        def override_get_db():
+            db = self.TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        main_module.app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(main_module.app)
+
+    def tearDown(self):
+        main_module.app.dependency_overrides.clear()
+        for p in reversed(self.patches):
+            p.stop()
+        self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    # =========================================================================
+    # 1. HASHING, 100% MULTI-LAYER VERIFICATION, DATE RESOLUTION & SCANNER
+    # =========================================================================
+    def test_hasher_and_100_percent_verification_layers(self):
+        f1 = create_synthetic_jpeg(self.drive_a / "orig.jpg", sharp=True)
+        f2 = self.drive_b / "copy.jpg"
+        f2.write_bytes(f1.read_bytes())
+
+        # Identical distinct physical files must pass 100% verification
+        ok, msg, sha = FastHasher.verify_files_identical_100_percent(f1, f2)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(sha), 64)
+
+        # Same physical file path must be blocked (protects against deleting the only copy!)
+        ok_same, msg_same, _ = FastHasher.verify_files_identical_100_percent(f1, f1)
+        self.assertFalse(ok_same)
+        self.assertIn("ten sam fizyczny plik", msg_same)
+
+        # Simulated os.path.samefile returning True on distinct Path objects
+        with patch("os.path.samefile", return_value=True):
+            ok_hardlink, msg_hl, _ = FastHasher.verify_files_identical_100_percent(f1, f2)
+            self.assertFalse(ok_hardlink)
+            self.assertIn("inode/hardlink", msg_hl)
+
+        # Simulated filecmp returning False
+        with patch("filecmp.cmp", return_value=False):
+            ok_cmp, msg_cmp, _ = FastHasher.verify_files_identical_100_percent(f1, f2)
+            self.assertFalse(ok_cmp)
+            self.assertIn("filecmp", msg_cmp)
+
+        # Simulated BLAKE2b / MD5 mismatch
+        with patch.object(FastHasher, "compute_multi_hashes", side_effect=[("sha1", "blake1", "md5_1"), ("sha1", "blake2", "md5_1")]):
+            ok_b, msg_b, _ = FastHasher.verify_files_identical_100_percent(f1, f2)
+            self.assertFalse(ok_b)
+            self.assertIn("BLAKE2b", msg_b)
+
+        with patch.object(FastHasher, "compute_multi_hashes", side_effect=[("sha1", "blake1", "md5_1"), ("sha1", "blake1", "md5_2")]):
+            ok_m, msg_m, _ = FastHasher.verify_files_identical_100_percent(f1, f2)
+            self.assertFalse(ok_m)
+            self.assertIn("MD5", msg_m)
+
+        # Missing file must fail
+        ok_miss, _, _ = FastHasher.verify_files_identical_100_percent(f1, self.drive_b / "nonexistent.jpg")
+        self.assertFalse(ok_miss)
+
+        # Directory instead of file must fail
+        ok_dir, _, _ = FastHasher.verify_files_identical_100_percent(f1, self.drive_b)
+        self.assertFalse(ok_dir)
+
+        # Zero-byte file must fail
+        f_zero = self.drive_b / "zero.jpg"
+        f_zero.touch()
+        ok_zero, _, _ = FastHasher.verify_files_identical_100_percent(f1, f_zero)
+        self.assertFalse(ok_zero)
+
+        # Different size must fail
+        f_diff_size = self.drive_b / "diff_size.jpg"
+        f_diff_size.write_bytes(f1.read_bytes() + b"\x00")
+        ok_size, _, _ = FastHasher.verify_files_identical_100_percent(f1, f_diff_size)
+        self.assertFalse(ok_size)
+
+        # Same size, mutated byte content must fail
+        mutated = bytearray(f1.read_bytes())
+        mutated[-10] ^= 0xFF
+        f_mut = self.drive_b / "mutated.jpg"
+        f_mut.write_bytes(bytes(mutated))
+        ok_mut, _, _ = FastHasher.verify_files_identical_100_percent(f1, f_mut)
+        self.assertFalse(ok_mut)
+
+        # Corrupted non-image with .jpg extension but identical bytes must fail structural image decode check
+        bad_img_a = self.drive_a / "bad1.jpg"
+        bad_img_b = self.drive_b / "bad2.jpg"
+        bad_img_a.write_bytes(b"NOT_A_JPEG_HEADER_AT_ALL" * 20)
+        bad_img_b.write_bytes(b"NOT_A_JPEG_HEADER_AT_ALL" * 20)
+        ok_bad_img, _, _ = FastHasher.verify_files_identical_100_percent(bad_img_a, bad_img_b)
+        self.assertFalse(ok_bad_img)
+
+    def test_video_partial_hash_small_and_large(self):
+        small_vid = self.drive_a / "small.mp4"
+        small_vid.write_bytes(b"V" * 10000)
+        h_small = FastHasher.hash_video_partial(small_vid, 10000)
+        self.assertEqual(h_small, FastHasher.hash_image_full(small_vid))
+
+        large_vid = self.drive_a / "large.mp4"
+        size_b = 512 * 1024
+        large_vid.write_bytes(b"A" * size_b)
+        h1 = FastHasher.hash_video_partial(large_vid, size_b)
+        with open(large_vid, "r+b") as f:
+            f.seek(size_b // 2)
+            f.write(b"Z")
+        h2 = FastHasher.hash_video_partial(large_vid, size_b)
+        self.assertNotEqual(h1, h2)
+
+    def test_date_resolver_and_scanner_service(self):
+        img_file = create_synthetic_jpeg(self.drive_a / "IMG_20210510_123045.jpg")
+        exif_dt, fn_dt, ctime, mtime, effective_dt, anomaly, reason = MetadataDateResolver.resolve_dates(img_file, is_image=True)
+        self.assertIsNone(exif_dt)
+        self.assertEqual(fn_dt, datetime.datetime(2021, 5, 10, 12, 30, 45))
+        self.assertEqual(effective_dt, fn_dt)
+        self.assertTrue(anomaly)
         self.assertIn("Brak metadanych EXIF", reason)
 
-    def test_sqlite_native_backup(self):
-        """
-        Test SQLite online backup mechanism with physical integrity check.
-        """
-        db_path = self.test_path / "source.db"
-        backup_dir = self.test_path / "backups"
-        backup_dir.mkdir()
+        # Test EXIF parsing on JpegImageFile (valid and >24h diff anomaly)
+        with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "2023:05:10 12:30:45"}):
+            ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(img_file, is_image=True)
+            self.assertEqual(ex_dt, datetime.datetime(2023, 5, 10, 12, 30, 45))
+            self.assertTrue(anom)
+            self.assertIn(">24h", rsn)
 
-        # Init SQLite source with WAL mode
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("CREATE TABLE test_data (id INTEGER PRIMARY KEY, payload TEXT);")
-        conn.execute("INSERT INTO test_data (payload) VALUES ('critical_record');")
+        with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "bad-date"}):
+            self.assertIsNone(MetadataDateResolver.parse_exif(img_file))
+
+        # Invalid calendar date in filename should be skipped gracefully
+        self.assertIsNone(MetadataDateResolver.parse_filename("IMG_20210231_120000.jpg"))
+        self.assertIsNone(MetadataDateResolver.parse_filename("random_name.jpg"))
+
+        # Test WindowsVolumeInspector & fallback when kernel32 fails
+        vsn, label, root = WindowsVolumeInspector.get_volume_info(self.drive_a)
+        self.assertTrue(len(vsn) > 0)
+        with patch("ctypes.windll.kernel32.GetVolumeInformationW", return_value=0):
+            vsn_fb, lbl_fb, _ = WindowsVolumeInspector.get_volume_info(self.drive_a)
+            self.assertTrue(vsn_fb.startswith("VOL_"))
+            self.assertEqual(lbl_fb, "LOCAL_STORAGE")
+
+        # Test real get_connected_vsn_map with bitmask mocked to C:\ only (bit 2 = 4)
+        self.vsn_patch.stop()
+        try:
+            with patch("ctypes.windll.kernel32.GetLogicalDrives", return_value=4):
+                connected = WindowsVolumeInspector.get_connected_vsn_map()
+                self.assertIsInstance(connected, dict)
+        finally:
+            self.vsn_patch.start()
+
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(volume_serial_number="VSN-A", volume_label="Dysk_A", last_known_drive_letter=str(self.drive_a))
+            db.add(vol)
+            db.commit()
+            db.refresh(vol)
+
+            item = FileScannerService.process_file(img_file, vol)
+            self.assertIsNotNone(item)
+            self.assertFalse(item.is_backup_copy)
+            self.assertIsNotNone(item.embedding)
+
+            # File inside backup/ folder must be flagged is_backup_copy=True
+            bkp_sub = self.drive_a / "backup" / "2021"
+            bkp_sub.mkdir(parents=True, exist_ok=True)
+            bkp_img = create_synthetic_jpeg(bkp_sub / "IMG_20210510_123045.jpg")
+            bkp_item = FileScannerService.process_file(bkp_img, vol)
+            self.assertTrue(bkp_item.is_backup_copy)
+            self.assertFalse(bkp_item.is_primary_duplicate)
+
+            # Corrupted image file handling in FileScannerService.process_file
+            corrupt_jpg = self.drive_a / "corrupt_scan.jpg"
+            corrupt_jpg.write_bytes(b"CORRUPTED_BYTES_NOT_IMAGE")
+            corrupt_item = FileScannerService.process_file(corrupt_jpg, vol)
+            self.assertIsNotNone(corrupt_item)
+            self.assertTrue(corrupt_item.is_corrupted)
+
+            # Unsupported, missing, and empty files return None
+            txt_f = self.drive_a / "note.txt"
+            txt_f.write_text("hello")
+            self.assertIsNone(FileScannerService.process_file(txt_f, vol))
+            self.assertIsNone(FileScannerService.process_file(self.drive_a / "missing.jpg", vol))
+            empty_f = self.drive_a / "empty.jpg"
+            empty_f.touch()
+            self.assertIsNone(FileScannerService.process_file(empty_f, vol))
+
+            # Synthetic video scanning + MediaQualityAnalyzer.analyze_video
+            vid_path = self.drive_a / "VID_20220801_100000.avi"
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            writer = cv2.VideoWriter(str(vid_path), fourcc, 10.0, (160, 120))
+            for _ in range(5):
+                frame = np.full((120, 160, 3), 128, dtype=np.uint8)
+                cv2.rectangle(frame, (10, 10), (100, 100), (255, 255, 255), 2)
+                writer.write(frame)
+            writer.release()
+            if vid_path.exists() and vid_path.stat().st_size > 0:
+                vid_item = FileScannerService.process_file(vid_path, vol)
+                self.assertIsNotNone(vid_item)
+                self.assertEqual(vid_item.media_type, "video")
+                v_corrupt, v_blur, v_score = MediaQualityAnalyzer.analyze_video(vid_path)
+                self.assertFalse(v_corrupt)
+                self.assertIsNotNone(v_score)
+
+            # Corrupted/missing video check
+            v_c2, _, _ = MediaQualityAnalyzer.analyze_video(self.drive_a / "no_video.mp4")
+            self.assertTrue(v_c2)
+            bad_vid = self.drive_a / "bad.mp4"
+            bad_vid.write_bytes(b"NOT_A_VIDEO")
+            v_c3, _, _ = MediaQualityAnalyzer.analyze_video(bad_vid)
+            self.assertTrue(v_c3)
+
+    # =========================================================================
+    # 2. BACKUP & 100% SAFE DEDUPLICATION + ALBUM 'WAŻNE' + PAIRWISE WORKFLOW
+    # =========================================================================
+    def test_backup_and_deduplication_and_important_album(self):
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-TEST-A",
+                volume_label="Dysk_A",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-TEST-B",
+                volume_label="Dysk_B",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            vol_c = WindowsVolume(
+                volume_serial_number="VSN-TEST-C",
+                volume_label="Dysk_Offline_C",
+                last_known_drive_letter=str(self.drive_c_offline),
+                is_online=False,
+            )
+            db.add_all([vol_a, vol_b, vol_c])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_c)
+            vol_a_id, vol_b_id, vol_c_id = vol_a.id, vol_b.id, vol_c.id
+
+            # Create File 1: 1 copy on Drive A, 2 copies on Drive B
+            p1_a = create_synthetic_jpeg(self.drive_a / "IMG_20230615_100000.jpg", color=(10, 80, 200))
+            p1_b_orig = self.drive_b / "01_Wakacje" / "IMG_20230615_100000.jpg"
+            p1_b_orig.parent.mkdir(parents=True, exist_ok=True)
+            p1_b_orig.write_bytes(p1_a.read_bytes())
+            p1_b_dup = self.drive_b / "99_Kopia" / "IMG_20230615_100000_dup.jpg"
+            p1_b_dup.parent.mkdir(parents=True, exist_ok=True)
+            p1_b_dup.write_bytes(p1_a.read_bytes())
+
+            # Create File 2: only 1 copy on Drive A (unbacked!)
+            p2_a = create_synthetic_jpeg(self.drive_a / "IMG_20230720_150000.jpg", color=(200, 50, 30))
+
+            for p, v in [(p1_a, vol_a), (p1_b_orig, vol_b), (p1_b_dup, vol_b), (p2_a, vol_a)]:
+                it = FileScannerService.process_file(p, v)
+                db.add(it)
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            svc.flag_duplicate_clusters()
+
+            # Check GET /actions/backup-panel
+            r_bp = self.client.get(f"/actions/backup-panel?target_volume_id={vol_b_id}")
+            self.assertEqual(r_bp.status_code, 200)
+
+            # Check unbacked detection (Rule 1g)
+            unbacked_before = svc.detect_files_without_backup()
+            self.assertEqual(len(unbacked_before), 2)
+
+            # Execute automated backup and 100%-verified deduplication via HTTP endpoint
+            r_exec_bkp = self.client.post(
+                "/actions/execute-backup",
+                data={"preferred_target_volume_id": str(vol_b_id)},
+            )
+            self.assertEqual(r_exec_bkp.status_code, 200)
+
+            # After execution, 0 files lack backup on another device!
+            db.expire_all()
+            unbacked_after = svc.detect_files_without_backup()
+            self.assertEqual(len(unbacked_after), 0)
+
+            # Verify that redundant duplicate on Drive B was deleted and Original on Drive B kept
+            self.assertFalse(p1_b_dup.exists(), "Redundant duplicate on Drive B must be physically removed")
+            self.assertTrue(p1_b_orig.exists(), "Original on Drive B must remain untouched in its place")
+
+            # Verify Album 'Ważne - Dysk_B' -> '2023' -> '2023-06' hierarchy was created
+            important_root = db.scalar(select(MediaGroup).where(MediaGroup.name == "Ważne - Dysk_B"))
+            self.assertIsNotNone(important_root)
+
+            # Test insufficient disk space warning in execute_backup_and_deduplication
+            p3_a = create_synthetic_jpeg(self.drive_a / "IMG_20230801_120000.jpg", color=(90, 90, 10))
+            it3 = FileScannerService.process_file(p3_a, vol_a)
+            db.add(it3)
+            db.commit()
+            with patch.object(StorageAutomationService, "check_volume_free_space", return_value=(False, 1024)):
+                res_nospace = svc.execute_backup_and_deduplication(preferred_target_volume_id=vol_b_id)
+                self.assertEqual(len(res_nospace["space_warnings"]), 1)
+
+            # Test offline pair prompt when target volume is offline
+            res_offline_pair = svc.execute_backup_and_deduplication(preferred_target_volume_id=vol_c_id)
+            self.assertGreaterEqual(res_offline_pair["pending_offline_pairs_count"], 1)
+            self.assertIsNotNone(res_offline_pair["next_pair_prompt"])
+
+            # Test /actions/execute-backup when target is offline (sets job status to WAITING_FOR_DEVICE)
+            r_wait = self.client.post(
+                "/actions/execute-backup",
+                data={"preferred_target_volume_id": str(vol_c_id)},
+            )
+            self.assertEqual(r_wait.status_code, 200)
+
+            # Test verification_blocks when verify_files_identical_100_percent returns False during backup copy
+            with patch.object(FastHasher, "verify_files_identical_100_percent", return_value=(False, "SimFail", None)):
+                res_vf = svc.execute_backup_and_deduplication(preferred_target_volume_id=vol_b_id)
+                self.assertGreaterEqual(res_vf["verification_blocks"], 1)
+
+            # Test duplicate deletion when physical duplicate file is already missing on disk, and when 100% check blocks deletion
+            (self.drive_b / "01_DupTest").mkdir(parents=True, exist_ok=True)
+            p4_b1 = create_synthetic_jpeg(self.drive_b / "01_DupTest" / "IMG_20230901_100000.jpg", color=(12, 34, 56))
+            (self.drive_b / "99_DupTest").mkdir(parents=True, exist_ok=True)
+            p4_b2 = self.drive_b / "99_DupTest" / "IMG_20230901_100000_dup.jpg"
+            p4_b2.write_bytes(p4_b1.read_bytes())
+            (self.drive_a / "backup").mkdir(parents=True, exist_ok=True)
+            p4_a_bkp = self.drive_a / "backup" / "IMG_20230901_100000.jpg"
+            p4_a_bkp.write_bytes(p4_b1.read_bytes())
+            for p_x, v_x in [(p4_b1, vol_b), (p4_b2, vol_b), (p4_a_bkp, vol_a)]:
+                db.add(FileScannerService.process_file(p_x, v_x))
+            db.commit()
+
+            # Block duplicate deletion via 100% verification failure
+            with patch.object(FastHasher, "verify_files_identical_100_percent", return_value=(False, "BlockDup", None)):
+                svc.execute_backup_and_deduplication(preferred_target_volume_id=vol_a_id)
+
+            # Unlink p4_b2 so missing dup_path cleanup branch is exercised
+            if p4_b2.exists():
+                p4_b2.unlink()
+            svc.execute_backup_and_deduplication(preferred_target_volume_id=vol_a_id)
+
+            # Test new_backup_drive_path registration in /actions/execute-backup
+            extra_drv = self.root / "ExtraBackupDrive"
+            extra_drv.mkdir(parents=True, exist_ok=True)
+            with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("VSN-EXTRA-99", "Extra_Bkp", str(extra_drv))):
+                self.client.post("/actions/execute-backup", data={"new_backup_drive_path": str(extra_drv)})
+
+            # Test refresh_volumes_online_status when VSN is in connected_map
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"VSN-TEST-A": (str(self.drive_a), "Dysk_A")}):
+                svc.refresh_volumes_online_status()
+
+            # Test check_volume_free_space on invalid path
+            ok_sp, free_sp = StorageAutomationService.check_volume_free_space("Z:\\NonExistentDriveRoot", 100)
+            self.assertFalse(ok_sp)
+            self.assertEqual(free_sp, 0)
+
+    # =========================================================================
+    # 3. ALBUMS: FAST DELETE, TRANSFER & DELETE SOURCE, 1-CLICK AUTO-ORGANIZE
+    # =========================================================================
+    def test_album_operations_and_restrictions(self):
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(volume_serial_number="V-ALB", volume_label="Pendrive", last_known_drive_letter=str(self.drive_a))
+            db.add(vol)
+            db.commit()
+            db.refresh(vol)
+
+            sub_dir = self.drive_a / "Grecja"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            img_p = create_synthetic_jpeg(sub_dir / "IMG_20240812_100000.jpg")
+            it = FileScannerService.process_file(img_p, vol)
+            db.add(it)
+            db.commit()
+            it_id = it.id
+
+            # 1-Click Auto-Organization without volume_id and folder_prefix must be rejected (Requirement 2e)
+            r_fail = self.client.post("/actions/auto-group", data={"mode": "date", "scope": "filtered"})
+            self.assertEqual(r_fail.status_code, 400)
+            self.assertIn("wyłącznie po wybraniu konkretnego urządzenia", r_fail.text)
+
+            # With volume_id and folder_prefix, 1-Click Auto-Organization succeeds
+            r_ok = self.client.post(
+                "/actions/auto-group",
+                data={"mode": "folder", "scope": "filtered", "volume_id": str(vol.id), "folder_prefix": "Grecja/"},
+            )
+            self.assertEqual(r_ok.status_code, 200)
+
+            r_date = self.client.post(
+                "/actions/auto-group",
+                data={"mode": "date", "scope": "filtered", "volume_id": str(vol.id), "folder_prefix": "Grecja/"},
+            )
+            self.assertEqual(r_date.status_code, 200)
+
+            # Assign to new album and existing album via /actions/assign-group (Requirement 2c)
+            r_assign_new = self.client.post(
+                "/actions/assign-group",
+                data={"group_name": "Nowy_Album_Test", "scope": "selected", "selected_ids": [it_id]},
+            )
+            self.assertEqual(r_assign_new.status_code, 200)
+            created_grp = db.scalar(select(MediaGroup).where(MediaGroup.name == "Nowy_Album_Test"))
+            self.assertIsNotNone(created_grp)
+
+            r_assign_ex = self.client.post(
+                "/actions/assign-group",
+                data={"existing_group_id": str(created_grp.id), "scope": "selected", "selected_ids": [it_id]},
+            )
+            self.assertEqual(r_assign_ex.status_code, 200)
+
+            # Error cases in assign-group
+            self.assertIn("nie istnieje", self.client.post("/actions/assign-group", data={"existing_group_id": "99999"}).text)
+            self.assertIn("Wybierz istniejący", self.client.post("/actions/assign-group", data={}).text)
+
+            # Create subalbum, rename, reparent
+            self.client.post("/actions/group-manage", data={"action": "create_sub", "target_group_id": str(created_grp.id), "new_name": "Podalbum1"})
+            self.client.post("/actions/group-manage", data={"action": "rename", "target_group_id": str(created_grp.id), "new_name": "Zmieniony_Album"})
+            self.client.post("/actions/group-manage", data={"action": "reparent", "target_group_id": str(created_grp.id), "new_parent_id": "0"})
+            self.assertIn("własnym rodzicem", self.client.post("/actions/group-manage", data={"action": "reparent", "target_group_id": str(created_grp.id), "new_parent_id": str(created_grp.id)}).text)
+
+            # Create two albums A and B, assign photo to A, transfer to B with deleting A (Requirement 2g)
+            alb_a = MediaGroup(name="Album_Stary")
+            alb_b = MediaGroup(name="Album_Docelowy")
+            db.add_all([alb_a, alb_b])
+            db.commit()
+            db.refresh(alb_a)
+            db.refresh(alb_b)
+            alb_a_id = alb_a.id
+            alb_b_id = alb_b.id
+
+            it_db = db.get(MediaItem, it_id)
+            it_db.group_id = alb_a_id
+            db.commit()
+
+            r_transfer = self.client.post(
+                "/actions/group-manage",
+                data={
+                    "action": "transfer_and_delete",
+                    "target_group_id": str(alb_a_id),
+                    "destination_group_id": str(alb_b_id),
+                },
+            )
+            self.assertEqual(r_transfer.status_code, 200)
+            db.expire_all()
+            self.assertIsNone(db.get(MediaGroup, alb_a_id))
+            self.assertEqual(db.get(MediaItem, it_id).group_id, alb_b_id)
+
+            # Consolidate group onto Drive B
+            r_cons = self.client.post(
+                "/actions/consolidate",
+                data={"group_id": str(alb_b_id), "target_volume_id": str(vol.id)},
+            )
+            self.assertEqual(r_cons.status_code, 200)
+
+            # Fast delete of Album B without deleting photos (Requirement 2f)
+            r_del = self.client.post(
+                "/actions/group-manage",
+                data={"action": "delete", "target_group_id": str(alb_b_id)},
+            )
+            self.assertEqual(r_del.status_code, 200)
+            db.expire_all()
+            self.assertIsNone(db.get(MediaGroup, alb_b_id))
+            self.assertIsNone(db.get(MediaItem, it_id).group_id)
+
+            # Additional edge cases in group-manage, delete_album_fast, transfer_album_and_delete_source
+            svc = StorageAutomationService(db)
+            with self.assertRaises(ValueError):
+                svc.delete_album_fast(999999)
+            with self.assertRaises(ValueError):
+                svc.transfer_album_and_delete_source(1, 1)
+            with self.assertRaises(ValueError):
+                svc.transfer_album_and_delete_source(999998, 999999)
+
+            # Transfer parent album into its own child subalbum (detaches child first)
+            p_grp = MediaGroup(name="Rodzic")
+            db.add(p_grp)
+            db.commit()
+            db.refresh(p_grp)
+            c_grp = MediaGroup(name="Dziecko", parent_id=p_grp.id)
+            db.add(c_grp)
+            db.commit()
+            db.refresh(c_grp)
+            svc.transfer_album_and_delete_source(p_grp.id, c_grp.id)
+
+            self.client.post("/actions/group-manage", data={"action": "unknown", "target_group_id": str(c_grp.id)})
+            self.client.post("/actions/group-manage", data={"action": "transfer_and_delete", "target_group_id": str(c_grp.id)})
+            self.client.post("/actions/group-manage", data={"action": "delete", "target_group_id": "999999"})
+            self.client.post("/actions/consolidate", data={"group_id": str(c_grp.id), "target_volume_id": "999999"})
+
+    # =========================================================================
+    # 4. MULTIMEDIA: DATE CHANGE, CLEAR ANOMALY WITHOUT DATE CHANGE, ROTATION
+    # =========================================================================
+    def test_multimedia_date_anomaly_and_rotation_persistence(self):
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(volume_serial_number="V-MM", volume_label="Dysk_MM", last_known_drive_letter=str(self.drive_a))
+            grp = MediaGroup(name="Album_Daty")
+            db.add_all([vol, grp])
+            db.commit()
+            db.refresh(vol)
+            db.refresh(grp)
+
+            p1 = create_synthetic_jpeg(self.drive_a / "IMG_20200101_120000.jpg")
+            p2 = create_synthetic_jpeg(self.drive_a / "IMG_20200102_120000.jpg")
+            it1 = FileScannerService.process_file(p1, vol)
+            it2 = FileScannerService.process_file(p2, vol)
+            it1.group_id = grp.id
+            it2.group_id = grp.id
+            db.add_all([it1, it2])
+            db.commit()
+            it1_id, it2_id, grp_id = it1.id, it2.id, grp.id
+
+            # Invalid date format check
+            r_bad_dt = self.client.post("/actions/change-date", data={"new_date": "nie-data", "scope": "selected", "selected_ids": [it1_id]})
+            self.assertEqual(r_bad_dt.status_code, 400)
+
+            # 4a-1: Change date of it1 -> updates effective_date and clears has_date_anomaly
+            r_chg = self.client.post(
+                "/actions/change-date",
+                data={"scope": "selected", "selected_ids": [it1_id], "new_date": "2022-05-15 18:30"},
+            )
+            self.assertEqual(r_chg.status_code, 200)
+            db.expire_all()
+            it1_reloaded = db.get(MediaItem, it1_id)
+            self.assertEqual(it1_reloaded.effective_date, datetime.datetime(2022, 5, 15, 18, 30))
+            self.assertFalse(it1_reloaded.has_date_anomaly)
+
+            # Change date by album_id
+            r_chg_alb = self.client.post(
+                "/actions/change-date",
+                data={"album_id": str(grp_id), "new_date": "2022-06-01"},
+            )
+            self.assertEqual(r_chg_alb.status_code, 200)
+
+            # 4a-2: Clear anomaly of it2 on demand WITHOUT changing its date (by media_id and by album_id)
+            it2_re = db.get(MediaItem, it2_id)
+            it2_re.has_date_anomaly = True
+            db.commit()
+            orig_dt = it2_re.effective_date
+            r_clr = self.client.post("/actions/clear-date-anomaly", data={"media_id": it2_id})
+            self.assertEqual(r_clr.status_code, 200)
+            db.expire_all()
+            it2_reloaded = db.get(MediaItem, it2_id)
+            self.assertEqual(it2_reloaded.effective_date, orig_dt)
+            self.assertFalse(it2_reloaded.has_date_anomaly)
+
+            self.client.post("/actions/clear-date-anomaly", data={"album_id": str(grp_id)})
+
+            # 4b & 4c: Rotate photo and verify persistence in SQLite
+            r_rot = self.client.post(
+                "/actions/rotate-media",
+                data={"media_id": it1_id, "delta": 90},
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(r_rot.status_code, 200)
+            self.assertEqual(r_rot.json()["rotation_angle"], 90)
+            db.expire_all()
+            self.assertEqual(db.get(MediaItem, it1_id).rotation_angle, 90)
+
+            # Rotate -90 back to 0 via HTML response
+            r_rot2 = self.client.post("/actions/rotate-media", data={"media_id": it1_id, "delta": -90})
+            self.assertEqual(r_rot2.status_code, 200)
+            db.expire_all()
+            self.assertEqual(db.get(MediaItem, it1_id).rotation_angle, 0)
+
+            # Error cases for rotate-media
+            self.assertEqual(self.client.post("/actions/rotate-media", data={}).status_code, 400)
+            self.assertEqual(self.client.post("/actions/rotate-media", data={"media_id": "nonexistent"}).status_code, 404)
+
+    # =========================================================================
+    # 5. OFFLINE MODE, TODO QUEUE, PAIRWISE EXECUTION & AUTOMATIC ROLLBACK
+    # =========================================================================
+    def test_offline_todo_moves_pairwise_execution_and_rollback(self):
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-OFF-A",
+                volume_label="Dysk_Online",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-OFF-B",
+                volume_label="Dysk_Online_B",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            vol_c = WindowsVolume(
+                volume_serial_number="VSN-OFF-C",
+                volume_label="Dysk_Offline_C",
+                last_known_drive_letter=str(self.drive_c_offline),
+                is_online=False,
+            )
+            db.add_all([vol_a, vol_b, vol_c])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_c)
+            vol_a_id, vol_b_id, vol_c_id = vol_a.id, vol_b.id, vol_c.id
+
+            f_a = create_synthetic_jpeg(self.drive_a / "offline_move_test.jpg")
+            it_a = FileScannerService.process_file(f_a, vol_a)
+            db.add(it_a)
+            db.commit()
+            it_a_id = it_a.id
+
+            # Test direct online physical move via target_volume_id
+            r_direct = self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_a_id], "target_volume_id": str(vol_b_id), "target_subfolder": "DirectSub"},
+            )
+            self.assertEqual(r_direct.status_code, 200)
+
+            # Move file to offline volume C -> logically moved in DB immediately and added to pending_file_moves (Rule 4b)
+            r_mv = self.client.post(
+                "/actions/move-files",
+                data={
+                    "scope": "selected",
+                    "selected_ids": [it_a_id],
+                    "target_volume_id": str(vol_c_id),
+                    "target_subfolder": "Planowane_2025",
+                },
+            )
+            self.assertEqual(r_mv.status_code, 200)
+            db.expire_all()
+            it_logical = db.get(MediaItem, it_a_id)
+            self.assertEqual(it_logical.volume_id, vol_c_id)
+            self.assertEqual(it_logical.relative_path, "Planowane_2025/offline_move_test.jpg")
+
+            # Re-targeting an already pending TODO move updates its target
+            self.client.post(
+                "/actions/move-files",
+                data={
+                    "scope": "selected",
+                    "selected_ids": [it_a_id],
+                    "target_volume_id": str(vol_c_id),
+                    "target_subfolder": "Planowane_Zmienione",
+                },
+            )
+
+            # View TODO panel (Rule 4c)
+            r_panel = self.client.get("/actions/todo-panel")
+            self.assertEqual(r_panel.status_code, 200)
+            self.assertIn("Planowane_Zmienione/offline_move_test.jpg", r_panel.text)
+
+            # Test cancellation / rollback (Rule 4d): restores previous location in DB and deletes TODO entry
+            r_rb = self.client.post("/actions/todo-rollback")
+            self.assertEqual(r_rb.status_code, 200)
+            db.expire_all()
+            it_restored = db.get(MediaItem, it_a_id)
+            self.assertEqual(it_restored.volume_id, vol_b_id)
+            self.assertEqual(db.query(PendingFileMove).count(), 0)
+
+            # Empty TODO execution returns status="empty"
+            self.assertEqual(self.client.post("/actions/todo-execute").status_code, 200)
+
+            # Schedule again, then bring Drive C online and execute pairwise move (Rule 4e)
+            self.client.post(
+                "/actions/move-files",
+                data={
+                    "scope": "selected",
+                    "selected_ids": [it_a_id],
+                    "target_volume_id": str(vol_c_id),
+                    "target_subfolder": "Zrealizowane",
+                },
+            )
+            self.drive_c_offline.mkdir(parents=True, exist_ok=True)
+            r_exec = self.client.post("/actions/todo-execute")
+            self.assertEqual(r_exec.status_code, 200)
+            self.assertTrue((self.drive_c_offline / "Zrealizowane" / "offline_move_test.jpg").exists())
+            db.expire_all()
+            self.assertEqual(db.query(PendingFileMove).count(), 0)
+
+            # Test automatic rollback on physical failure (Rule 4d):
+            self.client.post(
+                "/actions/move-files",
+                data={
+                    "scope": "selected",
+                    "selected_ids": [it_a_id],
+                    "target_volume_id": str(vol_a_id),
+                    "target_subfolder": "Powrot",
+                    "force_offline_todo": "true",
+                },
+            )
+            (self.drive_c_offline / "Zrealizowane" / "offline_move_test.jpg").unlink()
+            r_fail_exec = self.client.post("/actions/todo-execute")
+            self.assertEqual(r_fail_exec.status_code, 200)
+            self.assertIn("Przywrócono poprzednie lokalizacje", r_fail_exec.text)
+            db.expire_all()
+            self.assertEqual(db.get(MediaItem, it_a_id).volume_id, vol_c_id)
+            self.assertEqual(db.query(PendingFileMove).count(), 0)
+
+            # Test destination_path branches in /actions/move-files (empty, online, offline drive)
+            self.assertIn("Wybierz dysk", self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id]}).text)
+            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": str(self.drive_a / "NowyFolder")})
+            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": "Z:\\OfflineUnregistered"})
+
+            # Test moving an offline-queued file back to its original physical location (clears pending TODO)
+            vol_z = WindowsVolume(volume_serial_number="VSN-Z", volume_label="Dysk_Z", last_known_drive_letter="Z:\\", is_online=False)
+            db.add(vol_z)
+            db.commit()
+            db.refresh(vol_z)
+            f_b = create_synthetic_jpeg(self.drive_b / "return_test.jpg")
+            it_b = FileScannerService.process_file(f_b, vol_b)
+            db.add(it_b)
+            db.commit()
+            it_b_id = it_b.id
+            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_b_id], "destination_path": "Z:\\SubOffline"})
+            # Move back to original location on vol_b with force_offline_todo=True -> removes TODO
+            self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_b_id], "target_volume_id": str(vol_b_id), "target_subfolder": "", "force_offline_todo": "true"},
+            )
+
+            # Test physical rollback of already-moved files when 2nd file in pairwise batch fails due to space
+            f_b2 = create_synthetic_jpeg(self.drive_b / "batch_1.jpg")
+            f_b3 = create_synthetic_jpeg(self.drive_b / "batch_2.jpg")
+            it_b2 = FileScannerService.process_file(f_b2, vol_b)
+            it_b3 = FileScannerService.process_file(f_b3, vol_b)
+            db.add_all([it_b2, it_b3])
+            db.commit()
+            self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_b2.id, it_b3.id], "target_volume_id": str(vol_a_id), "target_subfolder": "BatchDest", "force_offline_todo": "true"},
+            )
+            with patch.object(StorageAutomationService, "check_volume_free_space", side_effect=[(True, 999999999), (False, 0)]):
+                self.client.post("/actions/todo-execute")
+            self.assertTrue(f_b2.exists(), "First file must be physically rolled back when second file fails!")
+
+    # =========================================================================
+    # 6. STATUS, BACKGROUND PROCESS CONTROL, GRANULAR AI, SCAN ENDPOINT & LOGS
+    # =========================================================================
+    def test_status_process_control_scan_and_granular_ai(self):
+        # Test POST /actions/scan on self.drive_a
+        create_synthetic_jpeg(self.drive_a / "scan_img1.jpg", width=400, height=250, color=(230, 140, 30))
+        create_synthetic_jpeg(self.drive_a / "scan_img2.jpg", width=250, height=400, color=(40, 180, 40))
+
+        r_scan_bad = self.client.post("/actions/scan", data={"path": str(self.root / "NonExistentDir")})
+        self.assertEqual(r_scan_bad.status_code, 400)
+
+        r_scan1 = self.client.post("/actions/scan", data={"path": str(self.drive_a), "force_rescan": "false"})
+        self.assertEqual(r_scan1.status_code, 200)
+        self.assertIn("Dodano nowych: 2", r_scan1.text)
+
+        # Second scan without force_rescan -> already_in_db = 2, plus repair missing thumbnail
+        for tf in self.thumbs_dir.glob("*.webp"):
+            tf.unlink()
+        r_scan2 = self.client.post("/actions/scan", data={"path": str(self.drive_a), "force_rescan": "false"})
+        self.assertEqual(r_scan2.status_code, 200)
+        self.assertIn("Odświeżono miniatur: 2", r_scan2.text)
+
+        # Force rescan
+        r_scan3 = self.client.post("/actions/scan", data={"path": str(self.drive_a), "force_rescan": "true"})
+        self.assertEqual(r_scan3.status_code, 200)
+
+        with self.TestingSessionLocal() as db:
+            vol = db.scalar(select(WindowsVolume))
+            items = list(db.scalars(select(MediaItem)).all())
+            self.assertEqual(len(items), 2)
+            it1_id, it2_id = items[0].id, items[1].id
+
+            # Trigger granular AI analysis synchronously (Requirement 3b) with fast mocked Haar cascade
+            with patch.object(OnDemandObjectTagger, "open_session", return_value=None):
+                for mode in ("tags", "vectors", "quality", "all"):
+                    resp = self.client.post(
+                        "/actions/analyze-all",
+                        data={
+                            "analysis_type": mode,
+                            "target_drive_scope": f"volume:{vol.id}",
+                            "run_sync": "true",
+                        },
+                    )
+                    self.assertEqual(resp.status_code, 200)
+
+                # Test /actions/ai-status and /actions/ai-stop
+                self.assertEqual(self.client.get("/actions/ai-status").status_code, 200)
+                self.assertEqual(self.client.post("/actions/ai-stop").status_code, 200)
+                self.assertEqual(self.client.get("/actions/ai-status").status_code, 200)
+
+                # Create an unfinished stopped job and test stop, resume, cancel via /actions/process-control
+                job_id = ProcessManager.create_job(
+                    job_type="ai_analysis",
+                    title="Test Wznowienia AI",
+                    item_ids=[it1_id, it2_id],
+                    params={"analysis_type": "all"},
+                    initial_status="STOPPED",
+                    db=db,
+                )
+                r_status = self.client.get("/actions/status-panel")
+                self.assertEqual(r_status.status_code, 200)
+                self.assertIn("Test Wznowienia AI", r_status.text)
+
+                self.client.post("/actions/process-control", data={"action": "stop", "job_id": str(job_id)})
+                r_resume = self.client.post(
+                    "/actions/process-control",
+                    data={"action": "resume", "job_id": str(job_id), "run_sync": "true"},
+                )
+                self.assertEqual(r_resume.status_code, 200)
+                db.expire_all()
+                self.assertEqual(db.get(BackgroundJob, job_id).status, "COMPLETED")
+
+                # Test ProcessManager.request_stop(None) and start_background_thread
+                ProcessManager.request_stop(None)
+                j_bg = ProcessManager.create_job("custom", "BgThread", [], db=db)
+                ProcessManager.start_background_thread(j_bg, lambda jid: ProcessManager.finish_job(jid))
+
+                # Test cancel action and resume on backup_dedup / move_to_trash / delete_permanently jobs
+                j_bkp = ProcessManager.create_job("backup_dedup", "BkpJob", [], initial_status="STOPPED", db=db)
+                self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_bkp)})
+                self.client.post("/actions/process-control", data={"action": "cancel", "job_id": str(j_bkp)})
+
+                j_tr = ProcessManager.create_job("move_to_trash", "TrJob", [it1_id], initial_status="STOPPED", db=db)
+                self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_tr)})
+
+                j_del = ProcessManager.create_job("delete_permanently", "DelJob", [it2_id], initial_status="STOPPED", db=db)
+                self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_del)})
+
+                j_empty = ProcessManager.create_job("custom_done", "EmptyJob", [], initial_status="STOPPED", db=db)
+                self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_empty)})
+                self.client.post("/actions/process-control", data={"action": "stop", "job_id": "999999"})
+
+                # Test AI_BATCH_STATE['running'] = True branch in /actions/ai-status and /actions/analyze-all
+                actions_module.AI_BATCH_STATE["running"] = True
+                actions_module.AI_BATCH_STATE["total"] = 10
+                actions_module.AI_BATCH_STATE["processed"] = 5
+                try:
+                    self.assertIn("Przetwarzanie AI", self.client.get("/actions/ai-status").text)
+                    self.assertIn("Przetwarzanie AI", self.client.post("/actions/analyze-all", data={"analysis_type": "all"}).text)
+                finally:
+                    actions_module.AI_BATCH_STATE["running"] = False
+
+                # Test _run_background_ai_batch stop_requested midway & error handling
+                j_stop_ai = ProcessManager.create_job("ai_analysis", "StopAI", [it1_id], db=db)
+                actions_module.AI_BATCH_STATE["stop_requested"] = True
+                actions_module._run_background_ai_batch(j_stop_ai, [it1_id], analysis_type="all")
+
+                j_err_ai = ProcessManager.create_job("ai_analysis", "ErrAI", [it1_id], db=db)
+                with patch.object(MediaQualityAnalyzer, "analyze_image", side_effect=RuntimeError("AI_Crash")):
+                    actions_module._run_background_ai_batch(j_err_ai, [it1_id], analysis_type="quality")
+
+                # Test execute_scan exception branch and stop_requested branch
+                with patch.object(WindowsVolumeInspector, "get_volume_info", side_effect=RuntimeError("ScanCrash")):
+                    self.assertEqual(actions_module.execute_scan(str(self.drive_a))["status"], "error")
+
+                # Test empty selection responses across endpoints
+                self.client.post("/actions/analyze-all", data={"scope": "selected"})
+                self.client.post("/actions/assign-group", data={"group_name": "PustyAlbum", "scope": "selected"})
+                self.client.post("/actions/auto-group", data={"mode": "date", "volume_id": str(vol.id), "folder_prefix": "BrakPlikow/"})
+                self.client.post("/actions/change-date", data={"new_date": "2023-01-01", "scope": "selected"})
+                self.client.post("/actions/clear-date-anomaly", data={"scope": "selected"})
+                self.client.post("/actions/export-json-disk", data={"scope": "selected"})
+                self.client.post("/actions/move-files", data={"scope": "selected"})
+                self.client.post("/actions/move-to-trash", data={"scope": "selected"})
+                self.client.post("/actions/unindex", data={"scope": "selected"})
+                self.client.post("/actions/delete-permanently", data={"scope": "selected"})
+                self.client.post("/actions/rename-volume", data={"volume_id": "999999", "new_label": ""})
+
+                # Test stop_requested inside _execute_move_to_trash_items and _execute_delete_permanently_items
+                j_st_tr = ProcessManager.create_job("move_to_trash", "StTr", [it1_id], db=db)
+                ProcessManager.request_stop(j_st_tr)
+                actions_module._execute_move_to_trash_items(db, [it1_id], job_id=j_st_tr)
+
+                j_st_dl = ProcessManager.create_job("delete_permanently", "StDl", [it1_id], db=db)
+                ProcessManager.request_stop(j_st_dl)
+                actions_module._execute_delete_permanently_items(db, [it1_id], job_id=j_st_dl)
+
+            # Verify persistent operation log on disk (Requirement 3d) and file fallback in OperationLogger
+            self.assertTrue(self.log_file.exists())
+            log_text = self.log_file.read_text(encoding="utf-8")
+            self.assertIn("AI_ANALYSIS", log_text)
+
+            db.query(OperationLogEntry).delete()
+            db.commit()
+            file_logs = OperationLogger.get_recent_logs(db, limit=10, log_file=self.log_file)
+            self.assertGreater(len(file_logs), 0)
+
+    # =========================================================================
+    # 7. AI TAGGER, QUALITY ANALYZER, SEMANTIC SIMILARITY & MEDIA ENDPOINTS
+    # =========================================================================
+    def test_tagger_quality_semantic_and_media_endpoints(self):
+        # Test all ImageNet class index mappings in OnDemandObjectTagger
+        cases = [
+            (200, 0.5, "pies"),
+            (200, 0.25, "zwierze"),
+            (282, 0.5, "kot"),
+            (290, 0.5, "zwierze"),
+            (15, 0.5, "ptak"),
+            (350, 0.5, "zwierze"),
+            (511, 0.5, "samochod"),
+            (670, 0.5, "rower_motocykl"),
+            (497, 0.5, "architektura"),
+            (950, 0.5, "jedzenie"),
+            (970, 0.5, "gory_natura"),
+            (975, 0.5, "morze_woda"),
+            (1, 0.5, None),
+        ]
+        for idx, prob, expected_tag in cases:
+            res = OnDemandObjectTagger._classify_imagenet_index(idx, prob)
+            if expected_tag:
+                self.assertTrue(any(t == expected_tag for t, _ in res), f"Failed for idx={idx}")
+            else:
+                self.assertEqual(res, [])
+
+        # Test OnDemandObjectTagger context manager & open_session with temp labels & mocked ort
+        labels_tmp = self.root / "imagenet_classes.json"
+        labels_tmp.write_text(json.dumps(["tench", "goldfish"]), encoding="utf-8")
+        fake_onnx = self.root / "mobilenetv2.onnx"
+        fake_onnx.write_bytes(b"X" * 1_100_000)
+
+        with patch("onnxruntime.InferenceSession", return_value=MagicMock()):
+            t_ctx = OnDemandObjectTagger()
+            t_ctx.labels_path = labels_tmp
+            t_ctx.model_path = fake_onnx
+            with t_ctx as active_t:
+                self.assertEqual(active_t._get_label_by_index(0), "tench")
+                active_t.labels = {"0": "tench_dict"}
+                self.assertEqual(active_t._get_label_by_index(0), "tench_dict")
+                active_t.labels = None
+                self.assertEqual(active_t._get_label_by_index(5), "class_5")
+
+        # Test scene color heuristics (square, B&W, dark, snow, sunset, water)
+        sq_dark = create_synthetic_jpeg(self.drive_a / "sq_dark.jpg", width=200, height=200, sharp=False, color=(15, 15, 15))
+        snow_bright = create_synthetic_jpeg(self.drive_a / "snow.jpg", width=1200, height=900, sharp=False, color=(240, 240, 240))
+        sunset_img = create_synthetic_jpeg(self.drive_a / "sunset.jpg", width=200, height=200, sharp=False, color=(20, 100, 240))
+        # Water image: white top half, blue bottom half
+        water_arr = np.full((200, 200, 3), 240, dtype=np.uint8)
+        water_arr[100:, :] = (220, 110, 20)  # BGR blue in bottom half
+        water_img = self.drive_a / "water.jpg"
+        cv2.imwrite(str(water_img), water_arr)
+
+        tagger = OnDemandObjectTagger()
+        mock_ort_sess = MagicMock()
+        mock_in = MagicMock()
+        mock_in.name = "input"
+        mock_out = MagicMock()
+        mock_out.name = "output"
+        mock_ort_sess.get_inputs.return_value = [mock_in]
+        mock_ort_sess.get_outputs.return_value = [mock_out]
+        logits = np.zeros((1, 1000), dtype=np.float32)
+        logits[0, 200] = 10.0  # dog class
+        mock_ort_sess.run.return_value = [logits]
+
+        mock_cascade = MagicMock()
+        mock_cascade.detectMultiScale.return_value = [(10, 10, 50, 50), (80, 10, 50, 50)]
+        tagger.session = mock_ort_sess
+        tagger.face_cascade = mock_cascade
+        tags_out = tagger.tag_image(sq_dark)
+        self.assertTrue(any(t == "pies" for t, _ in tags_out))
+        self.assertTrue(any(t == "grupa osob" for t, _ in tags_out))
+
+        # Single face -> portret
+        mock_cascade.detectMultiScale.return_value = [(10, 10, 50, 50)]
+        tags_portrait = tagger.tag_image(water_img)
+        self.assertTrue(any(t == "portret" for t, _ in tags_portrait))
+        self.assertTrue(any(t == "morze_woda" for t, _ in tags_portrait))
+
+        tagger.tag_image(snow_bright)
+        tagger.tag_image(sunset_img)
+        self.assertEqual(tagger.tag_image(self.drive_a / "missing_tag.jpg"), [])
+        bad_tag_f = self.drive_a / "bad_tag.jpg"
+        bad_tag_f.write_bytes(b"NOT_AN_IMAGE")
+        self.assertEqual(tagger.tag_image(bad_tag_f), [])
+        tagger.close_session()
+
+        # MediaQualityAnalyzer edge sizes (>1024px and <256px and flat and corrupt)
+        MediaQualityAnalyzer.analyze_image(snow_bright)
+        small_img = create_synthetic_jpeg(self.drive_a / "tiny.jpg", width=100, height=100, sharp=False)
+        MediaQualityAnalyzer.analyze_image(small_img)
+        MediaQualityAnalyzer.analyze_image(self.drive_a / "missing_q.jpg")
+        MediaQualityAnalyzer.analyze_image(bad_tag_f)
+
+        # OnDemandClipEmbedder edge cases
+        self.assertEqual(OnDemandClipEmbedder.rank_similar(np.zeros(512), []), [])
+        self.assertEqual(OnDemandClipEmbedder.rank_similar(np.zeros(512), [("id1", b"short")]), [])
+
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(volume_serial_number="V-SEM", volume_label="Dysk_Sem", last_known_drive_letter=str(self.drive_a))
+            grp = MediaGroup(name="Pieski")
+            db.add_all([vol, grp])
+            db.commit()
+            db.refresh(vol)
+            db.refresh(grp)
+
+            p1 = create_synthetic_jpeg(self.drive_a / "dog_1.jpg", color=(50, 100, 150))
+            p2 = create_synthetic_jpeg(self.drive_a / "dog_2.jpg", color=(55, 105, 155))
+            # Create a .tiff image to test on-the-fly TIFF->JPEG conversion in /{media_id}/raw
+            tiff_p = self.drive_a / "sample.tiff"
+            Image.new("RGB", (120, 90), color=(100, 150, 200)).save(tiff_p, format="TIFF")
+            mov_p = self.drive_a / "sample_clip.mov"
+            mov_p.write_bytes(b"FAKE_MOV_CONTENT" * 100)
+
+            it1 = FileScannerService.process_file(p1, vol)
+            it2 = FileScannerService.process_file(p2, vol)
+            it_tiff = FileScannerService.process_file(tiff_p, vol)
+            it_mov = FileScannerService.process_file(mov_p, vol)
+            it1.group_id = grp.id
+            it2.effective_date = it1.effective_date - datetime.timedelta(hours=2)
+            # Clear it2.embedding to test in-RAM vector fallback in semantic.py
+            it2.embedding = None
+            db.add_all([it1, it2, it_tiff, it_mov])
+            db.flush()
+            db.add(MediaTag(media_id=it1.id, tag="pies", confidence=0.9, source_model="test"))
+            db.add(MediaTag(media_id=it2.id, tag="pies", confidence=0.85, source_model="test"))
+            db.commit()
+            it1_id, it2_id, tiff_id, mov_id, grp_id, vol_id = it1.id, it2.id, it_tiff.id, it_mov.id, grp.id, vol.id
+            it1_thumb = it1.thumbnail_relative_path
+
+            # Test all 6 similarity modes + invalid mode + missing media_id
+            for mode in list(semantic_module.SIMILARITY_MODES.keys()) + ["invalid_mode"]:
+                r_sim = self.client.get(f"/semantic/similar/{it1_id}?mode={mode}")
+                self.assertEqual(r_sim.status_code, 200)
+            self.assertEqual(self.client.get("/semantic/similar/nonexistent_id").status_code, 200)
+
+            # Test semantic text search (normal and empty query)
+            r_q = self.client.get("/semantic/search?q=pies")
+            self.assertEqual(r_q.status_code, 200)
+            self.assertIn("dog_1.jpg", r_q.text)
+            self.assertEqual(self.client.get("/semantic/search?q=   ").status_code, 200)
+
+            # Test media detail, raw, thumbnails (including lazy regeneration), filters
+            self.assertEqual(self.client.get("/").status_code, 200)
+            self.assertEqual(self.client.get("/media/sidebar").status_code, 200)
+            for vm in ("grid", "compact", "table"):
+                for sb in ("date_desc", "date_asc", "size_desc", "size_asc", "name_asc", "blur_asc"):
+                    r_s = self.client.get(
+                        f"/media/search?view_mode={vm}&sort_by={sb}&q=dog&media_type=image"
+                        f"&volume_id={vol_id}&group_id={grp_id}&tag=pies&year={it1.effective_date.year}"
+                    )
+                    self.assertEqual(r_s.status_code, 200)
+
+            # Test boolean filter flags on /media/search
+            self.assertEqual(
+                self.client.get(
+                    "/media/search?anomaly_only=true&blurry_only=true&duplicates_only=true"
+                    "&untagged_only=true&ungrouped_only=true&unbacked_only=true&trashed_only=true"
+                ).status_code,
+                200,
+            )
+
+            self.assertEqual(self.client.get(f"/media/{it1_id}/detail").status_code, 200)
+            self.assertEqual(self.client.get("/media/nonexistent/detail").status_code, 404)
+            self.assertEqual(self.client.get(f"/media/{it1_id}/raw").status_code, 200)
+            self.assertEqual(self.client.get(f"/media/{tiff_id}/raw").status_code, 200)
+            self.assertEqual(self.client.get("/media/nonexistent/raw").status_code, 404)
+
+            # Test .mov video transcoding branch in /{media_id}/raw (both uncached ffmpeg call and cached)
+            cached_mp4 = self.thumbs_dir / f"{mov_id}_stream.mp4"
+            def fake_ffmpeg_run(*args, **kwargs):
+                cached_mp4.write_bytes(b"MP4_STREAM_DATA" * 200)
+            with patch("subprocess.run", side_effect=fake_ffmpeg_run):
+                self.assertEqual(self.client.get(f"/media/{mov_id}/raw").status_code, 200)
+
+            # Test offline raw fallback to WebP thumbnail and 404 when thumbnail is also missing
+            it_off = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_id,
+                relative_path="missing_on_disk.jpg",
+                file_name="missing_on_disk.jpg",
+                file_size_bytes=123,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="abc",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2023, 1, 1),
+                fs_mtime=datetime.datetime(2023, 1, 1),
+                effective_date=datetime.datetime(2023, 1, 1),
+                thumbnail_relative_path=it1_thumb,
+            )
+            db.add(it_off)
+            db.commit()
+            it_off_id = it_off.id
+            self.assertEqual(self.client.get(f"/media/{it_off_id}/raw").status_code, 200)
+
+            # Delete cached thumbnail and request /media/thumbnails/... to trigger lazy regeneration
+            (self.thumbs_dir / it1_thumb).unlink()
+            self.assertEqual(self.client.get(f"/media/{it_off_id}/raw").status_code, 404)
+            self.assertEqual(self.client.get(f"/media/thumbnails/{it1_thumb}").status_code, 200)
+            self.assertEqual(self.client.get("/media/thumbnails/nonexistent.webp").status_code, 404)
+
+            # Export JSON
+            r_exp = self.client.post("/actions/export-json-disk", data={"scope": "filtered"})
+            self.assertEqual(r_exp.status_code, 200)
+
+            # Rename volume
+            r_ren = self.client.post("/actions/rename-volume", data={"volume_id": str(vol_id), "new_label": "Nowa_Nazwa"})
+            self.assertEqual(r_ren.status_code, 200)
+
+            # Move group to trash -> restore group -> move selected to trash -> restore selected (with collision) -> empty trash
+            self.client.post("/actions/move-to-trash", data={"trash_group_id": str(grp_id)})
+            self.client.post("/actions/restore-from-trash", data={"restore_mode": "group", "restore_group_id": str(grp_id)})
+            self.client.post("/actions/move-to-trash", data={"scope": "selected", "selected_ids": [it1_id]})
+            # Create a file at p1 so restore triggers _restored_1 collision handling
+            create_synthetic_jpeg(p1)
+            self.client.post("/actions/restore-from-trash", data={"restore_mode": "selected", "selected_ids": [it1_id]})
+            self.client.post("/actions/move-to-trash", data={"scope": "selected", "selected_ids": [it1_id]})
+            self.client.post("/actions/empty-trash", data={})
+
+            # Permanent delete (by group_id and selected_ids) & unindex (by selected_ids and volume_id)
+            self.client.post("/actions/delete-permanently", data={"delete_group_id": str(grp_id)})
+            self.client.post("/actions/delete-permanently", data={"scope": "selected", "selected_ids": [it2_id]})
+            self.client.post("/actions/unindex", data={"scope": "selected", "selected_ids": [tiff_id]})
+            self.client.post("/actions/unindex", data={"unindex_volume_id": str(vol_id)})
+
+    # =========================================================================
+    # 8. SQLITE BACKUP MANAGER, SCHEMA MIGRATIONS & GOOGLE DRIVE CLOUD SYNC
+    # =========================================================================
+    def test_sqlite_backup_migrations_and_google_drive_verification(self):
+        # Test get_db generator
+        gen = get_db()
+        s_db = next(gen)
+        self.assertIsNotNone(s_db)
+        gen.close()
+
+        # Test ensure_schema_migrations on non-existent DB and on legacy minimal tables
+        ensure_schema_migrations(self.root / "does_not_exist.db")
+        legacy_db = self.root / "legacy.db"
+        conn = sqlite3.connect(legacy_db.as_posix())
+        conn.execute("CREATE TABLE media_groups (id INTEGER PRIMARY KEY, name TEXT);")
+        conn.execute("CREATE TABLE media_items (id TEXT PRIMARY KEY, file_name TEXT);")
         conn.commit()
         conn.close()
+        ensure_schema_migrations(legacy_db)
 
-        mgr = BackupManager(db_path=db_path, backup_dir=backup_dir, max_retained_backups=3)
-        backup_file = mgr.create_backup(tag="unit_test")
+        mgr = BackupManager(db_path=self.db_path, backup_dir=self.backup_dir, max_retained_backups=2)
+        self.assertTrue(mgr.check_integrity())
+        mgr.create_backup("t1")
+        mgr.create_backup("t2")
+        b3 = mgr.create_backup("t3")
+        self.assertTrue(b3.exists())
+        self.assertLessEqual(len(list(self.backup_dir.glob("media_vault_*.db"))), 2)
 
-        self.assertTrue(backup_file.exists())
+        # Test GoogleDriveManager authentication, folder creation, MD5 verification, and purge_local
+        sample = create_synthetic_jpeg(self.drive_a / "gdrive_test.jpg")
+        md5_hex = GoogleDriveManager.compute_local_md5(sample)
+        self.assertEqual(len(md5_hex), 32)
 
-        # Verify integrity of backup
-        dest_conn = sqlite3.connect(str(backup_file))
-        res = dest_conn.execute("SELECT payload FROM test_data;").fetchone()
-        dest_conn.close()
+        g_mgr = GoogleDriveManager()
+        g_mgr.CREDENTIALS_FILE = self.root / "missing_creds.json"
+        with self.assertRaises(FileNotFoundError):
+            g_mgr.authenticate()
 
-        self.assertEqual(res[0], "critical_record")
+        # Test authenticate() with mocked Credentials and build
+        g_mgr.CREDENTIALS_FILE = self.root / "creds.json"
+        g_mgr.TOKEN_FILE = self.root / "token.json"
+        g_mgr.CREDENTIALS_FILE.write_text("{}", encoding="utf-8")
+        g_mgr.TOKEN_FILE.write_text("{}", encoding="utf-8")
+        mock_creds = MagicMock()
+        mock_creds.valid = True
+        mock_svc = MagicMock()
+        with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=mock_creds), patch(
+            "googleapiclient.discovery.build", return_value=mock_svc
+        ):
+            g_mgr.authenticate()
+            self.assertIsNotNone(g_mgr.service)
 
-    def test_vector_cosine_similarity(self):
-        """
-        Tests NumPy fast vectorized cosine ranking for embeddings stored as raw BLOBs.
-        """
-        v1 = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        v2 = np.array([0.9, 0.1, 0.0], dtype=np.float32)
-        v2 /= np.linalg.norm(v2)
-        v3 = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        mock_svc.files().list().execute.return_value = {"files": []}
+        mock_svc.files().create().execute.return_value = {"id": "created_fld"}
+        self.assertEqual(g_mgr.get_or_create_folder("NowyFolder"), "created_fld")
 
-        candidates = [
-            ("item_similar", v2.tobytes()),
-            ("item_orthogonal", v3.tobytes()),
-        ]
+        mock_svc.files().list().execute.return_value = {"files": [{"id": "fld1", "name": "DomoweArchiwumFoto"}]}
+        self.assertEqual(g_mgr.get_or_create_folder("DomoweArchiwumFoto"), "fld1")
+        self.assertEqual(len(g_mgr.list_folders()), 1)
+        self.assertEqual(len(g_mgr.list_files_in_folder("fld1")), 1)
 
-        ranked = OnDemandClipEmbedder.rank_similar(v1, candidates, top_n=2)
-        self.assertEqual(ranked[0][0], "item_similar")
-        self.assertGreater(ranked[0][1], 0.8)
+        # Mock next_chunk() for upload_and_verify
+        mock_req = MagicMock()
+        mock_req.next_chunk.return_value = (
+            None,
+            {
+                "id": "cloud123",
+                "name": sample.name,
+                "size": str(sample.stat().st_size),
+                "md5Checksum": md5_hex,
+                "webViewLink": "https://drive.google.com/file/d/cloud123",
+            },
+        )
+        mock_svc.files().create.return_value = mock_req
+        with patch("googleapiclient.http.MediaFileUpload", return_value=MagicMock()):
+            up_res = g_mgr.upload_and_verify(sample, "fld1", purge_local_after_verify=False)
+            self.assertTrue(up_res["verified"])
+
+            # Checksum mismatch must raise RuntimeError and NOT delete local file
+            mock_req.next_chunk.return_value = (
+                None,
+                {"id": "bad", "name": sample.name, "size": str(sample.stat().st_size), "md5Checksum": "0000"},
+            )
+            with self.assertRaises(RuntimeError):
+                g_mgr.upload_and_verify(sample, "fld1", purge_local_after_verify=True)
+            self.assertTrue(sample.exists())
+
+            # Test purge_local_after_verify=True when verified
+            sample_purge = create_synthetic_jpeg(self.drive_a / "gdrive_purge.jpg")
+            purge_md5 = GoogleDriveManager.compute_local_md5(sample_purge)
+            mock_req.next_chunk.return_value = (
+                None,
+                {
+                    "id": "cloud_p",
+                    "name": sample_purge.name,
+                    "size": str(sample_purge.stat().st_size),
+                    "md5Checksum": purge_md5,
+                },
+            )
+            up_purge = g_mgr.upload_and_verify(sample_purge, "fld1", purge_local_after_verify=True)
+            self.assertTrue(up_purge["purged_local"])
+            self.assertFalse(sample_purge.exists())
+
+        # Test /actions/gdrive-panel and /actions/gdrive-sync endpoints (both db_backup and media modes)
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(volume_serial_number="V-GD", volume_label="Dysk_GD", last_known_drive_letter=str(self.drive_a))
+            db.add(vol)
+            db.commit()
+            db.refresh(vol)
+            it_gd = FileScannerService.process_file(sample, vol)
+            db.add(it_gd)
+            db.commit()
+            it_gd_id = it_gd.id
+
+        mock_req.next_chunk.return_value = (
+            None,
+            {
+                "id": "cloud123",
+                "name": sample.name,
+                "size": str(sample.stat().st_size),
+                "md5Checksum": md5_hex,
+                "webViewLink": "https://drive.google.com/file/d/cloud123",
+            },
+        )
+        with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr), patch(
+            "googleapiclient.http.MediaFileUpload", return_value=MagicMock()
+        ):
+            self.assertEqual(self.client.get("/actions/gdrive-panel").status_code, 200)
+            with patch.object(g_mgr, "upload_and_verify", return_value={"id": "c1", "name": "b.db", "size_bytes": 100, "md5": "abc", "verified": True, "purged_local": False}):
+                r_sync_db = self.client.post("/actions/gdrive-sync", data={"mode": "db_backup", "folder_id": "fld1"})
+                self.assertEqual(r_sync_db.status_code, 200)
+                r_sync_media = self.client.post(
+                    "/actions/gdrive-sync",
+                    data={"mode": "media", "new_folder_name": "Chmura_Test", "scope": "selected", "selected_ids": [it_gd_id], "purge_local": "true"},
+                )
+                self.assertEqual(r_sync_media.status_code, 200)
+
+        # Test gdrive-panel and gdrive-sync error handling when credentials fail
+        with patch("app.cloud.google_drive.GoogleDriveManager", side_effect=RuntimeError("Brak OAuth")):
+            self.assertEqual(self.client.get("/actions/gdrive-panel").status_code, 200)
+            self.assertEqual(self.client.post("/actions/gdrive-sync", data={"mode": "db_backup"}).status_code, 200)
+
+        # Test move-files by destination_path (both online and offline drive paths), group trash/restore, and TIFF raw conversion
+        with self.TestingSessionLocal() as db:
+            vol_m = WindowsVolume(volume_serial_number="V-MV-99", volume_label="Dysk_MV", last_known_drive_letter=str(self.drive_a), is_online=True)
+            vol_z = WindowsVolume(volume_serial_number="V-MV-Z", volume_label="Dysk_Z_Off", last_known_drive_letter="Z:\\", is_online=False)
+            db.add_all([vol_m, vol_z])
+            db.commit()
+            db.refresh(vol_m)
+            db.refresh(vol_z)
+            vol_m_id = vol_m.id
+
+            p_mv = create_synthetic_jpeg(self.drive_a / "SubFolder" / "mv_item.jpg")
+            it_mv = FileScannerService.process_file(p_mv, vol_m)
+            # Also create a .tiff image for on-the-fly JPEG conversion in /media/{id}/raw
+            tiff_path = self.drive_a / "SubFolder" / "sample_image.tiff"
+            Image.new("RGBA", (64, 64), (100, 150, 200, 255)).save(tiff_path, format="TIFF")
+            it_tiff = FileScannerService.process_file(tiff_path, vol_m)
+            grp_parent = MediaGroup(name="Rodzic_Kosz")
+            db.add_all([it_mv, it_tiff, grp_parent])
+            db.commit()
+            db.refresh(grp_parent)
+            grp_child = MediaGroup(name="Dziecko_Kosz", parent_id=grp_parent.id)
+            db.add(grp_child)
+            db.commit()
+            db.refresh(grp_child)
+            it_mv.group_id = grp_child.id
+            db.commit()
+            mv_id, tiff_id, child_gid = it_mv.id, it_tiff.id, grp_child.id
+
+        # Search with duplicates_only and volume_id (subfolders aggregation)
+        self.assertEqual(self.client.get(f"/media/search?duplicates_only=true&volume_id={vol_m_id}").status_code, 200)
+
+        # Raw TIFF on-the-fly conversion to JPEG
+        r_tiff = self.client.get(f"/media/{tiff_id}/raw")
+        self.assertEqual(r_tiff.status_code, 200)
+        self.assertEqual(r_tiff.headers["content-type"], "image/jpeg")
+
+        # Move group to trash and restore group hierarchy from trash
+        self.assertEqual(self.client.post("/actions/move-to-trash", data={"trash_group_id": str(child_gid)}).status_code, 200)
+        self.assertEqual(
+            self.client.post("/actions/restore-from-trash", data={"restore_mode": "group", "restore_group_id": str(child_gid)}).status_code,
+            200,
+        )
+
+        # Move by destination_path (online folder)
+        dest_online = self.drive_b / "CustomTarget"
+        with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-MV-NEW", "NowyDysk", str(self.drive_b))):
+            r_mv_on = self.client.post(
+                "/actions/move-files",
+                data={"destination_path": str(dest_online), "scope": "selected", "selected_ids": [mv_id]},
+            )
+            self.assertEqual(r_mv_on.status_code, 200)
+
+        # Move by destination_path (offline registered Z:\ drive)
+        r_mv_off = self.client.post(
+            "/actions/move-files",
+            data={"destination_path": "Z:\\Archiwum\\2024", "scope": "selected", "selected_ids": [mv_id]},
+        )
+        self.assertEqual(r_mv_off.status_code, 200)
+        # Move by destination_path (unregistered offline X:\ drive)
+        r_mv_unreg = self.client.post(
+            "/actions/move-files",
+            data={"destination_path": "X:\\Nieznany", "scope": "selected", "selected_ids": [mv_id]},
+        )
+        self.assertEqual(r_mv_unreg.status_code, 200)
+
+        # BackupManager edge cases (non-existent db_path, failed integrity check)
+        bm_missing = BackupManager(db_path=self.root / "no_such_db.sqlite", backup_dir=self.backup_dir)
+        self.assertTrue(bm_missing.check_integrity())
+        self.assertEqual(bm_missing.create_backup("missing"), self.root / "no_such_db.sqlite")
+
+        # GoogleDriveManager token refresh and OAuth flow branches, plus service=None auto-authenticate
+        mock_expired = MagicMock()
+        mock_expired.valid = False
+        mock_expired.expired = True
+        mock_expired.refresh_token = "ref_tok"
+        mock_expired.to_json.return_value = "{}"
+        with patch("google.oauth2.credentials.Credentials.from_authorized_user_file", return_value=mock_expired), patch(
+            "googleapiclient.discovery.build", return_value=mock_svc
+        ):
+            g_mgr.authenticate()
+            mock_expired.refresh.assert_called_once()
+
+        g_mgr.TOKEN_FILE.unlink()
+        mock_flow = MagicMock()
+        mock_flow.run_local_server.return_value = mock_expired
+        with patch("google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file", return_value=mock_flow), patch(
+            "googleapiclient.discovery.build", return_value=mock_svc
+        ):
+            g_mgr.authenticate()
+
+        # Test service=None lazy authenticate in list_folders, get_or_create_folder, list_files_in_folder, upload_and_verify
+        def _fake_auth():
+            g_mgr.service = mock_svc
+
+        with patch.object(g_mgr, "authenticate", side_effect=_fake_auth):
+            g_mgr.service = None
+            g_mgr.list_folders()
+            g_mgr.service = None
+            g_mgr.get_or_create_folder("Test")
+            g_mgr.service = None
+            g_mgr.list_files_in_folder("fld1")
+            g_mgr.service = None
+            with self.assertRaises(FileNotFoundError):
+                g_mgr.upload_and_verify(self.root / "nonexistent_upload.jpg", "fld1")
+
+        # MediaQualityAnalyzer .heic and video empty frame branches
+        heic_ok = self.root / "fake_valid.heic"
+        Image.new("RGB", (64, 64), (80, 120, 160)).save(heic_ok, format="JPEG")
+        c_h, b_h, s_h = MediaQualityAnalyzer.analyze_image(heic_ok)
+        self.assertFalse(c_h)
+        heic_bad = self.root / "fake_corrupt.heic"
+        heic_bad.write_bytes(b"corrupt_heic_bytes")
+        c_hb, _, _ = MediaQualityAnalyzer.analyze_image(heic_bad)
+        self.assertTrue(c_hb)
+
+        mock_vcap = MagicMock()
+        mock_vcap.isOpened.return_value = True
+        mock_vcap.read.return_value = (False, None)
+        with patch("cv2.VideoCapture", return_value=mock_vcap):
+            c_v, _, _ = MediaQualityAnalyzer.analyze_video(heic_ok)
+            self.assertTrue(c_v)
+
+        # OnDemandObjectTagger invalid labels JSON and invalid ONNX model handling
+        bad_lbl = self.root / "bad_labels.json"
+        bad_lbl.write_text("{invalid_json", encoding="utf-8")
+        bad_onnx = self.root / "bad_model.onnx"
+        bad_onnx.write_bytes(b"0" * 1_100_000)
+        tagger_bad = OnDemandObjectTagger()
+        tagger_bad.model_path = bad_onnx
+        tagger_bad.labels_path = bad_lbl
+        tagger_bad.open_session()
+        self.assertIsNone(tagger_bad.session)
+        tagger_bad.labels = 12345
+        self.assertEqual(tagger_bad._get_label_by_index(5), "class_5")
+        tagger_bad.close_session()
+
+        # Test stopping _run_background_ai_batch at chunk start and mid-batch, and stopping execute_scan midway
+        from app.routers.actions import _run_background_ai_batch, AI_BATCH_STATE, execute_scan
+        j_ai1 = ProcessManager.create_job("ai_analysis", "AI Stop Chunk", [mv_id])
+        with patch.object(ProcessManager, "is_stop_requested", return_value=True):
+            _run_background_ai_batch(j_ai1, [mv_id], analysis_type="tags")
+
+        j_ai2 = ProcessManager.create_job("ai_analysis", "AI Stop Mid", [mv_id])
+        with patch.object(ProcessManager, "is_stop_requested", side_effect=[False, True]):
+            _run_background_ai_batch(j_ai2, [mv_id], analysis_type="tags")
+        AI_BATCH_STATE["stop_requested"] = False
+
+        # Test _run_background_ai_batch with missing file, video tag, embedding error, and blurry item
+        with self.TestingSessionLocal() as db:
+            p_blur_ai = create_synthetic_jpeg(self.drive_a / "SubFolder" / "blur_ai.jpg", sharp=False)
+            it_blur_ai = FileScannerService.process_file(p_blur_ai, vol_m)
+            it_vid_ai = MediaItem(
+                id="vid-ai-test-1",
+                volume_id=vol_m_id,
+                relative_path="SubFolder/vid_ai_unique.mp4",
+                file_name="vid_ai.mp4",
+                file_size_bytes=1024,
+                media_type="video",
+                mime_type="video/mp4",
+                file_hash="h_vid_ai",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2023, 1, 1),
+                fs_mtime=datetime.datetime(2023, 1, 1),
+                effective_date=datetime.datetime(2023, 1, 1),
+                thumbnail_relative_path=it_blur_ai.thumbnail_relative_path,
+            )
+            it_miss_ai = MediaItem(
+                id="miss-ai-test-1",
+                volume_id=vol_m_id,
+                relative_path="SubFolder/no_such_file.jpg",
+                file_name="no_such_file.jpg",
+                file_size_bytes=1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="h_miss_ai",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2023, 1, 1),
+                fs_mtime=datetime.datetime(2023, 1, 1),
+                effective_date=datetime.datetime(2023, 1, 1),
+                thumbnail_relative_path="no_such_thumb.webp",
+            )
+            db.add_all([it_blur_ai, it_vid_ai, it_miss_ai])
+            db.commit()
+            blur_ai_id = it_blur_ai.id
+
+        j_ai3 = ProcessManager.create_job("ai_analysis", "AI Full Branches", [blur_ai_id, "vid-ai-test-1", "miss-ai-test-1"])
+        with patch.object(OnDemandClipEmbedder, "generate_image_embedding", side_effect=RuntimeError("VecErr")):
+            _run_background_ai_batch(j_ai3, [blur_ai_id, "vid-ai-test-1", "miss-ai-test-1"], analysis_type="all")
+
+        # Test async thread launch in /actions/analyze-all and /actions/process-control (invalid json & async resume)
+        with patch.object(ProcessManager, "start_background_thread") as mock_bg:
+            self.client.post("/actions/analyze-all", data={"scope": "selected", "selected_ids": [mv_id], "analysis_type": "tags"})
+            mock_bg.assert_called_once()
+            with self.TestingSessionLocal() as db:
+                jb_bad = BackgroundJob(job_type="other", title="BadJSON", status="STOPPED", remaining_ids_json="{bad", params_json="{bad")
+                jb_async = BackgroundJob(job_type="ai_analysis", title="AsyncResume", status="STOPPED", remaining_ids_json=json.dumps([mv_id]), params_json="{}")
+                db.add_all([jb_bad, jb_async])
+                db.commit()
+                db.refresh(jb_bad)
+                db.refresh(jb_async)
+                jb_bad_id, jb_async_id = jb_bad.id, jb_async.id
+            self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(jb_bad_id)})
+            self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(jb_async_id)})
+
+        # Additional action branches: consolidate offline, rename-volume invalid, restore-from-trash all, empty-trash selected & trashed group, move-files existing volume, gdrive empty folders & sync error
+        with self.TestingSessionLocal() as db:
+            vol_z_obj = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "V-MV-Z"))
+            vol_z_id = vol_z_obj.id
+        self.client.post("/actions/consolidate", data={"group_id": str(child_gid), "target_volume_id": str(vol_z_id)})
+        self.client.post("/actions/rename-volume", data={"volume_id": str(vol_m_id), "new_label": "   "})
+        self.client.post("/actions/move-to-trash", data={"trash_group_id": str(child_gid)})
+        self.client.post("/actions/restore-from-trash", data={"restore_mode": "all"})
+        self.client.post("/actions/move-to-trash", data={"trash_group_id": str(child_gid)})
+        self.client.post("/actions/empty-trash", data={"selected_ids": [mv_id]})
+        self.client.post("/actions/empty-trash", data={})
+
+        # Second move to already-registered V-MV-NEW volume
+        with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-MV-NEW", "NowyDysk", str(self.drive_b))):
+            self.client.post(
+                "/actions/move-files",
+                data={"destination_path": str(dest_online), "scope": "selected", "selected_ids": [tiff_id]},
+            )
+
+        # GDrive empty folders list and error fallback with folder_id
+        with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr):
+            with patch.object(g_mgr, "list_folders", side_effect=[[], [{"id": "fld1", "name": "DomoweArchiwumFoto"}]]):
+                self.client.get("/actions/gdrive-panel")
+            with patch.object(g_mgr, "upload_and_verify", side_effect=RuntimeError("UploadBoom")):
+                self.client.post("/actions/gdrive-sync", data={"mode": "db_backup", "folder_id": "fld1"})
+            with patch.object(g_mgr, "upload_and_verify", return_value={"id": "c2", "name": "b.db", "size_bytes": 100, "md5": "abc", "verified": True, "purged_local": False}):
+                self.client.post("/actions/gdrive-sync", data={"mode": "db_backup"})
+
+        j_scan = ProcessManager.create_job("scan", "Scan Stop", ["mv_item.jpg"])
+        ProcessManager.request_stop(j_scan)
+        with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-MV-99", "Dysk_MV", str(self.drive_a))):
+            execute_scan(str(self.drive_a), force_rescan=True, job_id=j_scan)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hydra Media Vault</title>
+    <title>Domowe Archiwum Foto</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script>
@@ -17,19 +17,46 @@
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: #0b0f19; }
         ::-webkit-scrollbar-thumb { background: #1f2b48; border-radius: 4px; }
-        .zoomed-img { transform: scale(1.85); cursor: zoom-out !important; }
+        .pure-fullscreen-mode #lightbox-header,
+        .pure-fullscreen-mode #lightbox-footer,
+        .pure-fullscreen-mode .lightbox-nav-btn {
+            display: none !important;
+        }
+        .pure-fullscreen-mode {
+            padding: 0 !important;
+        }
+        .pure-fullscreen-mode #lightbox-stage {
+            margin: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+        }
     </style>
 </head>
 <body class="bg-darkBg text-slate-100 h-screen flex flex-col font-sans antialiased overflow-hidden">
     <header class="border-b border-borderBg bg-cardBg/95 backdrop-blur z-40 px-5 py-2.5 flex items-center justify-between flex-shrink-0">
         <div class="flex items-center space-x-3">
             <a href="/" class="flex items-center space-x-2.5">
-                <div class="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow">H</div>
-                <span class="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Hydra Photos</span>
+                <div class="w-8 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-xs text-white shadow">DAF</div>
+                <span class="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Domowe Archiwum Foto</span>
             </a>
         </div>
-        <div id="global-notification" class="text-xs px-3 py-1 rounded"></div>
+        <div id="global-notification" class="text-xs px-3 py-1 rounded max-w-2xl truncate"></div>
         <div class="flex items-center space-x-2 text-xs">
+            <button type="button"
+                    onclick="openBackupModal()"
+                    class="bg-emerald-900/80 hover:bg-emerald-800 border border-emerald-600/60 px-3 py-1.5 rounded-lg text-emerald-200 font-semibold transition">
+                🛡️ Backup i Deduplikacja (100%)
+            </button>
+            <button type="button"
+                    onclick="openTodoModal()"
+                    class="bg-amber-900/80 hover:bg-amber-800 border border-amber-600/60 px-3 py-1.5 rounded-lg text-amber-200 font-medium transition">
+                📋 Lista TODO (Offline)
+            </button>
+            <button type="button"
+                    onclick="openStatusModal()"
+                    class="bg-purple-900/80 hover:bg-purple-800 border border-purple-600/60 px-3 py-1.5 rounded-lg text-purple-200 font-medium transition">
+                ⚙️ Status i Log Operacji
+            </button>
             <button type="button"
                     onclick="openGDriveModal()"
                     class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-sky-300 font-medium transition">
@@ -39,7 +66,7 @@
     </header>
 
     <div class="flex flex-1 overflow-hidden">
-<aside id="sidebar-container"
+        <aside id="sidebar-container"
                hx-get="/media/sidebar"
                hx-trigger="refresh-all from:body"
                class="w-72 border-r border-borderBg bg-cardBg/50 p-3.5 overflow-y-auto flex-shrink-0 hidden md:block">
@@ -51,39 +78,93 @@
         </main>
     </div>
 
-    <!-- Fullscreen Gallery Lightbox -->
-    <div id="lightbox" class="hidden fixed inset-0 z-50 bg-black/95 flex flex-col justify-between p-4 select-none">
-        <div class="flex items-center justify-between px-4 py-2 bg-slate-900/70 rounded-xl backdrop-blur z-50">
-            <div id="lightbox-caption" class="text-xs text-slate-200 font-mono truncate max-w-xl"></div>
-            <div class="flex items-center space-x-3">
-                <button type="button" onclick="findSimilarFromLightbox()" class="bg-purple-800/80 hover:bg-purple-700 text-purple-100 text-xs px-3 py-1.5 rounded-lg">🔍 Pokaż podobne</button>
-<button type="button" id="tv-slideshow-btn" onclick="toggleTvSlideshow()"
-        class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition">
-    📺 Pokaz slajdów TV (Start)
-</button>
-                <button type="button" onclick="openDetailFromLightbox()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1.5 rounded-lg">ℹ️ Szczegóły EXIF / Tagi</button>
+    <!-- Fullscreen Gallery Lightbox with Rotation, Zoom/Pan, and Pure Fullscreen Ratio Mode -->
+    <div id="lightbox" class="hidden fixed inset-0 z-50 bg-black/95 flex flex-col justify-between p-3 select-none">
+        <div id="lightbox-header" class="flex flex-wrap items-center justify-between gap-2 px-4 py-2 bg-slate-900/80 rounded-xl backdrop-blur z-50">
+            <div id="lightbox-caption" class="text-xs text-slate-200 font-mono truncate max-w-md"></div>
+            <div class="flex flex-wrap items-center gap-2">
+                <button type="button" onclick="rotateCurrentLightbox(-90)" title="Obróć w lewo o 90° i zapamiętaj w bazie"
+                        class="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs px-2.5 py-1.5 rounded-lg border border-borderBg">⟲ Obróć -90°</button>
+                <button type="button" onclick="rotateCurrentLightbox(90)" title="Obróć w prawo o 90° i zapamiętaj w bazie"
+                        class="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs px-2.5 py-1.5 rounded-lg border border-borderBg">⟳ Obróć +90°</button>
+                <button type="button" onclick="adjustLightboxZoom(0.4)" title="Powiększ (możesz przesuwać myszką)"
+                        class="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs px-2.5 py-1.5 rounded-lg border border-borderBg">🔍+</button>
+                <button type="button" onclick="adjustLightboxZoom(-0.4)" title="Pomniejsz"
+                        class="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs px-2.5 py-1.5 rounded-lg border border-borderBg">🔍-</button>
+                <button type="button" onclick="resetLightboxTransform(false)" title="Resetuj powiększenie i przesunięcie"
+                        class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2 py-1.5 rounded-lg border border-borderBg">1:1</button>
+                <button type="button" onclick="enterPureFullscreen()" title="Maksymalne dopasowanie do całego ekranu z zachowaniem proporcji bez pasków (powrót ESC)"
+                        class="bg-emerald-700 hover:bg-emerald-600 text-white text-xs px-3 py-1.5 rounded-lg font-semibold">⛶ Pełny ekran (Czysty)</button>
+                <button type="button" onclick="findSimilarFromLightbox()" class="bg-purple-800/80 hover:bg-purple-700 text-purple-100 text-xs px-3 py-1.5 rounded-lg">🔍 Podobne</button>
+                <button type="button" id="tv-slideshow-btn" onclick="toggleTvSlideshow()"
+                        class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition">
+                    📺 Pokaz TV
+                </button>
+                <button type="button" onclick="openDetailFromLightbox()" class="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1.5 rounded-lg">ℹ️ Szczegóły</button>
                 <a id="lightbox-download" href="#" download class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1.5 rounded-lg">📥 Oryginał</a>
                 <button type="button" onclick="closeLightbox()" class="text-white hover:text-rose-400 text-2xl font-bold px-2">&times;</button>
             </div>
         </div>
 
-        <div class="flex-1 flex items-center justify-between overflow-hidden relative my-2">
-            <button type="button" onclick="prevLightbox()" class="text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10094;</button>
-            <div class="flex-1 h-full flex items-center justify-center overflow-hidden">
-                <img id="lightbox-img" src="" onclick="this.classList.toggle('zoomed-img')"
-                     class="hidden max-w-full max-h-[82vh] object-contain rounded shadow-2xl transition-transform duration-200 cursor-zoom-in">
+        <div id="lightbox-stage" class="flex-1 flex items-center justify-between overflow-hidden relative my-1">
+            <button type="button" onclick="prevLightbox()" class="lightbox-nav-btn text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10094;</button>
+            <div id="lightbox-viewport" class="flex-1 h-full w-full flex items-center justify-center overflow-hidden relative">
+                <img id="lightbox-img" src="" draggable="false"
+                     class="hidden max-w-full max-h-[84vh] object-contain rounded shadow-2xl cursor-grab select-none">
                 <video id="lightbox-video" controls autoplay
-                       class="hidden max-w-full max-h-[82vh] rounded shadow-2xl bg-black outline-none"></video>
+                       class="hidden max-w-full max-h-[84vh] rounded shadow-2xl bg-black outline-none"></video>
             </div>
-            <button type="button" onclick="nextLightbox()" class="text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10095;</button>
+            <button type="button" onclick="nextLightbox()" class="lightbox-nav-btn text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10095;</button>
         </div>
 
-        <div class="text-center text-[11px] text-slate-400 font-mono">
-            Nawigacja: Strzałki <strong>&larr; / &rarr;</strong> | Kliknij zdjęcie aby powiększyć (Zoom) | <strong>ESC</strong> aby zamknąć
+        <div id="lightbox-footer" class="text-center text-[11px] text-slate-400 font-mono">
+            Nawigacja: <strong>&larr; / &rarr;</strong> | Kółko myszy / klik: <strong>Zoom</strong> + przeciąganie myszą (Pan) | <strong>R</strong>: Obróć | <strong>F</strong>: Czysty pełny ekran | <strong>ESC</strong>: Powrót / Zamknij
         </div>
     </div>
 
-    <!-- Google Drive Live Archive & Folder Verification Modal -->
+    <!-- Backup & 100% Safe Deduplication Modal -->
+    <div id="backup-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+                <div>
+                    <h3 class="font-bold text-sm text-emerald-400">🛡️ Automatyczny Backup na inne urządzenie i 100% Bezpieczna Deduplikacja</h3>
+                    <p class="text-[11px] text-slate-400">Kopia zapasowa zawsze w katalogu <code>backup/</code> na innym dysku niż oryginał • Wielowarstwowa weryfikacja 100% przed usunięciem duplikatów • Obsługa par dysków w obie strony.</p>
+                </div>
+                <button type="button" onclick="document.getElementById('backup-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div id="backup-panel-body"></div>
+        </div>
+    </div>
+
+    <!-- Offline Pending Moves (Lista TODO) Modal -->
+    <div id="todo-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+                <div>
+                    <h3 class="font-bold text-sm text-amber-400">📋 Lista TODO — Oczekujące fizyczne przeniesienia plików (Tryb Offline)</h3>
+                    <p class="text-[11px] text-slate-400">Pliki zostały już przeniesione logicznie w bazie. Tutaj możesz wykonać fizyczne przeniesienia parami dysków w obie strony lub wycofać zmiany.</p>
+                </div>
+                <button type="button" onclick="document.getElementById('todo-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div id="todo-panel-body"></div>
+        </div>
+    </div>
+
+    <!-- Background Processes Status & Persistent Disk Log Modal -->
+    <div id="status-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+                <div>
+                    <h3 class="font-bold text-sm text-purple-400">⚙️ Kontrola Procesów w Tle oraz Log Operacji (data/logs/operations.log)</h3>
+                    <p class="text-[11px] text-slate-400">Zatrzymywanie, wznawianie niedokończonych procesów (AI, usuwanie, backup, skanowanie) oraz pełna historia operacji zapisana na dysku.</p>
+                </div>
+                <button type="button" onclick="document.getElementById('status-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <div id="status-panel-body"></div>
+        </div>
+    </div>
+
+    <!-- Google Drive Live Archive Modal -->
     <div id="gdrive-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
         <div class="bg-cardBg border border-borderBg rounded-2xl max-w-3xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
             <div class="flex justify-between items-center border-b border-borderBg pb-3">
@@ -105,6 +186,34 @@
         let currentLightboxIndex = 0;
         let lightboxItems = [];
         let lastCheckedCheckbox = null;
+
+        // Lightbox Transform State (Rotation, Zoom, Pan, Pure Fullscreen)
+        let lbZoom = 1.0;
+        let lbPanX = 0;
+        let lbPanY = 0;
+        let lbRotation = 0;
+        let isDraggingImg = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let isPureFullscreen = false;
+
+        function openBackupModal() {
+            document.getElementById('backup-modal').classList.remove('hidden');
+            document.getElementById('backup-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Analizowanie dysków, duplikatów i brakujących backupów...</div>";
+            htmx.ajax('GET', '/actions/backup-panel', '#backup-panel-body');
+        }
+
+        function openTodoModal() {
+            document.getElementById('todo-modal').classList.remove('hidden');
+            document.getElementById('todo-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Ładowanie listy oczekujących przeniesień (TODO)...</div>";
+            htmx.ajax('GET', '/actions/todo-panel', '#todo-panel-body');
+        }
+
+        function openStatusModal() {
+            document.getElementById('status-modal').classList.remove('hidden');
+            document.getElementById('status-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Ładowanie statusu procesów i logu operacji...</div>";
+            htmx.ajax('GET', '/actions/status-panel', '#status-panel-body');
+        }
 
         function openGDriveModal() {
             document.getElementById('gdrive-modal').classList.remove('hidden');
@@ -154,10 +263,10 @@
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.value = '';
                 });
-['anomaly_only', 'blurry_only', 'duplicates_only', 'untagged_only', 'ungrouped_only', 'trashed_only'].forEach(k => {
-    const el = form.querySelector(`[name='${k}']`);
-    if (el) el.checked = false;
-});
+                ['anomaly_only', 'blurry_only', 'duplicates_only', 'untagged_only', 'ungrouped_only', 'trashed_only', 'unbacked_only'].forEach(k => {
+                    const el = form.querySelector(`[name='${k}']`);
+                    if (el) el.checked = false;
+                });
             }
             for (const [k, v] of Object.entries(paramsObj)) {
                 if (k === '_reset') continue;
@@ -182,12 +291,108 @@
             }
         }
 
+        function applyLightboxTransform() {
+            const imgEl = document.getElementById('lightbox-img');
+            if (!imgEl) return;
+            if (isPureFullscreen) {
+                imgEl.style.maxWidth = (lbRotation % 180 !== 0) ? '100vh' : '100vw';
+                imgEl.style.maxHeight = (lbRotation % 180 !== 0) ? '100vw' : '100vh';
+                imgEl.style.width = (lbRotation % 180 !== 0) ? '100vh' : '100vw';
+                imgEl.style.height = (lbRotation % 180 !== 0) ? '100vw' : '100vh';
+            } else {
+                imgEl.style.maxWidth = '100%';
+                imgEl.style.maxHeight = '84vh';
+                imgEl.style.width = '';
+                imgEl.style.height = '';
+            }
+            imgEl.style.transform = `translate(${lbPanX}px, ${lbPanY}px) scale(${lbZoom}) rotate(${lbRotation}deg)`;
+            imgEl.style.cursor = lbZoom > 1.05 ? (isDraggingImg ? 'grabbing' : 'grab') : 'zoom-in';
+        }
+
+        function resetLightboxTransform(resetRotation = false) {
+            lbZoom = 1.0;
+            lbPanX = 0;
+            lbPanY = 0;
+            if (resetRotation) lbRotation = 0;
+            applyLightboxTransform();
+        }
+
+        function adjustLightboxZoom(delta) {
+            lbZoom = Math.min(6.0, Math.max(0.5, +(lbZoom + delta).toFixed(2)));
+            if (lbZoom <= 1.0) {
+                lbPanX = 0;
+                lbPanY = 0;
+            }
+            applyLightboxTransform();
+        }
+
+        async function rotateCurrentLightbox(deltaDeg) {
+            if (!lightboxItems.length) return;
+            const item = lightboxItems[currentLightboxIndex];
+            lbRotation = (lbRotation + deltaDeg + 360) % 360;
+            item.rotation = lbRotation;
+            applyLightboxTransform();
+
+            // Update card rotation in DOM immediately
+            const cardEl = document.querySelector(`.gallery-media-item[data-id='${item.id}']`);
+            if (cardEl) {
+                cardEl.setAttribute('data-rotation', String(lbRotation));
+                const thumbImg = cardEl.querySelector('img');
+                if (thumbImg) thumbImg.style.transform = `rotate(${lbRotation}deg)`;
+            }
+
+            // Persist in SQLite database
+            const formData = new FormData();
+            formData.append('media_id', item.id);
+            formData.append('delta', String(deltaDeg));
+            try {
+                await fetch('/actions/rotate-media', {
+                    method: 'POST',
+                    headers: { 'Accept': 'application/json' },
+                    body: formData
+                });
+            } catch (e) {
+                console.error('Rotation save error:', e);
+            }
+        }
+
+        function enterPureFullscreen() {
+            const lb = document.getElementById('lightbox');
+            const vidEl = document.getElementById('lightbox-video');
+            isPureFullscreen = true;
+            lb.classList.add('pure-fullscreen-mode');
+            vidEl.style.maxWidth = '100vw';
+            vidEl.style.maxHeight = '100vh';
+            vidEl.style.width = '100vw';
+            vidEl.style.height = '100vh';
+            applyLightboxTransform();
+            if (lb.requestFullscreen && !document.fullscreenElement) {
+                lb.requestFullscreen().catch(() => {});
+            }
+        }
+
+        function exitPureFullscreen() {
+            const lb = document.getElementById('lightbox');
+            const vidEl = document.getElementById('lightbox-video');
+            isPureFullscreen = false;
+            lb.classList.remove('pure-fullscreen-mode');
+            vidEl.style.maxWidth = '';
+            vidEl.style.maxHeight = '84vh';
+            vidEl.style.width = '';
+            vidEl.style.height = '';
+            applyLightboxTransform();
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+
         function openLightboxById(mediaId) {
             lightboxItems = Array.from(document.querySelectorAll('.gallery-media-item')).map(el => ({
                 id: el.getAttribute('data-id'),
                 rawUrl: el.getAttribute('data-raw'),
                 mediaType: el.getAttribute('data-type'),
-                title: el.getAttribute('data-title') || ''
+                title: el.getAttribute('data-title') || '',
+                rotation: parseInt(el.getAttribute('data-rotation') || '0', 10)
             }));
             currentLightboxIndex = lightboxItems.findIndex(x => x.id === mediaId);
             if (currentLightboxIndex === -1) currentLightboxIndex = 0;
@@ -201,7 +406,11 @@
             const item = lightboxItems[currentLightboxIndex];
             const imgEl = document.getElementById('lightbox-img');
             const vidEl = document.getElementById('lightbox-video');
-            imgEl.classList.remove('zoomed-img');
+
+            lbZoom = 1.0;
+            lbPanX = 0;
+            lbPanY = 0;
+            lbRotation = item.rotation || 0;
 
             vidEl.pause();
             vidEl.removeAttribute('src');
@@ -215,6 +424,7 @@
                 vidEl.classList.add('hidden');
                 imgEl.classList.remove('hidden');
                 imgEl.src = item.rawUrl;
+                applyLightboxTransform();
             }
 
             document.getElementById('lightbox-caption').textContent = `${currentLightboxIndex + 1} / ${lightboxItems.length} — ${item.title}`;
@@ -222,6 +432,9 @@
         }
 
         function closeLightbox() {
+            if (isPureFullscreen) {
+                exitPureFullscreen();
+            }
             stopTvSlideshow();
             const vidEl = document.getElementById('lightbox-video');
             if (vidEl) { vidEl.pause(); vidEl.removeAttribute('src'); }
@@ -254,14 +467,90 @@
             htmx.ajax('GET', `/media/${item.id}/detail`, '#modal-container');
         }
 
-        document.addEventListener('keydown', (e) => {
-            if (document.getElementById('lightbox').classList.contains('hidden')) return;
-            if (e.key === 'Escape') closeLightbox();
-            if (e.key === 'ArrowRight') nextLightbox();
-            if (e.key === 'ArrowLeft') prevLightbox();
+        // Mouse Zoom & Pan on Lightbox Image
+        document.addEventListener('DOMContentLoaded', () => {
+            const imgEl = document.getElementById('lightbox-img');
+            const vpEl = document.getElementById('lightbox-viewport');
+
+            if (vpEl) {
+                vpEl.addEventListener('wheel', (e) => {
+                    if (document.getElementById('lightbox').classList.contains('hidden')) return;
+                    e.preventDefault();
+                    const delta = e.deltaY < 0 ? 0.25 : -0.25;
+                    adjustLightboxZoom(delta);
+                }, { passive: false });
+            }
+
+            if (imgEl) {
+                imgEl.addEventListener('mousedown', (e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    isDraggingImg = true;
+                    dragStartX = e.clientX - lbPanX;
+                    dragStartY = e.clientY - lbPanY;
+                    imgEl.dataset.moved = 'false';
+                    applyLightboxTransform();
+                });
+
+                window.addEventListener('mousemove', (e) => {
+                    if (!isDraggingImg) return;
+                    const dx = e.clientX - dragStartX;
+                    const dy = e.clientY - dragStartY;
+                    if (Math.abs(dx - lbPanX) > 3 || Math.abs(dy - lbPanY) > 3) {
+                        imgEl.dataset.moved = 'true';
+                    }
+                    if (lbZoom > 1.01) {
+                        lbPanX = dx;
+                        lbPanY = dy;
+                        applyLightboxTransform();
+                    }
+                });
+
+                window.addEventListener('mouseup', () => {
+                    if (!isDraggingImg) return;
+                    isDraggingImg = false;
+                    if (imgEl.dataset.moved === 'false') {
+                        // Click without drag toggles zoom 1.0 <-> 2.0
+                        if (lbZoom > 1.05) {
+                            resetLightboxTransform(false);
+                        } else {
+                            lbZoom = 2.0;
+                            applyLightboxTransform();
+                        }
+                    } else {
+                        applyLightboxTransform();
+                    }
+                });
+            }
         });
 
-let tvSlideshowTimer = null;
+        document.addEventListener('keydown', (e) => {
+            if (document.getElementById('lightbox').classList.contains('hidden')) return;
+            if (e.key === 'Escape') {
+                if (isPureFullscreen) {
+                    exitPureFullscreen();
+                } else {
+                    closeLightbox();
+                }
+            }
+            if (e.key === 'ArrowRight') nextLightbox();
+            if (e.key === 'ArrowLeft') prevLightbox();
+            if (e.key === 'r' || e.key === 'R') rotateCurrentLightbox(90);
+            if (e.key === 'f' || e.key === 'F') {
+                if (isPureFullscreen) exitPureFullscreen();
+                else enterPureFullscreen();
+            }
+        });
+
+        document.addEventListener('fullscreenchange', () => {
+            if (!document.fullscreenElement && isPureFullscreen) {
+                isPureFullscreen = false;
+                document.getElementById('lightbox').classList.remove('pure-fullscreen-mode');
+                applyLightboxTransform();
+            }
+        });
+
+        let tvSlideshowTimer = null;
         let isTvSlideshowActive = false;
 
         function toggleTvSlideshow() {
@@ -270,7 +559,7 @@ let tvSlideshowTimer = null;
 
             if (!isTvSlideshowActive) {
                 isTvSlideshowActive = true;
-                btn.textContent = "⏹️ Zatrzymaj pokaz TV";
+                btn.textContent = "⏹️ Zatrzymaj TV";
                 btn.classList.replace('bg-amber-600', 'bg-rose-600');
                 if (lb.requestFullscreen) {
                     lb.requestFullscreen().catch(() => {});
@@ -289,7 +578,6 @@ let tvSlideshowTimer = null;
             const vidEl = document.getElementById('lightbox-video');
 
             if (currentItem.mediaType === 'video') {
-                // Dla wideo czekamy az film dobiegnie do konca i przechodzimy dalej
                 vidEl.onended = () => {
                     if (isTvSlideshowActive) {
                         nextLightbox();
@@ -297,7 +585,6 @@ let tvSlideshowTimer = null;
                     }
                 };
             } else {
-                // Dla zdjec przechodzimy dalej co 5 sekund
                 tvSlideshowTimer = setTimeout(() => {
                     if (isTvSlideshowActive) {
                         nextLightbox();
@@ -312,10 +599,10 @@ let tvSlideshowTimer = null;
             clearTimeout(tvSlideshowTimer);
             const btn = document.getElementById('tv-slideshow-btn');
             if (btn) {
-                btn.textContent = "📺 Pokaz slajdów TV (Start)";
+                btn.textContent = "📺 Pokaz TV";
                 btn.classList.replace('bg-rose-600', 'bg-amber-600');
             }
-            if (document.fullscreenElement) {
+            if (document.fullscreenElement && !isPureFullscreen) {
                 document.exitFullscreen().catch(() => {});
             }
         }

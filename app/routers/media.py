@@ -1,18 +1,22 @@
 from collections import defaultdict
-import json
+import io
+import logging
 from pathlib import Path
 import shutil
+import subprocess
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import desc, asc, select, or_, func, extract
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import desc, asc, select, or_, func, extract, and_
+from sqlalchemy.orm import Session, joinedload, aliased
 
 from app.database import get_db, THUMBNAILS_DIR
-from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding
+from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, PendingFileMove
+from app.operation_log import ProcessManager
 from app.storage_ops import StorageAutomationService
 
+logger = logging.getLogger("MediaRouter")
 router = APIRouter(prefix="/media", tags=["Media"])
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -33,13 +37,39 @@ def to_bool(val: Optional[str]) -> bool:
     return str(val).lower() in ("true", "1", "yes", "on")
 
 
-def render_template(request: Request, name: str, context: dict = None):
+def render_template(request: Request, name: str, context: Optional[dict] = None):
     ctx = context or {}
     ctx["request"] = request
     try:
         return templates.TemplateResponse(request=request, name=name, context=ctx)
     except TypeError:
         return templates.TemplateResponse(name, ctx)
+
+
+def get_unbacked_primary_ids_subquery():
+    """Returns a SQL subquery of primary MediaItem IDs that have no backup copy on a different device."""
+    bkp_alias = aliased(MediaItem)
+    backed_hashes = (
+        select(MediaItem.file_hash)
+        .join(
+            bkp_alias,
+            and_(
+                bkp_alias.file_hash == MediaItem.file_hash,
+                bkp_alias.volume_id != MediaItem.volume_id,
+                bkp_alias.is_backup_copy == True,
+                bkp_alias.is_trashed == False,
+            ),
+        )
+        .where(MediaItem.is_trashed == False, MediaItem.is_primary_duplicate == True)
+    )
+    return (
+        select(MediaItem.id)
+        .where(
+            MediaItem.is_trashed == False,
+            MediaItem.is_primary_duplicate == True,
+            ~MediaItem.file_hash.in_(backed_hashes),
+        )
+    )
 
 
 def apply_media_filters(
@@ -58,6 +88,7 @@ def apply_media_filters(
     untagged_only: bool = False,
     ungrouped_only: bool = False,
     trashed_only: bool = False,
+    unbacked_only: bool = False,
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
@@ -94,6 +125,8 @@ def apply_media_filters(
             .having(func.count(MediaItem.id) > 1)
         )
         stmt = stmt.where(MediaItem.file_hash.in_(dup_hashes_subq))
+    if unbacked_only:
+        stmt = stmt.where(MediaItem.id.in_(get_unbacked_primary_ids_subquery()))
     if q and q.strip():
         clean_q = q.strip()
         stmt = stmt.outerjoin(MediaItem.tags).where(
@@ -106,11 +139,29 @@ def apply_media_filters(
     return stmt
 
 
+def build_flat_album_choices(groups: List[MediaGroup]) -> List[dict]:
+    """Builds a list of albums with their full hierarchical path for select dropdowns."""
+    by_id = {g.id: g for g in groups}
+    result = []
+    for g in groups:
+        parts = []
+        curr = g
+        depth = 0
+        while curr and depth < 10:
+            parts.append(curr.name)
+            curr = by_id.get(curr.parent_id) if curr.parent_id else None
+            depth += 1
+        full_label = " / ".join(reversed(parts))
+        result.append({"id": g.id, "name": g.name, "full_label": full_label, "parent_id": g.parent_id})
+    result.sort(key=lambda x: x["full_label"].lower())
+    return result
+
+
 def build_sidebar_context(db: Session) -> dict:
-    volumes = db.scalars(select(WindowsVolume)).all()
+    svc = StorageAutomationService(db)
+    volumes = svc.refresh_volumes_online_status()
     vol_space = {}
     for v in volumes:
-        v.is_online = Path(v.last_known_drive_letter).exists()
         if v.is_online:
             try:
                 u = shutil.disk_usage(v.last_known_drive_letter)
@@ -119,7 +170,8 @@ def build_sidebar_context(db: Session) -> dict:
                     "total_gb": u.total / (1024 ** 3),
                     "used_pct": int((u.used / u.total) * 100) if u.total else 0,
                 }
-            except Exception:
+            except Exception as exc:
+                logger.debug("disk_usage warning for %s: %s", v.last_known_drive_letter, exc)
                 vol_space[v.id] = None
         else:
             vol_space[v.id] = None
@@ -132,8 +184,8 @@ def build_sidebar_context(db: Session) -> dict:
         ).all()
     )
 
-    groups = db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all()
-    trashed_groups = db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all()
+    groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
+    trashed_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all())
 
     direct_counts = dict(
         db.execute(
@@ -179,6 +231,9 @@ def build_sidebar_context(db: Session) -> dict:
     total_blurry = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_blurry == True)) or 0
     total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
     total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id))) or 0
+    total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
+    total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
+    jobs_summary = ProcessManager.get_jobs_summary(db)
 
     return {
         "volumes": volumes,
@@ -186,6 +241,7 @@ def build_sidebar_context(db: Session) -> dict:
         "vol_counts": vol_counts,
         "group_tree": build_tree(None, 0),
         "all_groups": groups,
+        "flat_album_choices": build_flat_album_choices(groups),
         "trashed_groups": trashed_groups,
         "top_tags": top_tags,
         "years": [(int(y), c) for y, c in years if y is not None],
@@ -195,6 +251,9 @@ def build_sidebar_context(db: Session) -> dict:
         "total_blurry": total_blurry,
         "total_trashed": total_trashed,
         "total_vectors": total_vectors,
+        "total_unbacked": total_unbacked,
+        "total_pending_moves": total_pending_moves,
+        "jobs_summary": jobs_summary,
     }
 
 
@@ -213,6 +272,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     untagged_only = to_bool(qp.get("untagged_only"))
     ungrouped_only = to_bool(qp.get("ungrouped_only"))
     trashed_only = to_bool(qp.get("trashed_only"))
+    unbacked_only = to_bool(qp.get("unbacked_only"))
     sort_by = qp.get("sort_by", "date_desc")
     view_mode = qp.get("view_mode", "grid")
     page_int = max(1, to_int(qp.get("page")) or 1)
@@ -221,7 +281,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     base_stmt = select(MediaItem)
     filtered_stmt = apply_media_filters(
         base_stmt, db, q, media_type, vol_id_int, folder_prefix, grp_id_int, tag, yr_int,
-        anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only
+        anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only
     ).distinct()
 
     count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
@@ -237,7 +297,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     )
 
     if duplicates_only:
-        stmt = stmt.order_by(asc(MediaItem.file_hash), desc(MediaItem.is_primary_duplicate), asc(MediaItem.effective_date))
+        stmt = stmt.order_by(asc(MediaItem.file_hash), desc(MediaItem.is_primary_duplicate), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
     elif sort_by == "date_asc":
         stmt = stmt.order_by(asc(MediaItem.effective_date))
     elif sort_by == "size_desc":
@@ -252,7 +312,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         stmt = stmt.order_by(desc(MediaItem.effective_date))
 
     offset = (page_int - 1) * page_size_int
-    items = db.scalars(stmt.offset(offset).limit(page_size_int)).unique().all()
+    items = list(db.scalars(stmt.offset(offset).limit(page_size_int)).unique().all())
     total_pages = max(1, (total_matching + page_size_int - 1) // page_size_int)
 
     grouped = defaultdict(list)
@@ -265,9 +325,11 @@ def build_search_context(request: Request, db: Session) -> dict:
             grouped[day_str].append(it)
 
     active_group = db.get(MediaGroup, grp_id_int) if grp_id_int else None
-    all_groups = db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all()
-    trashed_groups = db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all()
-    all_volumes = db.scalars(select(WindowsVolume)).all()
+    active_volume = db.get(WindowsVolume, vol_id_int) if vol_id_int else None
+    all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
+    trashed_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all())
+    all_volumes = list(db.scalars(select(WindowsVolume)).all())
+    total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
 
     subfolders = []
     if vol_id_int and not trashed_only:
@@ -280,6 +342,8 @@ def build_search_context(request: Request, db: Session) -> dict:
             if parent_str != ".":
                 top_part = parent_str.split("/")[0]
                 folder_counts[top_part] += 1
+            else:
+                folder_counts["."] += 1
         subfolders = sorted(folder_counts.items(), key=lambda x: x[1], reverse=True)[:25]
 
     return {
@@ -293,15 +357,20 @@ def build_search_context(request: Request, db: Session) -> dict:
         "view_mode": view_mode,
         "sort_by": sort_by,
         "active_group": active_group,
+        "active_volume": active_volume,
         "active_tag": tag,
         "active_volume_id": vol_id_int,
         "active_folder": folder_prefix,
         "trashed_only": trashed_only,
         "duplicates_only": duplicates_only,
+        "anomaly_only": anomaly_only,
+        "unbacked_only": unbacked_only,
         "trashed_groups": trashed_groups,
         "subfolders": subfolders,
         "all_groups": all_groups,
+        "flat_album_choices": build_flat_album_choices(all_groups),
         "all_volumes": all_volumes,
+        "total_pending_moves": total_pending_moves,
         "similarity_scores": {},
     }
 
@@ -321,8 +390,8 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("pillow_heif not available: %s", exc)
 
     p = THUMBNAILS_DIR / filename
     if not p.exists() or p.stat().st_size < 100:
@@ -339,8 +408,8 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
                         it.height = h
                         it.is_corrupted = False
                         db.commit()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Lazy thumbnail regeneration failed: %s", exc)
 
     if not p.exists():
         raise HTTPException(status_code=404)
@@ -349,15 +418,12 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
 
 @router.get("/{media_id}/raw")
 def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
-    import io
-    import subprocess
-    from fastapi.responses import StreamingResponse
     from PIL import Image, ImageOps
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("pillow_heif not available: %s", exc)
 
     it = db.scalars(select(MediaItem).options(joinedload(MediaItem.volume)).where(MediaItem.id == media_id)).unique().first()
     if not it:
@@ -368,7 +434,7 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
         if full_path.exists() and full_path.is_file():
             ext = full_path.suffix.lower()
 
-            # 1. Konwersja obrazow HEIC/HEIF/TIFF w locie do JPEG
+            # 1. On-the-fly conversion of HEIC/HEIF/TIFF images to JPEG
             if ext in (".heic", ".heif", ".tiff", ".tif"):
                 try:
                     with Image.open(full_path) as img:
@@ -379,10 +445,10 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
                         img.save(buf, format="JPEG", quality=90)
                         buf.seek(0)
                         return StreamingResponse(buf, media_type="image/jpeg")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("On-the-fly JPEG conversion failed: %s", exc)
 
-            # 2. Transkodowanie wideo .MOV / .MKV / .AVI / .WMV do H.264 MP4 (obraz + dzwiek w przegladarce)
+            # 2. On-the-fly transcoding of .MOV / .MKV / .AVI / .WMV to browser-playable H.264 MP4
             if ext in (".mov", ".mkv", ".avi", ".wmv", ".mts", ".m2ts", ".flv", ".3gp"):
                 cached_mp4 = THUMBNAILS_DIR / f"{it.id}_stream.mp4"
                 if not cached_mp4.exists() or cached_mp4.stat().st_size < 1000:
@@ -399,8 +465,8 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
                             str(cached_mp4.resolve()),
                         ]
                         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Video transcoding skipped: %s", exc)
                 if cached_mp4.exists() and cached_mp4.stat().st_size > 1000:
                     return FileResponse(cached_mp4, media_type="video/mp4", filename=f"{full_path.stem}.mp4")
 
@@ -428,17 +494,22 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
     if not it:
         raise HTTPException(status_code=404)
 
-    all_groups = db.scalars(select(MediaGroup).order_by(MediaGroup.name.asc())).all()
+    all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
     duplicate_copies = list(
         db.scalars(
             select(MediaItem)
             .options(joinedload(MediaItem.volume), joinedload(MediaItem.group))
             .where(MediaItem.file_hash == it.file_hash, MediaItem.is_trashed == False)
-            .order_by(desc(MediaItem.is_primary_duplicate), asc(MediaItem.effective_date))
+            .order_by(desc(MediaItem.is_primary_duplicate), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
         ).unique().all()
     )
     return render_template(
         request,
         "partials/modal_detail.html",
-        {"item": it, "all_groups": all_groups, "duplicate_copies": duplicate_copies},
+        {
+            "item": it,
+            "all_groups": all_groups,
+            "flat_album_choices": build_flat_album_choices(all_groups),
+            "duplicate_copies": duplicate_copies,
+        },
     )

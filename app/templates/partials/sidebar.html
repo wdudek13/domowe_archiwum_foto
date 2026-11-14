@@ -1,14 +1,21 @@
 {% macro render_group_nodes(nodes) %}
     {% for node in nodes %}
     <div class="pl-{{ node.depth * 3 }} py-0.5">
-        <button onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
-                class="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
-            <span class="truncate flex items-center space-x-1.5">
+        <div class="flex items-center justify-between px-2 py-1 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
+            <button type="button"
+                    onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
+                    class="truncate flex items-center space-x-1.5 flex-1 text-left">
                 <span class="text-amber-400">📁</span>
                 <span class="truncate">{{ node.group.name }}</span>
-            </span>
-            <span class="text-[10px] font-mono bg-slate-900 px-1.5 py-0.5 rounded text-slate-400 group-hover:text-indigo-300">{{ node.total_count }}</span>
-        </button>
+            </button>
+            <div class="flex items-center space-x-1">
+                <button type="button"
+                        title="Zmień nazwę albumu"
+                        onclick="const n = prompt('Podaj nową nazwę dla albumu {{ node.group.name }}:', '{{ node.group.name }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/group-manage', {values: {action: 'rename', target_group_id: '{{ node.group.id }}', new_name: n.trim()}, target: '#global-notification'});"
+                        class="opacity-0 group-hover:opacity-100 text-[10px] text-slate-400 hover:text-indigo-300 px-0.5">✏️</button>
+                <span class="text-[10px] font-mono bg-slate-900 px-1.5 py-0.5 rounded text-slate-400 group-hover:text-indigo-300">{{ node.total_count }}</span>
+            </div>
+        </div>
         {% if node.children %}
             {{ render_group_nodes(node.children) }}
         {% endif %}
@@ -25,7 +32,11 @@
                 <span class="font-mono text-[10px] text-slate-400">{{ total_all }}</span>
             </button>
             <button onclick="applySidebarFilter({_reset: true, ungrouped_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-slate-300">
-                <span>📂 Nieprzypisane do grup</span>
+                <span>📂 Nieprzypisane do albumów</span>
+            </button>
+            <button onclick="applySidebarFilter({_reset: true, unbacked_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-emerald-300">
+                <span>🛡️ Brak backupu na innym dysku</span>
+                <span class="font-mono text-[10px]">{{ total_unbacked or 0 }}</span>
             </button>
             <button onclick="applySidebarFilter({_reset: true, anomaly_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-amber-300">
                 <span>⚠️ Anomalie daty</span>
@@ -39,15 +50,30 @@
                 <span>🔍 Rozmyte / Nieostre</span>
                 <span class="font-mono text-[10px]">{{ total_blurry }}</span>
             </button>
-<button type="button" onclick="applySidebarFilter({_reset: true, trashed_only: true})"
+            <button type="button" onclick="openTodoModal()"
+                    class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-amber-950/60 text-amber-300 font-semibold border border-amber-800/40 mt-1">
+                <span>📋 Lista TODO Przeniesień</span>
+                <span class="font-mono text-[10px] bg-amber-950 px-1.5 py-0.5 rounded">{{ total_pending_moves or 0 }}</span>
+            </button>
+            <button type="button" onclick="applySidebarFilter({_reset: true, trashed_only: true})"
                     class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 font-semibold border border-rose-900/40 mt-1">
                 <span>🗑️ Kosz (Usunięte)</span>
                 <span class="font-mono text-[10px] bg-rose-950 px-1.5 py-0.5 rounded">{{ total_trashed }}</span>
             </button>
 
+            {% if jobs_summary and (jobs_summary.has_running or jobs_summary.has_unfinished) %}
+            <button type="button" onclick="openStatusModal()"
+                    class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg bg-purple-950/50 hover:bg-purple-900/60 text-purple-200 font-semibold border border-purple-700/60 mt-1">
+                <span>⚡ Procesy w tle / Wstrzymane</span>
+                <span class="font-mono text-[10px] bg-purple-900 px-1.5 py-0.5 rounded">
+                    {{ (jobs_summary.running_jobs|length) + (jobs_summary.unfinished_jobs|length) }}
+                </span>
+            </button>
+            {% endif %}
+
             {% if trashed_groups %}
             <div class="mt-2 p-2 rounded-lg bg-rose-950/20 border border-rose-900/40 space-y-1">
-                <div class="text-[10px] font-bold text-rose-300 uppercase">Grupy w Koszu:</div>
+                <div class="text-[10px] font-bold text-rose-300 uppercase">Albumy w Koszu:</div>
                 {% for tg in trashed_groups %}
                 <div class="flex items-center justify-between text-[11px] text-slate-300 py-0.5">
                     <span class="truncate">📁 {{ tg.name }}</span>
@@ -69,30 +95,23 @@
         </div>
     </div>
 
-    <div class="p-2.5 rounded-xl bg-indigo-950/30 border border-indigo-800/50 space-y-2">
+    <div class="p-2.5 rounded-xl bg-indigo-950/30 border border-indigo-800/50 space-y-1.5">
         <div class="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">1-Klik Auto-Organizacja</div>
-        <div class="grid grid-cols-1 gap-1.5">
-            <button hx-post="/actions/auto-group" hx-vals='{"mode": "folder", "scope": "filtered"}' hx-include="#filter-form" hx-target="#global-notification"
-                    class="w-full text-left px-2.5 py-1.5 rounded bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/30 text-indigo-200 text-[11px] transition">
-                🌳 Utwórz drzewo wg Katalogów z dysku
-            </button>
-            <button hx-post="/actions/auto-group" hx-vals='{"mode": "date", "scope": "filtered"}' hx-include="#filter-form" hx-target="#global-notification"
-                    class="w-full text-left px-2.5 py-1.5 rounded bg-purple-600/20 hover:bg-purple-600/40 border border-purple-500/30 text-purple-200 text-[11px] transition">
-                📅 Utwórz drzewo wg Daty (Rok -> Miesiąc)
-            </button>
-        </div>
+        <p class="text-[10px] text-slate-400 leading-relaxed">
+            Dostępna po wybraniu konkretnego <strong>urządzenia (dysku)</strong> poniżej oraz <strong>katalogu fizycznego</strong> na pasku nad galerią.
+        </p>
     </div>
 
     <div>
         <div class="flex items-center justify-between mb-1.5">
-            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Drzewo Grup / Albumów</span>
+            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Drzewo Albumów</span>
             <button onclick="document.getElementById('group-modal').classList.remove('hidden')" class="text-indigo-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800">+</button>
         </div>
         <div class="max-h-60 overflow-y-auto pr-1 space-y-0.5">
             {% if group_tree %}
                 {{ render_group_nodes(group_tree) }}
             {% else %}
-                <div class="text-[11px] text-slate-500 italic px-2 py-1">Brak grup.</div>
+                <div class="text-[11px] text-slate-500 italic px-2 py-1">Brak albumów.</div>
             {% endif %}
         </div>
     </div>
@@ -129,13 +148,13 @@
                                 title="Nadaj krótką nazwę dysku"
                                 onclick="const n = prompt('Podaj krótką nazwę dla dysku {{ v.last_known_drive_letter }}:', '{{ v.volume_label }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/rename-volume', {values: {volume_id: '{{ v.id }}', new_label: n.trim()}, target: '#global-notification'});"
                                 class="text-[10px] text-slate-400 hover:text-indigo-300 px-1">✏️</button>
-<button type="button"
-        title="Wyindeksuj cały ten dysk z bazy (pliki na dysku pozostaną)"
-        hx-post="/actions/unindex"
-        hx-vals='{"unindex_volume_id": "{{ v.id }}"}'
-        hx-confirm="Wyindeksować cały dysk {{ v.volume_label }} z bazy? Pliki na dysku pozostaną nienaruszone."
-        hx-target="#global-notification"
-        class="text-[10px] text-slate-500 hover:text-rose-400 px-1">✖️</button>
+                        <button type="button"
+                                title="Wyindeksuj cały ten dysk z bazy (pliki na dysku pozostaną)"
+                                hx-post="/actions/unindex"
+                                hx-vals='{"unindex_volume_id": "{{ v.id }}"}'
+                                hx-confirm="Wyindeksować cały dysk {{ v.volume_label }} z bazy? Pliki na dysku pozostaną nienaruszone."
+                                hx-target="#global-notification"
+                                class="text-[10px] text-slate-500 hover:text-rose-400 px-1">✖️</button>
                         <span class="font-mono text-[10px] bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">{{ vol_counts.get(v.id, 0) }}</span>
                     </div>
                 </div>

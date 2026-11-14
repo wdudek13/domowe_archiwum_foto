@@ -1,5 +1,5 @@
 @echo off
-title Hydra Media Vault
+title Domowe Archiwum Foto
 cd /d "%~dp0"
 
 if not exist "venv\Scripts\activate.bat" (
@@ -9,6 +9,6 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 call venv\Scripts\activate.bat
-echo Starting Hydra Media Vault on http://127.0.0.1:8000 ...
+echo Starting Domowe Archiwum Foto on http://127.0.0.1:8000 ...
 uvicorn main:app --reload --port 8000
 pause

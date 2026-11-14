@@ -3,22 +3,24 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
-from typing import List
-from app.database import DB_PATH, BACKUP_DIR
+from typing import List, Optional
+import app.database as db_module
 
 logger = logging.getLogger("BackupManager")
 
 
 class BackupManager:
+    """Manages online transactional SQLite backups with integrity verification and rotation."""
+
     def __init__(
         self,
-        db_path: Path = DB_PATH,
-        backup_dir: Path = BACKUP_DIR,
+        db_path: Optional[Path] = None,
+        backup_dir: Optional[Path] = None,
         max_retained_backups: int = 5,
-        max_retained: int = None,
+        max_retained: Optional[int] = None,
     ):
-        self.db_path = Path(db_path)
-        self.backup_dir = Path(backup_dir)
+        self.db_path = Path(db_path if db_path is not None else db_module.DB_PATH)
+        self.backup_dir = Path(backup_dir if backup_dir is not None else db_module.BACKUP_DIR)
         self.max_retained_backups = max_retained if max_retained is not None else max_retained_backups
         self.max_retained = self.max_retained_backups
 
@@ -40,6 +42,7 @@ class BackupManager:
         if not self.db_path.exists():
             return self.db_path
 
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.check_integrity()
         timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         dest_path = self.backup_dir / f"media_vault_{tag}_{timestamp}.db"
@@ -63,8 +66,8 @@ class BackupManager:
             reverse=True,
         )
         if len(backups) > self.max_retained_backups:
-            for b in backups[self.max_retained_backups:]:
+            for old_backup in backups[self.max_retained_backups:]:
                 try:
-                    b.unlink()
-                except OSError:
-                    pass
+                    old_backup.unlink()
+                except OSError as exc:
+                    logger.debug("Could not remove rotated backup %s: %s", old_backup, exc)

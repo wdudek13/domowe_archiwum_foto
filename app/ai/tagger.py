@@ -27,6 +27,8 @@ PL_CATEGORY_MAPPING = {
 
 
 class OnDemandObjectTagger:
+    """Loads ONNX MobileNetV2 and OpenCV Haar Cascade strictly on demand and frees memory upon exit."""
+
     def __init__(self):
         self.model_path = DATA_DIR / "models" / "mobilenetv2.onnx"
         self.labels_path = DATA_DIR / "models" / "imagenet_classes.json"
@@ -39,14 +41,16 @@ class OnDemandObjectTagger:
             try:
                 with open(self.labels_path, "r", encoding="utf-8") as f:
                     self.labels = json.load(f)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Could not load ImageNet labels: %s", exc)
                 self.labels = None
 
         try:
             cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
             if Path(cascade_path).exists():
                 self.face_cascade = cv2.CascadeClassifier(cascade_path)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Could not load Haar cascade: %s", exc)
             self.face_cascade = None
 
         if self.model_path.exists() and self.model_path.stat().st_size > 1_000_000:
@@ -202,8 +206,8 @@ class OnDemandObjectTagger:
                 elif len(faces) > 1:
                     tags.append(("osoba / twarz", 0.95))
                     tags.append(("grupa osob", 0.91))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Face detection warning: %s", exc)
 
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         mean_h, mean_s, mean_v = cv2.mean(hsv)[:3]
@@ -265,10 +269,8 @@ class OnDemandObjectTagger:
                     for i in top_idx:
                         idx = int(i)
                         p = float(probs[idx])
-                        # Add Polish category based on exact ImageNet ID ranges
                         for pl_tag, pl_conf in self._classify_imagenet_index(idx, p):
                             results.append((pl_tag, pl_conf))
-                        # Only add raw English ImageNet class name if confidence >= 35%
                         if p >= 0.35:
                             en_lbl = self._get_label_by_index(idx)
                             results.append((en_lbl, round(p, 3)))

@@ -71,9 +71,9 @@ class OnDemandClipEmbedder:
         valid_ids = []
         rows = []
         for cid, blob in candidates:
-            v = np.frombuffer(blob, dtype=np.float32)
-            if len(v) != q_dim:
+            if not blob or len(blob) != q_dim * 4:
                 continue
+            v = np.frombuffer(blob, dtype=np.float32)
             valid_ids.append(cid)
             rows.append(v)
 

@@ -4,13 +4,19 @@
         <div class="flex flex-wrap items-center gap-2">
             <span class="text-slate-400">Aktywny zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong> plików ({{ "%.1f"|format(total_size_mb) }} MB)</span>
             {% if active_group %}
-                <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Grupa: {{ active_group.name }} (ID: {{ active_group.id }})</span>
+                <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Album: {{ active_group.name }} (ID: {{ active_group.id }})</span>
+            {% endif %}
+            {% if active_volume %}
+                <span class="bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">💾 Urządzenie: {{ active_volume.volume_label }} ({{ active_volume.last_known_drive_letter }})</span>
             {% endif %}
             {% if active_tag %}
                 <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Tag: {{ active_tag }}</span>
             {% endif %}
             {% if active_folder %}
-                <span class="bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">📂 Folder: {{ active_folder }}</span>
+                <span class="bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">📂 Katalog: {{ active_folder }}</span>
+            {% endif %}
+            {% if unbacked_only %}
+                <span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">🛡️ Pliki bez backupu na innym urządzeniu</span>
             {% endif %}
         </div>
 
@@ -23,12 +29,55 @@
         {% endif %}
     </div>
 
+    <!-- Pasek narzędzi Anomalii Daty (Requirement 4a Multimedia) -->
+    {% if anomaly_only %}
+    <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div>
+            <div class="font-bold text-amber-300 text-sm">⚠️ Lista zdjęć z nieprawidłową datą / anomalią EXIF ({{ total_matching }} szt.)</div>
+            <div class="text-slate-300 text-[11px]">Możesz ustawić nową datę dla wybranych zdjęć (co usunie je z tej listy) lub usunąć zdjęcia z tej listy na życzenie bez zmiany daty.</div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+            <form hx-post="/actions/change-date"
+                  hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                  hx-target="#global-notification"
+                  class="flex items-center space-x-1.5">
+                <input type="text" name="new_date" placeholder="RRRR-MM-DD GG:MM" required
+                       class="bg-slate-900 border border-borderBg rounded-lg px-2.5 py-1.5 text-white font-mono w-40">
+                <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg font-semibold">
+                    📅 Ustaw nową datę i usuń z listy
+                </button>
+            </form>
+            <button type="button"
+                    hx-post="/actions/clear-date-anomaly"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold">
+                ✓ Usuń z listy anomalii BEZ zmiany daty
+            </button>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Pasek narzędzi Backupu (Requirement 1a-1h) -->
+    {% if unbacked_only %}
+    <div class="bg-emerald-950/30 border border-emerald-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div>
+            <div class="font-bold text-emerald-300 text-sm">🛡️ Wykryto {{ total_matching }} plików bez kopii zapasowej (backupu) na innym urządzeniu</div>
+            <div class="text-slate-300 text-[11px]">Kopia zapasowa zostanie zapisana w katalogu <code>backup/</code> na innym dysku niż oryginał, ze sprawdzaniem wolnego miejsca i 100% weryfikacją.</div>
+        </div>
+        <button type="button" onclick="openBackupModal()"
+                class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
+            🛡️ Otwórz Panel Automatycznego Backupu i Deduplikacji
+        </button>
+    </div>
+    {% endif %}
+
     <!-- Pasek narzędzi Kosza -->
     {% if trashed_only %}
     <div class="bg-rose-950/40 border border-rose-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
             <div class="font-bold text-rose-300 text-sm">🗑️ Widok Kosza (data/kosz)</div>
-            <div class="text-slate-400 text-[11px]">Każdy plik pamięta swój pierwotny dysk, ścieżkę macierzystą oraz grupę.</div>
+            <div class="text-slate-400 text-[11px]">Każdy plik pamięta swój pierwotny dysk, ścieżkę macierzystą oraz album.</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
             <button type="button"
@@ -62,20 +111,25 @@
     {% if duplicates_only %}
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
-            <div class="font-bold text-amber-300 text-sm">👥 Porównywanie Duplikatów Binarnych (Zgrupowane parami wg SHA-256)</div>
-            <div class="text-slate-300 text-[11px]">Zielony znacznik <strong>ORYGINAŁ</strong> oznacza pierwszą (najstarszą) kopię, a czerwony <strong>DUPLIKAT</strong> – kolejne identyczne kopie na dyskach.</div>
+            <div class="font-bold text-amber-300 text-sm">👥 Porównywanie Duplikatów Binarnych (Zgrupowane wg SHA-256)</div>
+            <div class="text-slate-300 text-[11px]">Zielony znacznik <strong>ORYGINAŁ</strong> wskazuje główną kopię (preferowaną na dysku z duplikatem do albumu <em>Ważne</em>), niebieski <strong>BACKUP</strong> to kopia w kartotece <code>backup/</code>, a czerwony <strong>DUPLIKAT</strong> to kopia nadmiarowa.</div>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    onclick="openBackupModal()"
+                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
+                🛡️ Automatyczny Backup i 100% Bezpieczne Usunięcie Duplikatów
+            </button>
             <button type="button"
                     onclick="document.querySelectorAll('input[data-is-dup=\'true\']').forEach(cb => cb.checked = true); document.querySelectorAll('input[data-is-dup=\'false\']').forEach(cb => cb.checked = false); updateSelectionState();"
                     class="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
-                ☑️ Zaznacz tylko nadmiarowe kopie (zostaw po 1 oryginale)
+                ☑️ Zaznacz tylko nadmiarowe kopie
             </button>
         </div>
     </div>
     {% endif %}
 
-<!-- Pasek przełączania 6 trybów podobieństwa -->
+    <!-- Pasek przełączania 6 trybów podobieństwa -->
     {% if similarity_target_id and similarity_modes %}
     <div class="bg-purple-950/30 border border-purple-700/60 p-3.5 rounded-xl space-y-2.5 text-xs">
         <div class="flex flex-wrap items-center justify-between gap-2">
@@ -100,30 +154,96 @@
     </div>
     {% endif %}
 
-    <!-- Pasek zarządzania aktywną grupą -->
+    <!-- Pasek zarządzania aktywnym albumem (Requirement 2a, 2b2, 2f, 2g, 4a) -->
     {% if active_group %}
-    <div class="bg-indigo-950/30 border border-indigo-700/50 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div class="font-bold text-indigo-300 text-sm">Zarządzanie grupą: {{ active_group.name }}</div>
-        <div class="flex flex-wrap items-center gap-2">
+    <div class="bg-indigo-950/30 border border-indigo-700/50 p-3.5 rounded-xl space-y-3 text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-indigo-800/40 pb-2">
+            <div class="font-bold text-indigo-300 text-sm">📁 Zarządzanie albumem: {{ active_group.name }}</div>
+            <div class="flex flex-wrap items-center gap-2">
+                <!-- Szybkie usunięcie samego albumu (zdjęcia do swobodnej puli - Req 2f) -->
+                <form hx-post="/actions/group-manage" hx-target="#global-notification">
+                    <input type="hidden" name="action" value="delete">
+                    <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
+                    <button type="submit" class="bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-700/60 px-2.5 py-1 rounded font-medium">
+                        ⚡ Usuń sam album (zdjęcia do swobodnej puli)
+                    </button>
+                </form>
+                <form hx-post="/actions/move-to-trash"
+                      hx-confirm="Czy na pewno przenieść cały album '{{ active_group.name }}' WRAZ ZE ZDJĘCIAMI do katalogu data/kosz?"
+                      hx-target="#global-notification">
+                    <input type="hidden" name="trash_group_id" value="{{ active_group.id }}">
+                    <button type="submit" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-medium">
+                        🗑️ Album + zdjęcia do Kosza
+                    </button>
+                </form>
+                <form hx-post="/actions/delete-permanently"
+                      hx-confirm="UWAGA! Czy na pewno TRWALE usunąć fizycznie z dysku wszystkie zdjęcia z albumu '{{ active_group.name }}'? Operacja jest nieodwracalna!"
+                      hx-target="#global-notification">
+                    <input type="hidden" name="delete_group_id" value="{{ active_group.id }}">
+                    <button type="submit" class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-2.5 py-1 rounded font-semibold">
+                        🔥 Usuń z dysku
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-3">
+            <!-- Zmiana nazwy albumu (Req 2b2) -->
+            <form hx-post="/actions/group-manage" hx-target="#global-notification" class="flex items-center space-x-1">
+                <input type="hidden" name="action" value="rename">
+                <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
+                <input type="text" name="new_name" value="{{ active_group.name }}" placeholder="Nowa nazwa albumu..." required class="bg-slate-900 border border-borderBg rounded px-2 py-1 w-36 text-white">
+                <button type="submit" class="bg-indigo-700 hover:bg-indigo-600 text-white px-2.5 py-1 rounded">✏️ Zmień nazwę</button>
+            </form>
+
+            <!-- Dodanie podalbumu -->
             <form hx-post="/actions/group-manage" hx-target="#global-notification" class="flex items-center space-x-1">
                 <input type="hidden" name="action" value="create_sub">
                 <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
-                <input type="text" name="new_name" placeholder="Nowa podgrupa..." required class="bg-slate-900 border border-borderBg rounded px-2 py-1 w-32">
-                <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-2.5 py-1 rounded">+ Podgrupa</button>
+                <input type="text" name="new_name" placeholder="Nowy podalbum..." required class="bg-slate-900 border border-borderBg rounded px-2 py-1 w-32">
+                <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-2.5 py-1 rounded">+ Podalbum</button>
             </form>
+
+            <!-- Przerzucenie wszystkich zdjęć z albumu do innego albumu z usunięciem obecnego (Req 2g) -->
+            <form hx-post="/actions/group-manage" hx-target="#global-notification" class="flex items-center space-x-1">
+                <input type="hidden" name="action" value="transfer_and_delete">
+                <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
+                <select name="destination_group_id" required class="bg-slate-900 border border-borderBg rounded px-2 py-1">
+                    <option value="">-- Przerzuć zdjęcia do albumu... --</option>
+                    {% for ch in flat_album_choices %}
+                        {% if ch.id != active_group.id %}
+                        <option value="{{ ch.id }}">📁 {{ ch.full_label }}</option>
+                        {% endif %}
+                    {% endfor %}
+                </select>
+                <button type="submit" class="bg-purple-700 hover:bg-purple-600 text-white px-2.5 py-1 rounded font-medium">
+                    ➡️ Przerzuć zdjęcia i usuń ten album
+                </button>
+            </form>
+
+            <!-- Przeniesienie w drzewie albumów -->
             <form hx-post="/actions/group-manage" hx-target="#global-notification" class="flex items-center space-x-1">
                 <input type="hidden" name="action" value="reparent">
                 <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
                 <select name="new_parent_id" class="bg-slate-900 border border-borderBg rounded px-2 py-1">
                     <option value="0">-- Poziom główny (Root) --</option>
-                    {% for g in all_groups %}
-                        {% if g.id != active_group.id %}
-                        <option value="{{ g.id }}" {% if active_group.parent_id == g.id %}selected{% endif %}>Przenieś pod: {{ g.name }}</option>
+                    {% for ch in flat_album_choices %}
+                        {% if ch.id != active_group.id %}
+                        <option value="{{ ch.id }}" {% if active_group.parent_id == ch.id %}selected{% endif %}>Pod: {{ ch.full_label }}</option>
                         {% endif %}
                     {% endfor %}
                 </select>
                 <button type="submit" class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-2.5 py-1 rounded">Przenieś w drzewie</button>
             </form>
+
+            <!-- Zmiana daty dla całego albumu (Req 4a) -->
+            <form hx-post="/actions/change-date" hx-target="#global-notification" class="flex items-center space-x-1">
+                <input type="hidden" name="album_id" value="{{ active_group.id }}">
+                <input type="text" name="new_date" placeholder="Nowa data RRRR-MM-DD" required class="bg-slate-900 border border-borderBg rounded px-2 py-1 w-36 font-mono">
+                <button type="submit" class="bg-amber-700 hover:bg-amber-600 text-white px-2.5 py-1 rounded">📅 Zmień datę albumu</button>
+            </form>
+
+            <!-- Konsolidacja na wybrany dysk -->
             <form hx-post="/actions/consolidate" hx-target="#global-notification" class="flex items-center space-x-1">
                 <input type="hidden" name="group_id" value="{{ active_group.id }}">
                 <select name="target_volume_id" class="bg-slate-900 border border-borderBg rounded px-2 py-1">
@@ -131,42 +251,46 @@
                     <option value="{{ v.id }}">Dysk: {{ v.volume_label }} ({{ v.last_known_drive_letter }})</option>
                     {% endfor %}
                 </select>
-                <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded font-medium">Fizycznie przenieś na dysk</button>
-            </form>
-            <form hx-post="/actions/group-manage" hx-target="#global-notification">
-                <input type="hidden" name="action" value="delete">
-                <input type="hidden" name="target_group_id" value="{{ active_group.id }}">
-                <button type="submit" class="bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-800/60 px-2.5 py-1 rounded">Odepnij grupę</button>
-            </form>
-            <form hx-post="/actions/move-to-trash"
-                  hx-confirm="Czy na pewno przenieść całą grupę '{{ active_group.name }}' WRAZ ZE ZDJĘCIAMI do katalogu data/kosz?"
-                  hx-target="#global-notification">
-                <input type="hidden" name="trash_group_id" value="{{ active_group.id }}">
-                <button type="submit" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-medium">
-                    🗑️ Grupa + zdjęcia do Kosza
-                </button>
-            </form>
-<form hx-post="/actions/delete-permanently"
-                  hx-confirm="UWAGA! Czy na pewno TRWALE usunąć fizycznie z dysku wszystkie zdjęcia z grupy '{{ active_group.name }}'? Operacja jest nieodwracalna!"
-                  hx-target="#global-notification">
-                <input type="hidden" name="delete_group_id" value="{{ active_group.id }}">
-                <button type="submit" class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-2.5 py-1 rounded font-semibold">
-                    🔥 Usuń z dysku
-                </button>
+                <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded font-medium">Przenieś na dysk</button>
             </form>
         </div>
     </div>
     {% endif %}
 
-    <!-- Katalogi fizyczne na wybranym dysku -->
-    {% if subfolders %}
-    <div class="bg-cardBg/50 border border-borderBg p-3 rounded-xl space-y-1.5">
-        <div class="text-[10px] font-bold text-slate-400 uppercase">Katalogi fizyczne na dysku:</div>
+    <!-- Katalogi fizyczne na wybranym dysku + 1-Klik Auto-Organizacja (Requirement 2e) -->
+    {% if active_volume_id and subfolders %}
+    <div class="bg-cardBg/50 border border-borderBg p-3 rounded-xl space-y-2.5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="text-[10px] font-bold text-slate-400 uppercase">
+                📂 Wybierz katalog fizyczny na urządzeniu {{ active_volume.volume_label if active_volume else '' }}:
+            </div>
+            {% if active_volume_id and active_folder %}
+            <div class="flex items-center space-x-2 bg-indigo-950/60 border border-indigo-600/60 px-3 py-1 rounded-lg text-xs">
+                <span class="font-bold text-indigo-300">⚡ 1-Klik Auto-Organizacja ({{ active_folder }}):</span>
+                <button type="button"
+                        hx-post="/actions/auto-group"
+                        hx-vals='{"mode": "folder", "scope": "filtered"}'
+                        hx-include="#filter-form"
+                        hx-target="#global-notification"
+                        class="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-semibold transition">
+                    🌳 Utwórz drzewo wg Katalogów
+                </button>
+                <button type="button"
+                        hx-post="/actions/auto-group"
+                        hx-vals='{"mode": "date", "scope": "filtered"}'
+                        hx-include="#filter-form"
+                        hx-target="#global-notification"
+                        class="px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-semibold transition">
+                    📅 Utwórz drzewo wg Daty (Rok -> Miesiąc)
+                </button>
+            </div>
+            {% endif %}
+        </div>
         <div class="flex flex-wrap gap-1.5">
-            <button type="button" onclick="applySidebarFilter({folder_prefix: ''})" class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300">Wszystkie</button>
+            <button type="button" onclick="applySidebarFilter({folder_prefix: ''})" class="px-2 py-1 rounded bg-slate-800 text-xs text-slate-300">Wszystkie katalogi</button>
             {% for fname, fcnt in subfolders %}
-            <button type="button" onclick="applySidebarFilter({folder_prefix: '{{ fname }}/'})"
-                    class="px-2.5 py-1 rounded bg-slate-900 hover:bg-indigo-950 border border-borderBg text-xs text-amber-300 font-mono">
+            <button type="button" onclick="applySidebarFilter({folder_prefix: '{{ fname if fname == '.' else fname ~ '/' }}'})"
+                    class="px-2.5 py-1 rounded {% if active_folder == (fname if fname == '.' else fname ~ '/') %}bg-indigo-700 text-white border-indigo-400{% else %}bg-slate-900 hover:bg-indigo-950 text-amber-300 border-borderBg{% endif %} border text-xs font-mono">
                 📂 {{ fname }} ({{ fcnt }})
             </button>
             {% endfor %}
@@ -185,7 +309,7 @@
                     <th class="p-2">Nazwa pliku</th>
                     <th class="p-2">Ścieżka na dysku</th>
                     <th class="p-2">Nośnik USB</th>
-                    <th class="p-2">Grupa</th>
+                    <th class="p-2">Album</th>
                     <th class="p-2">Data efektywna</th>
                     <th class="p-2">Rozmiar</th>
                     <th class="p-2">Status / Duplikat / Akcje</th>
@@ -197,6 +321,7 @@
                     data-id="{{ item.id }}"
                     data-raw="/media/{{ item.id }}/raw"
                     data-type="{{ item.media_type }}"
+                    data-rotation="{{ item.rotation_angle or 0 }}"
                     data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
                     <td class="p-2">
                         <input type="checkbox" name="selected_ids" value="{{ item.id }}"
@@ -207,6 +332,7 @@
                         <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                              onclick="openLightboxById('{{ item.id }}')"
                              alt="{{ item.file_name }}"
+                             style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                              class="w-10 h-10 object-cover rounded cursor-pointer border border-borderBg">
                     </td>
                     <td class="p-2 font-medium text-slate-200 cursor-pointer hover:text-indigo-400"
@@ -223,14 +349,24 @@
                     <td class="p-2 font-mono text-[11px]">{{ item.effective_date.strftime('%Y-%m-%d %H:%M') }}</td>
                     <td class="p-2 font-mono text-[11px]">{{ "%.2f"|format(item.file_size_bytes / (1024*1024)) }} MB</td>
                     <td class="p-2 space-x-1">
-                        {% if duplicates_only and item.is_primary_duplicate %}
+                        {% if item.is_backup_copy %}
+                            <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded text-[10px]">BACKUP</span>
+                        {% elif duplicates_only and item.is_primary_duplicate %}
                             <span class="bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded text-[10px]">ORYGINAŁ</span>
                         {% elif not item.is_primary_duplicate %}
                             <span onclick="htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                                   class="bg-rose-700 hover:bg-rose-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px] cursor-pointer">DUPLIKAT (Porównaj)</span>
                         {% endif %}
                         {% if item.embedding %}<span class="bg-purple-900/90 text-purple-200 px-1 rounded text-[9px] font-mono">512D</span>{% endif %}
-                        {% if item.has_date_anomaly %}<span class="bg-amber-500 text-black font-bold px-1 rounded text-[10px]" title="{{ item.date_anomaly_reason }}">! Data</span>{% endif %}
+                        {% if item.has_date_anomaly %}
+                            <span class="bg-amber-500 text-black font-bold px-1 rounded text-[10px]" title="{{ item.date_anomaly_reason }}">! Data</span>
+                            <button type="button"
+                                    hx-post="/actions/clear-date-anomaly"
+                                    hx-vals='{"media_id": "{{ item.id }}"}'
+                                    hx-target="#global-notification"
+                                    title="Usuń z listy nieprawidłowych dat bez zmiany daty"
+                                    class="text-[10px] bg-emerald-900 hover:bg-emerald-700 text-emerald-200 px-1 py-0.5 rounded">✓ OK</button>
+                        {% endif %}
                         <button type="button" hx-get="/semantic/similar/{{ item.id }}" hx-target="#media-grid" class="text-[10px] bg-slate-800 hover:bg-purple-900 text-purple-300 px-1.5 py-0.5 rounded">🔍 Podobne</button>
                         <button type="button"
                                 hx-post="/actions/move-to-trash"
@@ -254,12 +390,15 @@
              data-id="{{ item.id }}"
              data-raw="/media/{{ item.id }}/raw"
              data-type="{{ item.media_type }}"
+             data-rotation="{{ item.rotation_angle or 0 }}"
              data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
             <input type="checkbox" name="selected_ids" value="{{ item.id }}"
                    data-is-dup="{{ 'false' if item.is_primary_duplicate else 'true' }}"
                    onclick="handleCheckboxClick(event, this)"
                    class="absolute top-1.5 left-1.5 z-20 rounded bg-slate-900/90 border-borderBg text-indigo-600 w-3.5 h-3.5 cursor-pointer">
-            {% if not item.is_primary_duplicate %}
+            {% if item.is_backup_copy %}
+            <span class="absolute top-1 right-1 z-20 bg-sky-700 text-white text-[8px] font-bold px-1 rounded">BKP</span>
+            {% elif not item.is_primary_duplicate %}
             <span onclick="event.stopPropagation(); htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                   class="absolute top-1 right-1 z-20 bg-rose-700 text-white text-[8px] font-bold px-1 rounded cursor-pointer">DUP</span>
             {% elif item.embedding %}
@@ -267,6 +406,7 @@
             {% endif %}
             <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                  alt="{{ item.file_name }}" loading="lazy"
+                 style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                  onclick="openLightboxById('{{ item.id }}')"
                  class="w-full h-full object-cover cursor-pointer group-hover:scale-105 transition">
             {% if item.media_type == 'video' %}
@@ -289,16 +429,17 @@
                     <span class="text-xs text-slate-500 font-mono">({{ items|length }})</span>
                 </div>
                 <button type="button" onclick="toggleDaySelection('{{ day }}')" class="text-[11px] text-slate-400 hover:text-indigo-400 font-medium">
-                    Zaznacz grupę / dzień
+                    Zaznacz dzień / klaster
                 </button>
             </div>
 
             <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-3">
                 {% for item in items %}
-                <div class="gallery-media-item group relative bg-cardBg rounded-xl border {% if duplicates_only and item.is_primary_duplicate %}border-emerald-600/80{% elif not item.is_primary_duplicate %}border-rose-700/80{% else %}border-borderBg{% endif %} overflow-hidden shadow hover:border-indigo-500/70 flex flex-col"
+                <div class="gallery-media-item group relative bg-cardBg rounded-xl border {% if duplicates_only and item.is_primary_duplicate %}border-emerald-600/80{% elif item.is_backup_copy %}border-sky-600/80{% elif not item.is_primary_duplicate %}border-rose-700/80{% else %}border-borderBg{% endif %} overflow-hidden shadow hover:border-indigo-500/70 flex flex-col"
                      data-id="{{ item.id }}"
                      data-raw="/media/{{ item.id }}/raw"
                      data-type="{{ item.media_type }}"
+                     data-rotation="{{ item.rotation_angle or 0 }}"
                      data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
 
                     <div class="absolute top-2 left-2 z-20">
@@ -315,12 +456,16 @@
                         {% if item.embedding %}
                             <span title="Wektor 512-D aktywny" class="bg-purple-900/90 text-purple-200 border border-purple-600/50 text-[9px] px-1 py-0.5 rounded font-mono">512D</span>
                         {% endif %}
-                        <span class="bg-black/75 text-[9px] px-1.5 py-0.5 rounded font-mono text-slate-300">{{ item.volume.last_known_drive_letter }}</span>
+                        <span class="bg-black/75 text-[9px] px-1.5 py-0.5 rounded font-mono {% if item.volume.is_online %}text-emerald-300{% else %}text-rose-300{% endif %}"
+                              title="{{ item.volume.volume_label }} ({% if item.volume.is_online %}Online{% else %}Offline{% endif %})">
+                            {{ item.volume.last_known_drive_letter }}
+                        </span>
                     </div>
 
                     <div class="aspect-square bg-slate-900 overflow-hidden cursor-pointer relative" onclick="openLightboxById('{{ item.id }}')">
                         <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                              alt="{{ item.file_name }}" loading="lazy"
+                             style="transform: rotate({{ item.rotation_angle or 0 }}deg)"
                              class="w-full h-full object-cover transition duration-200 group-hover:scale-105">
 
                         {% if item.media_type == 'video' %}
@@ -336,7 +481,9 @@
                             {% if item.has_date_anomaly %}
                                 <span title="{{ item.date_anomaly_reason }}" class="bg-amber-500 text-slate-950 font-bold px-1 rounded">!</span>
                             {% endif %}
-                            {% if duplicates_only and item.is_primary_duplicate %}
+                            {% if item.is_backup_copy %}
+                                <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded">BACKUP</span>
+                            {% elif duplicates_only and item.is_primary_duplicate %}
                                 <span class="bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded">ORYGINAŁ</span>
                             {% elif not item.is_primary_duplicate %}
                                 <span onclick="event.stopPropagation(); htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
@@ -360,6 +507,10 @@
                                 🔍 Podobne
                             </button>
                         </div>
+
+                        {% if item.group %}
+                        <div class="text-[9px] text-indigo-300 truncate">📁 {{ item.group.name }}</div>
+                        {% endif %}
 
                         {% if item.tags %}
                         <div class="flex flex-wrap gap-1">

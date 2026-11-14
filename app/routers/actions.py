@@ -1,38 +1,38 @@
 from concurrent.futures import ThreadPoolExecutor
+import datetime
+import json
 import logging
 import os
 from pathlib import Path
+import shutil
+import threading
 import traceback
-from typing import List, Optional
-from fastapi import APIRouter, Depends, Form, Request, UploadFile, File
-from fastapi.responses import HTMLResponse
-from sqlalchemy import select, delete
+from typing import List, Optional, Tuple
+from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import select, delete, update
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
 from app.database import get_db, SessionLocal, THUMBNAILS_DIR, DATA_DIR
-from app.models import WindowsVolume, MediaItem, MediaGroup, MediaTag, MediaEmbedding
+from app.models import (
+    WindowsVolume,
+    MediaItem,
+    MediaGroup,
+    MediaTag,
+    MediaEmbedding,
+    BackgroundJob,
+)
+from app.operation_log import OperationLogger, ProcessManager
 from app.scanner import WindowsVolumeInspector, FileScannerService, ThumbnailService, IMAGE_EXTS, VIDEO_EXTS
 from app.storage_ops import StorageAutomationService
 from app.ai.quality import MediaQualityAnalyzer
 from app.ai.tagger import OnDemandObjectTagger
 from app.ai.embeddings import OnDemandClipEmbedder
-from app.routers.media import apply_media_filters, to_int
+from app.routers.media import apply_media_filters, to_int, render_template
 
 logger = logging.getLogger("ActionsRouter")
 router = APIRouter(prefix="/actions", tags=["Actions"])
-
-
-def get_best_readable_path(item: MediaItem, vol: Optional[WindowsVolume]) -> Optional[Path]:
-    """Returns physical file path on USB if online, otherwise falls back to cached WebP thumbnail."""
-    if vol:
-        full_p = Path(vol.last_known_drive_letter) / item.relative_path
-        if full_p.exists() and full_p.stat().st_size > 0:
-            return full_p
-    thumb_p = THUMBNAILS_DIR / item.thumbnail_relative_path
-    if thumb_p.exists() and thumb_p.stat().st_size > 0:
-        return thumb_p
-    return None
 
 
 def resolve_target_items(
@@ -51,22 +51,41 @@ def resolve_target_items(
     duplicates_only: bool = False,
     untagged_only: bool = False,
     ungrouped_only: bool = False,
+    unbacked_only: bool = False,
     limit: Optional[int] = None,
 ) -> List[MediaItem]:
     if scope == "selected" and selected_ids:
         stmt = select(MediaItem).where(MediaItem.id.in_(selected_ids))
+    elif scope == "all_drives":
+        stmt = select(MediaItem).where(MediaItem.is_trashed == False)
+    elif scope.startswith("volume:"):
+        vid = to_int(scope.split(":", 1)[1])
+        stmt = select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.volume_id == vid)
     else:
         stmt = apply_media_filters(
-            select(MediaItem), db, q, media_type, to_int(volume_id), folder_prefix,
-            to_int(group_id), tag, to_int(year),
-            anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only
+            select(MediaItem),
+            db,
+            q,
+            media_type,
+            to_int(volume_id),
+            folder_prefix,
+            to_int(group_id),
+            tag,
+            to_int(year),
+            anomaly_only,
+            blurry_only,
+            duplicates_only,
+            untagged_only,
+            ungrouped_only,
+            False,
+            unbacked_only,
         ).distinct()
     if limit:
         stmt = stmt.limit(limit)
     return list(db.scalars(stmt).unique().all())
 
 
-def execute_scan(path_str: str, force_rescan: bool = False) -> dict:
+def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int] = None) -> dict:
     clean = path_str.strip(' \t\n\r"\'')
     if len(clean) == 2 and clean[1] == ":":
         clean += "\\"
@@ -128,30 +147,73 @@ def execute_scan(path_str: str, force_rescan: bool = False) -> dict:
                             try:
                                 ThumbnailService.generate(full, item_id, ext in IMAGE_EXTS)
                                 repaired_thumbs += 1
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logger.debug("Thumbnail repair failed for %s: %s", full, exc)
                     else:
                         if rel in existing_map and force_rescan:
                             db.execute(delete(MediaItem).where(MediaItem.id == existing_map[rel][0]))
                         candidates_to_add.append((full, rel))
+
+            own_job = False
+            if job_id is None and candidates_to_add:
+                job_id = ProcessManager.create_job(
+                    job_type="scan",
+                    title=f"Skanowanie dysku {label} ({clean})",
+                    item_ids=[c[1] for c in candidates_to_add],
+                    params={"path": clean, "force_rescan": force_rescan},
+                    db=db,
+                )
+                own_job = True
 
             def _worker(args):
                 f_path, r_path = args
                 return FileScannerService.process_file(f_path, vol, rel_override=r_path)
 
             indexed = 0
+            stopped_early = False
             if candidates_to_add:
                 with ThreadPoolExecutor(max_workers=min(4, (os.cpu_count() or 2))) as pool:
-                    for item in pool.map(_worker, candidates_to_add):
+                    for idx, item in enumerate(pool.map(_worker, candidates_to_add)):
+                        if job_id and ProcessManager.is_stop_requested(job_id):
+                            stopped_early = True
+                            remaining_paths = [c[1] for c in candidates_to_add[idx:]]
+                            ProcessManager.update_progress(
+                                job_id,
+                                remaining_ids=remaining_paths,
+                                status="STOPPED",
+                                message=f"Wstrzymano skanowanie po zindeksowaniu {indexed} plików.",
+                                db=db,
+                            )
+                            db.commit()
+                            break
                         if item:
                             db.add(item)
                             indexed += 1
                             if indexed % 50 == 0:
                                 db.commit()
+                                if job_id:
+                                    ProcessManager.update_progress(job_id, processed_delta=50, db=db)
+                                    db.commit()
                 db.commit()
 
             svc = StorageAutomationService(db)
             dup_total = svc.flag_duplicate_clusters()
+
+            if job_id and not stopped_early:
+                ProcessManager.finish_job(
+                    job_id,
+                    status="COMPLETED",
+                    message=f"Zindeksowano {indexed} nowych plików z wolumenu {label} ({vsn}).",
+                    db=db,
+                )
+                db.commit()
+            elif own_job and not candidates_to_add:
+                OperationLogger.log(
+                    "SCAN",
+                    f"Skanowanie {label} ({vsn}): znaleziono {found_total}, nowych: 0, już w bazie: {already_in_db}",
+                    status="OK",
+                    db=db,
+                )
 
             return {
                 "status": "ok",
@@ -167,6 +229,8 @@ def execute_scan(path_str: str, force_rescan: bool = False) -> dict:
     except Exception as e:
         err = traceback.format_exc()
         logger.error("Scan error:\n%s", err)
+        if job_id:
+            ProcessManager.finish_job(job_id, status="FAILED", message=str(e))
         return {"status": "error", "message": f"Błąd skanera: {str(e)}"}
 
 
@@ -192,11 +256,11 @@ def trigger_scan(path: str = Form(...), force_rescan: bool = Form(False)):
     )
 
 
-import threading
-
 AI_BATCH_STATE = {
     "running": False,
     "stop_requested": False,
+    "job_id": None,
+    "analysis_type": "all",
     "processed": 0,
     "total": 0,
     "tagged": 0,
@@ -205,85 +269,122 @@ AI_BATCH_STATE = {
 }
 
 
-def _run_background_ai_batch(item_ids: List[str]):
+def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: str = "all"):
     AI_BATCH_STATE["running"] = True
     AI_BATCH_STATE["stop_requested"] = False
+    AI_BATCH_STATE["job_id"] = job_id
+    AI_BATCH_STATE["analysis_type"] = analysis_type
     AI_BATCH_STATE["processed"] = 0
     AI_BATCH_STATE["total"] = len(item_ids)
     AI_BATCH_STATE["tagged"] = 0
     AI_BATCH_STATE["vectors"] = 0
     AI_BATCH_STATE["blurry"] = 0
 
+    run_tags = analysis_type in ("all", "tags")
+    run_vectors = analysis_type in ("all", "vectors")
+    run_quality = analysis_type in ("all", "quality")
+
+    stopped_midway = False
+    tagger = OnDemandObjectTagger() if run_tags else None
     try:
-        with OnDemandObjectTagger() as tagger:
-            chunk_size = 50
-            for start in range(0, len(item_ids), chunk_size):
-                if AI_BATCH_STATE["stop_requested"]:
+        if tagger is not None:
+            tagger.open_session()
+
+        chunk_size = 50
+        for start in range(0, len(item_ids), chunk_size):
+            if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
+                stopped_midway = True
+                remaining = item_ids[start:]
+                ProcessManager.update_progress(
+                    job_id,
+                    remaining_ids=remaining,
+                    status="STOPPED",
+                    message=f"Zatrzymano analizę AI ({analysis_type}) na {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']}.",
+                )
+                break
+
+            batch_ids = item_ids[start : start + chunk_size]
+
+            with SessionLocal() as db:
+                rows = db.execute(
+                    select(
+                        MediaItem.id,
+                        MediaItem.media_type,
+                        MediaItem.thumbnail_relative_path,
+                        MediaItem.relative_path,
+                        WindowsVolume.last_known_drive_letter,
+                    )
+                    .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
+                    .where(MediaItem.id.in_(batch_ids))
+                ).all()
+
+            computed_batch = []
+            for idx_in_batch, (mid, mtype, thumb_rel, rel_p, drive_let) in enumerate(rows):
+                if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
+                    stopped_midway = True
+                    remaining = item_ids[start + idx_in_batch :]
+                    ProcessManager.update_progress(
+                        job_id,
+                        remaining_ids=remaining,
+                        status="STOPPED",
+                        message=f"Zatrzymano analizę AI ({analysis_type}) na {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']}.",
+                    )
                     break
-                batch_ids = item_ids[start : start + chunk_size]
 
-                # KROK A: Szybki odczyt ścieżek z bazy (transakcja zamknięta natychmiast)
-                with SessionLocal() as db:
-                    rows = db.execute(
-                        select(
-                            MediaItem.id,
-                            MediaItem.media_type,
-                            MediaItem.thumbnail_relative_path,
-                            MediaItem.relative_path,
-                            WindowsVolume.last_known_drive_letter,
-                        )
-                        .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
-                        .where(MediaItem.id.in_(batch_ids))
-                    ).all()
+                thumb_p = THUMBNAILS_DIR / thumb_rel
+                src_p = Path(drive_let) / rel_p
+                readable_path = (
+                    thumb_p
+                    if (thumb_p.exists() and thumb_p.stat().st_size > 100)
+                    else (src_p if src_p.exists() else None)
+                )
 
-                # KROK B: Ciężkie obliczenia CPU (ONNX + OpenCV) w RAM BEZ blokowania bazy SQLite!
-                computed_batch = []
-                for mid, mtype, thumb_rel, rel_p, drive_let in rows:
-                    if AI_BATCH_STATE["stop_requested"]:
-                        break
-                    thumb_p = THUMBNAILS_DIR / thumb_rel
-                    src_p = Path(drive_let) / rel_p
-                    readable_path = thumb_p if (thumb_p.exists() and thumb_p.stat().st_size > 100) else (src_p if src_p.exists() else None)
+                if not readable_path:
+                    AI_BATCH_STATE["processed"] += 1
+                    continue
 
-                    if not readable_path:
-                        AI_BATCH_STATE["processed"] += 1
-                        continue
-
+                tags = []
+                if run_tags and tagger is not None:
                     tags = tagger.tag_image(readable_path)
                     if mtype == "video":
                         tags.append(("wideo", 1.0))
 
-                    vec_blob = None
+                vec_blob = None
+                if run_vectors:
                     try:
                         vec_blob = OnDemandClipEmbedder.generate_image_embedding(readable_path)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Vector embedding skipped for %s: %s", mid, exc)
 
+                corrupted, blurry, score = False, False, None
+                if run_quality:
                     corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(readable_path)
-                    computed_batch.append((mid, tags, vec_blob, corrupted, blurry, score))
-                    AI_BATCH_STATE["processed"] += 1
 
-                # KROK C: Błyskawiczny zapis wyników do SQLite (<10 ms blokady)
-                if computed_batch:
-                    with SessionLocal() as db:
-                        for mid, tags, vec_blob, corrupted, blurry, score in computed_batch:
+                computed_batch.append((mid, tags, vec_blob, corrupted, blurry, score))
+                AI_BATCH_STATE["processed"] += 1
+
+            if computed_batch:
+                with SessionLocal() as db:
+                    for mid, tags, vec_blob, corrupted, blurry, score in computed_batch:
+                        if run_tags:
                             db.execute(delete(MediaTag).where(MediaTag.media_id == mid))
                             for t_name, conf in tags:
                                 db.add(MediaTag(media_id=mid, tag=t_name, confidence=conf, source_model="opencv+onnx"))
                             if tags:
                                 AI_BATCH_STATE["tagged"] += 1
 
-                            if vec_blob is not None:
-                                db.merge(
-                                    MediaEmbedding(
-                                        media_id=mid,
-                                        model_name=OnDemandClipEmbedder.MODEL_NAME,
-                                        dimensions=512,
-                                        vector=vec_blob,
-                                    )
+                        if run_vectors and vec_blob is not None:
+                            db.merge(
+                                MediaEmbedding(
+                                    media_id=mid,
+                                    model_name=OnDemandClipEmbedder.MODEL_NAME,
+                                    dimensions=512,
+                                    vector=vec_blob,
                                 )
-                                AI_BATCH_STATE["vectors"] += 1
+                            )
+                            AI_BATCH_STATE["vectors"] += 1
 
+                        if run_quality:
                             it_obj = db.get(MediaItem, mid)
                             if it_obj:
                                 it_obj.is_corrupted = corrupted
@@ -291,9 +392,35 @@ def _run_background_ai_batch(item_ids: List[str]):
                                 it_obj.blur_score = score
                                 if blurry:
                                     AI_BATCH_STATE["blurry"] += 1
-                        db.commit()
+                    db.commit()
+
+                ProcessManager.update_progress(
+                    job_id,
+                    processed_delta=len(computed_batch),
+                    remaining_ids=item_ids[start + len(computed_batch) :],
+                    message=f"Przetworzono {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} (Tagi: {AI_BATCH_STATE['tagged']}, Wektory: {AI_BATCH_STATE['vectors']}, Rozmyte: {AI_BATCH_STATE['blurry']})",
+                )
+    except Exception as exc:
+        logger.error("AI batch failure: %s", exc)
+        ProcessManager.finish_job(job_id, status="FAILED", message=f"Błąd analizy AI: {exc}")
+        stopped_midway = True
     finally:
+        if tagger is not None:
+            tagger.close_session()
+            del tagger
+        import gc
+        gc.collect()
         AI_BATCH_STATE["running"] = False
+        if not stopped_midway:
+            ProcessManager.finish_job(
+                job_id,
+                status="COMPLETED",
+                message=(
+                    f"Zakończono analizę AI ({analysis_type}): {AI_BATCH_STATE['processed']}/{AI_BATCH_STATE['total']} | "
+                    f"Otagowano: {AI_BATCH_STATE['tagged']} | Wektory: {AI_BATCH_STATE['vectors']} | Rozmyte: {AI_BATCH_STATE['blurry']}"
+                ),
+            )
+
 
 @router.get("/ai-status")
 def get_ai_batch_status():
@@ -302,14 +429,21 @@ def get_ai_batch_status():
         pct = int((st["processed"] / st["total"]) * 100) if st["total"] else 0
         return HTMLResponse(
             f"<div hx-get='/actions/ai-status' hx-trigger='every 1.5s' hx-swap='outerHTML' class='flex items-center space-x-3 text-xs'>"
-            f"<span class='text-purple-300 font-semibold animate-pulse'>⚡ Przetwarzanie AI w tle: {st['processed']} / {st['total']} ({pct}%)</span>"
+            f"<span class='text-purple-300 font-semibold animate-pulse'>⚡ Przetwarzanie AI ({st['analysis_type']}) w tle: {st['processed']} / {st['total']} ({pct}%)</span>"
             f"<span class='text-slate-400 font-mono'>[Tagi: {st['tagged']} | Wektory: {st['vectors']} | Rozmyte: {st['blurry']}]</span>"
             f"<button hx-post='/actions/ai-stop' hx-target='#global-notification' class='bg-rose-800 hover:bg-rose-700 text-white px-2 py-0.5 rounded text-[10px]'>⏹️ Zatrzymaj</button>"
             f"</div>"
         )
+    if st["stop_requested"]:
+        return HTMLResponse(
+            f"<span class='text-amber-400 text-xs font-semibold'>"
+            f"⏹️ Proces AI zatrzymany na {st['processed']} / {st['total']}. Możesz go wznowić w panelu 'Status i Procesy'."
+            f"</span>",
+            headers={"HX-Trigger": "refresh-all"},
+        )
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>"
-        f"✓ Masowe AI zakończone! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Nowe wektory 512-D: {st['vectors']}"
+        f"✓ Analiza AI ({st['analysis_type']}) zakończona! Przetworzono: {st['processed']} / {st['total']} | Otagowano: {st['tagged']} | Wektory 512-D: {st['vectors']} | Rozmyte: {st['blurry']}"
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -318,11 +452,14 @@ def get_ai_batch_status():
 @router.post("/ai-stop")
 def stop_ai_batch():
     AI_BATCH_STATE["stop_requested"] = True
-    return HTMLResponse("<span class='text-amber-400 text-xs font-semibold'>⏹️ Zatrzymywanie procesu AI po bieżącej paczce...</span>")
+    ProcessManager.request_stop(AI_BATCH_STATE.get("job_id"))
+    return HTMLResponse("<span class='text-amber-400 text-xs font-semibold'>⏹️ Zatrzymywanie procesu w tle...</span>")
 
 
 @router.post("/analyze-all")
 def trigger_full_ai_analysis(
+    analysis_type: str = Form("all"),
+    target_drive_scope: str = Form("current"),
     scope: str = Form("filtered"),
     selected_ids: List[str] = Form(default=[]),
     q: Optional[str] = Form(None),
@@ -335,22 +472,307 @@ def trigger_full_ai_analysis(
     anomaly_only: bool = Form(False),
     blurry_only: bool = Form(False),
     duplicates_only: bool = Form(False),
+    run_sync: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     if AI_BATCH_STATE["running"]:
         return get_ai_batch_status()
 
+    effective_scope = target_drive_scope if target_drive_scope in ("all_drives",) or target_drive_scope.startswith("volume:") else scope
     items = resolve_target_items(
-        db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
-        group_id, tag, year, anomaly_only, blurry_only, duplicates_only, limit=None
+        db,
+        effective_scope,
+        selected_ids,
+        q,
+        media_type,
+        volume_id,
+        folder_prefix,
+        group_id,
+        tag,
+        year,
+        anomaly_only,
+        blurry_only,
+        duplicates_only,
+        limit=None,
     )
     if not items:
-        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w wybranym zakresie.</span>")
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w wybranym zakresie do analizy AI.</span>")
 
+    type_labels = {
+        "all": "Pełna analiza AI (Tagi + Wektory 512-D + Ostrość)",
+        "tags": "Tagowanie obiektów i scen AI",
+        "vectors": "Generowanie wektorów podobieństwa 512-D",
+        "quality": "Analiza ostrości (Blur) i integralności",
+    }
     item_ids = [it.id for it in items]
-    t = threading.Thread(target=_run_background_ai_batch, args=(item_ids,), daemon=True)
-    t.start()
+    job_id = ProcessManager.create_job(
+        job_type="ai_analysis",
+        title=f"{type_labels.get(analysis_type, 'Analiza AI')} ({len(item_ids)} szt.)",
+        item_ids=item_ids,
+        params={"analysis_type": analysis_type, "scope": effective_scope},
+        db=db,
+    )
+
+    if run_sync:
+        _run_background_ai_batch(job_id, item_ids, analysis_type=analysis_type)
+        return get_ai_batch_status()
+
+    ProcessManager.start_background_thread(job_id, _run_background_ai_batch, item_ids, analysis_type=analysis_type)
     return get_ai_batch_status()
+
+
+@router.get("/status-panel")
+def get_status_and_logs_panel(request: Request, db: Session = Depends(get_db)):
+    summary = ProcessManager.get_jobs_summary(db)
+    logs = OperationLogger.get_recent_logs(db, limit=100)
+    volumes = list(db.scalars(select(WindowsVolume)).all())
+    return render_template(
+        request,
+        "partials/status_panel.html",
+        {
+            "jobs_summary": summary,
+            "logs": logs,
+            "volumes": volumes,
+            "ai_state": AI_BATCH_STATE,
+        },
+    )
+
+
+@router.post("/process-control")
+def control_background_process(
+    request: Request,
+    action: str = Form(...),
+    job_id: int = Form(...),
+    run_sync: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    job = db.get(BackgroundJob, job_id)
+    if not job:
+        return HTMLResponse("<span class='text-rose-400 text-xs'>Zadanie nie istnieje.</span>")
+
+    if action == "stop":
+        if job.job_type == "ai_analysis":
+            AI_BATCH_STATE["stop_requested"] = True
+        ProcessManager.request_stop(job_id)
+        job.status = "STOPPED"
+        job.last_message = "Zatrzymano na żądanie użytkownika."
+        db.commit()
+    elif action == "cancel":
+        ProcessManager.request_stop(job_id)
+        db.delete(job)
+        db.commit()
+        OperationLogger.log("PROCESS_CANCEL", f"Usunięto niedokończone zadanie #{job_id} ({job.title}).", status="WARN", db=db)
+    elif action == "resume":
+        try:
+            rem_ids = json.loads(job.remaining_ids_json or "[]")
+            params = json.loads(job.params_json or "{}")
+        except Exception:
+            rem_ids = []
+            params = {}
+
+        if not rem_ids and job.job_type not in ("backup_dedup", "todo_sync"):
+            job.status = "COMPLETED"
+            db.commit()
+        else:
+            ProcessManager.clear_stop(job.id)
+            AI_BATCH_STATE["stop_requested"] = False
+            job.status = "RUNNING"
+            job.last_message = "Wznowiono wykonywanie procesu..."
+            db.commit()
+            if job.job_type == "ai_analysis":
+                atype = params.get("analysis_type", "all")
+                if run_sync:
+                    _run_background_ai_batch(job.id, rem_ids, analysis_type=atype)
+                else:
+                    ProcessManager.start_background_thread(job.id, _run_background_ai_batch, rem_ids, analysis_type=atype)
+            elif job.job_type == "delete_permanently":
+                _execute_delete_permanently_items(db, rem_ids, job_id=job.id)
+            elif job.job_type == "move_to_trash":
+                _execute_move_to_trash_items(db, rem_ids, job_id=job.id)
+            elif job.job_type == "backup_dedup":
+                svc = StorageAutomationService(db)
+                svc.execute_backup_and_deduplication(job_id=job.id)
+                ProcessManager.finish_job(job.id, status="COMPLETED", message="Backup i deduplikacja wznowione i wykonane.", db=db)
+                db.commit()
+
+    resp = get_status_and_logs_panel(request, db)
+    resp.headers["HX-Trigger"] = "refresh-all"
+    return resp
+
+
+@router.get("/backup-panel")
+def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, db: Session = Depends(get_db)):
+    svc = StorageAutomationService(db)
+    pref_vid = to_int(target_volume_id)
+    plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
+    unbacked_files = svc.detect_files_without_backup()
+
+    vol_space = {}
+    for vid, v in plan["volumes"].items():
+        if v.is_online:
+            try:
+                u = shutil.disk_usage(v.last_known_drive_letter)
+                vol_space[vid] = {
+                    "free_gb": u.free / (1024 ** 3),
+                    "total_gb": u.total / (1024 ** 3),
+                    "used_pct": int((u.used / u.total) * 100) if u.total else 0,
+                }
+            except Exception:
+                vol_space[vid] = None
+        else:
+            vol_space[vid] = None
+
+    return render_template(
+        request,
+        "partials/backup_panel.html",
+        {
+            "plan": plan,
+            "unbacked_files": unbacked_files[:200],
+            "unbacked_total": len(unbacked_files),
+            "volumes": list(plan["volumes"].values()),
+            "vol_space": vol_space,
+            "execution_result": None,
+        },
+    )
+
+
+@router.post("/execute-backup")
+def execute_backup_action(
+    request: Request,
+    preferred_target_volume_id: Optional[str] = Form(None),
+    new_backup_drive_path: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    pref_vid = to_int(preferred_target_volume_id)
+    if new_backup_drive_path and new_backup_drive_path.strip():
+        clean_p = new_backup_drive_path.strip(' \t\n\r"\'')
+        if len(clean_p) == 2 and clean_p[1] == ":":
+            clean_p += "\\"
+        p_obj = Path(clean_p)
+        if p_obj.exists():
+            vsn, label, root = WindowsVolumeInspector.get_volume_info(p_obj)
+            vol = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == vsn))
+            if not vol:
+                vol = WindowsVolume(
+                    volume_serial_number=vsn,
+                    volume_label=label,
+                    last_known_drive_letter=root,
+                    is_online=True,
+                )
+                db.add(vol)
+                db.commit()
+                db.refresh(vol)
+            pref_vid = vol.id
+
+    svc = StorageAutomationService(db)
+    job_id = ProcessManager.create_job(
+        job_type="backup_dedup",
+        title="Automatyczny Backup na inne urządzenie i 100% bezpieczna deduplikacja",
+        item_ids=[],
+        params={"preferred_target_volume_id": pref_vid},
+        db=db,
+    )
+    exec_result = svc.execute_backup_and_deduplication(preferred_target_volume_id=pref_vid, job_id=job_id)
+    if exec_result["pending_offline_pairs_count"] > 0:
+        ProcessManager.update_progress(
+            job_id,
+            status="WAITING_FOR_DEVICE",
+            message=f"Oczekiwanie na podłączenie kolejnej pary dysków (pozostało par: {exec_result['pending_offline_pairs_count']}).",
+            db=db,
+        )
+    else:
+        ProcessManager.finish_job(job_id, status="COMPLETED", message=exec_result["summary"], db=db)
+    db.commit()
+
+    plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
+    unbacked_files = svc.detect_files_without_backup()
+    vol_space = {}
+    for vid, v in plan["volumes"].items():
+        if v.is_online:
+            try:
+                u = shutil.disk_usage(v.last_known_drive_letter)
+                vol_space[vid] = {
+                    "free_gb": u.free / (1024 ** 3),
+                    "total_gb": u.total / (1024 ** 3),
+                    "used_pct": int((u.used / u.total) * 100) if u.total else 0,
+                }
+            except Exception:
+                vol_space[vid] = None
+        else:
+            vol_space[vid] = None
+
+    resp = render_template(
+        request,
+        "partials/backup_panel.html",
+        {
+            "plan": plan,
+            "unbacked_files": unbacked_files[:200],
+            "unbacked_total": len(unbacked_files),
+            "volumes": list(plan["volumes"].values()),
+            "vol_space": vol_space,
+            "execution_result": exec_result,
+        },
+    )
+    resp.headers["HX-Trigger"] = "refresh-all"
+    return resp
+
+
+@router.get("/todo-panel")
+def get_offline_todo_panel(request: Request, db: Session = Depends(get_db)):
+    svc = StorageAutomationService(db)
+    summary = svc.get_pending_moves_summary()
+    return render_template(
+        request,
+        "partials/todo_panel.html",
+        {
+            "summary": summary,
+            "exec_report": None,
+        },
+    )
+
+
+@router.post("/todo-execute")
+def execute_offline_todo_moves(request: Request, db: Session = Depends(get_db)):
+    svc = StorageAutomationService(db)
+    report = svc.execute_pending_moves_pairwise()
+    summary = svc.get_pending_moves_summary()
+    resp = render_template(
+        request,
+        "partials/todo_panel.html",
+        {
+            "summary": summary,
+            "exec_report": report,
+        },
+    )
+    resp.headers["HX-Trigger"] = "refresh-all"
+    return resp
+
+
+@router.post("/todo-rollback")
+def rollback_offline_todo_moves(
+    request: Request,
+    todo_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    svc = StorageAutomationService(db)
+    tid = to_int(todo_id)
+    reverted = svc.rollback_pending_moves(todo_ids=[tid] if tid else None)
+    summary = svc.get_pending_moves_summary()
+    report = {
+        "status": "rolled_back",
+        "message": f"Zrezygnowano z przenoszenia. Przywrócono poprzednie lokalizacje w bazie dla {reverted} plików i usunięto zadania z listy TODO.",
+    }
+    resp = render_template(
+        request,
+        "partials/todo_panel.html",
+        {
+            "summary": summary,
+            "exec_report": report,
+        },
+    )
+    resp.headers["HX-Trigger"] = "refresh-all"
+    return resp
+
 
 @router.post("/assign-group")
 def assign_group(
@@ -375,14 +797,16 @@ def assign_group(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
         group_id, tag, year, anomaly_only, blurry_only, duplicates_only
     )
-    if not items:
-        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików do przypisania.</span>")
 
     ex_id = to_int(existing_group_id)
     par_id = to_int(parent_id)
+    if par_id is not None and par_id <= 0:
+        par_id = None
 
     if ex_id:
         grp = db.get(MediaGroup, ex_id)
+        if not grp:
+            return HTMLResponse("<span class='text-rose-400 text-xs'>Wybrany album nie istnieje.</span>")
     elif group_name and group_name.strip():
         clean_name = group_name.strip()
         grp = db.scalar(select(MediaGroup).where(MediaGroup.name == clean_name, MediaGroup.parent_id == par_id))
@@ -392,14 +816,26 @@ def assign_group(
             db.commit()
             db.refresh(grp)
     else:
-        return HTMLResponse("<span class='text-rose-400 text-xs'>Podaj nazwę grupy.</span>")
+        return HTMLResponse("<span class='text-rose-400 text-xs'>Wybierz istniejący album z listy lub podaj nazwę nowego albumu.</span>")
+
+    if not items:
+        return HTMLResponse(
+            f"<span class='text-emerald-400 text-xs font-semibold'>Utworzono pusty album '{grp.name}'.</span>",
+            headers={"HX-Trigger": "refresh-all"},
+        )
 
     for it in items:
         it.group_id = grp.id
     db.commit()
 
+    OperationLogger.log(
+        "ALBUM_ASSIGN",
+        f"Przypisano {len(items)} plików do albumu '{grp.name}' (ID: {grp.id}).",
+        status="OK",
+        db=db,
+    )
     return HTMLResponse(
-        f"<span class='text-emerald-400 text-xs font-semibold'>Przypisano {len(items)} plików do grupy '{grp.name}'.</span>",
+        f"<span class='text-emerald-400 text-xs font-semibold'>Przypisano {len(items)} plików do albumu '{grp.name}'.</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
 
@@ -421,21 +857,36 @@ def auto_group_endpoint(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
+    """
+    Requirement 2e: 1-Click Auto-Organization is restricted strictly to a selected device (volume_id)
+    and directory (folder_prefix).
+    """
+    vid_int = to_int(volume_id)
+    clean_folder = (folder_prefix or "").strip()
+    if not vid_int or not clean_folder:
+        return HTMLResponse(
+            "<span class='text-amber-400 text-xs font-semibold'>"
+            "⚠️ 1-Klik Auto-Organizacja jest dostępna wyłącznie po wybraniu konkretnego urządzenia (dysku) oraz katalogu."
+            "</span>",
+            status_code=400,
+        )
+
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
         group_id, tag, year, anomaly_only, blurry_only, duplicates_only
     )
     if not items:
-        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w zbiorze.</span>")
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików w wybranym katalogu urządzenia.</span>")
 
     svc = StorageAutomationService(db)
     if mode == "date":
         cnt = svc.auto_group_items_by_date(items)
-        msg = f"Zorganizowano {cnt} plików w drzewo grup Rok -> Miesiąc."
+        msg = f"Zorganizowano {cnt} plików z wybranego katalogu w drzewo albumów Rok -> Miesiąc."
     else:
         cnt = svc.auto_group_items_by_folder(items)
-        msg = f"Zorganizowano {cnt} plików w drzewo na podstawie katalogów z dysku."
+        msg = f"Zorganizowano {cnt} plików w drzewo albumów na podstawie wybranego katalogu z dysku."
 
+    OperationLogger.log("AUTO_ORGANIZE", msg, status="OK", details={"volume_id": vid_int, "folder": clean_folder, "mode": mode}, db=db)
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
         headers={"HX-Trigger": "refresh-all"},
@@ -448,40 +899,215 @@ def manage_group(
     target_group_id: int = Form(...),
     new_name: Optional[str] = Form(None),
     new_parent_id: Optional[str] = Form(None),
+    destination_group_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     grp = db.get(MediaGroup, target_group_id)
     if not grp:
-        return HTMLResponse("<span class='text-rose-400 text-xs'>Grupa nie istnieje.</span>")
+        return HTMLResponse("<span class='text-rose-400 text-xs'>Album nie istnieje.</span>")
 
     par_id = to_int(new_parent_id)
-    if action == "create_sub" and new_name:
+    dest_gid = to_int(destination_group_id)
+    svc = StorageAutomationService(db)
+
+    if action == "create_sub" and new_name and new_name.strip():
         sub = MediaGroup(name=new_name.strip(), parent_id=grp.id)
         db.add(sub)
         db.commit()
-        msg = f"Utworzono podgrupę '{sub.name}' wewnątrz '{grp.name}'."
-    elif action == "rename" and new_name:
+        msg = f"Utworzono podalbum '{sub.name}' wewnątrz '{grp.name}'."
+        OperationLogger.log("ALBUM_CREATE_SUB", msg, status="OK", db=db)
+    elif action == "rename" and new_name and new_name.strip():
+        old_name = grp.name
         grp.name = new_name.strip()
         db.commit()
-        msg = f"Zmieniono nazwę grupy na '{grp.name}'."
+        msg = f"Zmieniono nazwę albumu z '{old_name}' na '{grp.name}'."
+        OperationLogger.log("ALBUM_RENAME", msg, status="OK", db=db)
     elif action == "reparent":
         if par_id == grp.id:
-            return HTMLResponse("<span class='text-rose-400 text-xs'>Grupa nie może być swoim własnym rodzicem.</span>")
+            return HTMLResponse("<span class='text-rose-400 text-xs'>Album nie może być swoim własnym rodzicem.</span>")
         grp.parent_id = par_id if par_id and par_id > 0 else None
         db.commit()
-        msg = f"Przeniesiono grupę '{grp.name}' w drzewie."
+        msg = f"Przeniesiono album '{grp.name}' w drzewie."
+        OperationLogger.log("ALBUM_REPARENT", msg, status="OK", db=db)
     elif action == "delete":
-        name = grp.name
-        for it in db.scalars(select(MediaItem).where(MediaItem.group_id == grp.id)).all():
-            it.group_id = None
-        db.delete(grp)
-        db.commit()
-        msg = f"Usunięto grupę '{name}'."
+        name = svc.delete_album_fast(target_group_id)
+        msg = f"Usunięto album '{name}' (zdjęcia wróciły do swobodnej puli)."
+    elif action in ("transfer_and_delete", "merge_into"):
+        if not dest_gid:
+            return HTMLResponse("<span class='text-rose-400 text-xs'>Wybierz docelowy album.</span>")
+        try:
+            moved_cnt, src_name, dst_name = svc.transfer_album_and_delete_source(target_group_id, dest_gid)
+            msg = f"Przerzucono {moved_cnt} zdjęć z albumu '{src_name}' do '{dst_name}' i usunięto album '{src_name}'."
+        except ValueError as exc:
+            return HTMLResponse(f"<span class='text-rose-400 text-xs'>{exc}</span>")
     else:
-        msg = "Nieznana operacja."
+        msg = "Nieznana operacja na albumie."
 
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/change-date")
+def change_media_date(
+    new_date: str = Form(...),
+    album_id: Optional[str] = Form(None),
+    scope: str = Form("selected"),
+    selected_ids: List[str] = Form(default=[]),
+    q: Optional[str] = Form(None),
+    media_type: str = Form("all"),
+    volume_id: Optional[str] = Form(None),
+    folder_prefix: Optional[str] = Form(None),
+    group_id: Optional[str] = Form(None),
+    tag: Optional[str] = Form(None),
+    year: Optional[str] = Form(None),
+    anomaly_only: bool = Form(False),
+    blurry_only: bool = Form(False),
+    duplicates_only: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Requirement 4a (Multimedia): Changes effective_date for an album or selected/filtered photos,
+    and automatically removes them from the date anomaly list (has_date_anomaly = False).
+    """
+    clean_dt_str = new_date.strip().replace("T", " ")
+    parsed_dt: Optional[datetime.datetime] = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed_dt = datetime.datetime.strptime(clean_dt_str, fmt)
+            break
+        except ValueError:
+            continue
+
+    if not parsed_dt:
+        return HTMLResponse(
+            "<span class='text-rose-400 text-xs'>Nieprawidłowy format daty (użyj RRRR-MM-DD lub RRRR-MM-DD GG:MM).</span>",
+            status_code=400,
+        )
+
+    aid = to_int(album_id)
+    if aid:
+        svc = StorageAutomationService(db)
+        subtree_ids = svc.get_group_subtree_ids(aid)
+        items = list(db.scalars(select(MediaItem).where(MediaItem.group_id.in_(subtree_ids), MediaItem.is_trashed == False)).all())
+    else:
+        items = resolve_target_items(
+            db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        )
+
+    if not items:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do zmiany daty.</span>")
+
+    for it in items:
+        it.effective_date = parsed_dt
+        it.has_date_anomaly = False
+        it.date_anomaly_reason = None
+
+    db.commit()
+    msg = f"Zmieniono datę na {parsed_dt.strftime('%Y-%m-%d %H:%M')} dla {len(items)} zdjęć (usunięto z listy anomalii daty)."
+    OperationLogger.log("DATE_CHANGE", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>📅 {msg}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/clear-date-anomaly")
+def clear_date_anomaly_without_changing_date(
+    media_id: Optional[str] = Form(None),
+    album_id: Optional[str] = Form(None),
+    scope: str = Form("selected"),
+    selected_ids: List[str] = Form(default=[]),
+    q: Optional[str] = Form(None),
+    media_type: str = Form("all"),
+    volume_id: Optional[str] = Form(None),
+    folder_prefix: Optional[str] = Form(None),
+    group_id: Optional[str] = Form(None),
+    tag: Optional[str] = Form(None),
+    year: Optional[str] = Form(None),
+    anomaly_only: bool = Form(False),
+    blurry_only: bool = Form(False),
+    duplicates_only: bool = Form(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Requirement 4a (Multimedia): Removes photos from the invalid date (anomaly) list
+    on demand without modifying their effective_date.
+    """
+    if media_id:
+        items = list(db.scalars(select(MediaItem).where(MediaItem.id == media_id)).all())
+    elif to_int(album_id):
+        svc = StorageAutomationService(db)
+        subtree_ids = svc.get_group_subtree_ids(to_int(album_id))
+        items = list(db.scalars(select(MediaItem).where(MediaItem.group_id.in_(subtree_ids), MediaItem.is_trashed == False)).all())
+    else:
+        items = resolve_target_items(
+            db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        )
+
+    if not items:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak zdjęć do zatwierdzenia daty.</span>")
+
+    cleared = 0
+    for it in items:
+        if it.has_date_anomaly or it.date_anomaly_reason:
+            cleared += 1
+        it.has_date_anomaly = False
+        it.date_anomaly_reason = None
+
+    db.commit()
+    msg = f"Usunięto z listy nieprawidłowych dat bez zmiany daty: {len(items)} zdjęć."
+    OperationLogger.log("DATE_ANOMALY_CLEAR", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>✓ {msg}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/rotate-media")
+def rotate_media_action(
+    request: Request,
+    media_id: Optional[str] = Form(None),
+    delta: int = Form(90),
+    selected_ids: List[str] = Form(default=[]),
+    db: Session = Depends(get_db),
+):
+    """
+    Requirement 4b & 4c (Multimedia): Rotates photo(s) and persists rotation_angle (0, 90, 180, 270)
+    in SQLite so the photo is always displayed in the proper orientation.
+    """
+    target_ids = [media_id] if media_id else selected_ids
+    if not target_ids:
+        return JSONResponse({"status": "error", "message": "Brak ID zdjęcia."}, status_code=400)
+
+    items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(target_ids))).all())
+    if not items:
+        return JSONResponse({"status": "error", "message": "Nie znaleziono zdjęcia."}, status_code=404)
+
+    new_angles = {}
+    for it in items:
+        curr = it.rotation_angle or 0
+        it.rotation_angle = (curr + delta) % 360
+        new_angles[it.id] = it.rotation_angle
+
+    db.commit()
+    OperationLogger.log(
+        "MEDIA_ROTATE",
+        f"Obrócono zdjęcia ({len(items)} szt.) o {delta}° -> {new_angles}",
+        status="OK",
+        db=db,
+    )
+
+    accept = request.headers.get("accept", "")
+    if "application/json" in accept or request.headers.get("x-requested-with") == "XMLHttpRequest":
+        first_id = items[0].id
+        return JSONResponse({"status": "ok", "media_id": first_id, "rotation_angle": new_angles[first_id], "angles": new_angles})
+
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>↻ Obrócono zdjęcie i zapisano kąt ({items[0].rotation_angle}°) w bazie.</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
 
@@ -494,9 +1120,12 @@ def consolidate_group_endpoint(
 ):
     svc = StorageAutomationService(db)
     try:
-        cnt = svc.consolidate_group(group_id, target_volume_id)
+        res = svc.consolidate_group(group_id, target_volume_id)
+        msg = f"Skonsolidowano album: przeniesiono fizycznie {res['moved_physically']} plików"
+        if res["queued_offline"] > 0:
+            msg += f", dodano do listy TODO (offline): {res['queued_offline']} plików"
         return HTMLResponse(
-            f"<span class='text-emerald-400 text-xs font-semibold'>Skonsolidowano i przeniesiono fizycznie {cnt} plików na dysk docelowy.</span>",
+            f"<span class='text-emerald-400 text-xs font-semibold'>{msg}.</span>",
             headers={"HX-Trigger": "refresh-all"},
         )
     except Exception as e:
@@ -508,14 +1137,13 @@ def get_gdrive_panel(
     request: Request,
     folder_id: Optional[str] = None,
 ):
-    from app.routers.media import render_template
     from app.cloud.google_drive import GoogleDriveManager
 
     try:
         gdrive = GoogleDriveManager()
         folders = gdrive.list_folders()
         if not folders:
-            default_id = gdrive.get_or_create_folder("HydraArchive")
+            default_id = gdrive.get_or_create_folder("DomoweArchiwumFoto")
             folders = gdrive.list_folders()
         else:
             default_id = folders[0]["id"]
@@ -569,8 +1197,6 @@ def sync_to_google_drive(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    import datetime
-    from app.routers.media import render_template
     from app.cloud.google_drive import GoogleDriveManager
 
     try:
@@ -580,7 +1206,7 @@ def sync_to_google_drive(
         elif folder_id and folder_id.strip():
             target_fid = folder_id.strip()
         else:
-            target_fid = gdrive.get_or_create_folder("HydraArchive")
+            target_fid = gdrive.get_or_create_folder("DomoweArchiwumFoto")
 
         uploaded_results = []
         if mode == "db_backup":
@@ -614,6 +1240,7 @@ def sync_to_google_drive(
                 + ("Pliki lokalne zostały bezpiecznie usunięte." if purge_local else "Kopie lokalne pozostały na dysku.")
             )
 
+        OperationLogger.log("GDRIVE_SYNC", summary, status="OK", db=db)
         folders = gdrive.list_folders()
         cloud_files = gdrive.list_files_in_folder(target_fid)
 
@@ -642,8 +1269,8 @@ def sync_to_google_drive(
             folders = gdrive.list_folders()
             if folder_id:
                 cloud_files = gdrive.list_files_in_folder(folder_id)
-        except Exception:
-            pass
+        except Exception as inner_exc:
+            logger.debug("GDrive fallback listing failed: %s", inner_exc)
         return render_template(
             request,
             "partials/gdrive_panel.html",
@@ -673,9 +1300,6 @@ def export_json_to_disk(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    import datetime
-    import json
-
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
         group_id, tag, year, anomaly_only, blurry_only, duplicates_only
@@ -686,7 +1310,7 @@ def export_json_to_disk(
     export_dir = DATA_DIR / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest_file = export_dir / f"hydra_export_{ts}.json"
+    dest_file = export_dir / f"domowe_archiwum_export_{ts}.json"
 
     payload = []
     for it in items:
@@ -700,19 +1324,22 @@ def export_json_to_disk(
                 "volume_label": vol.volume_label if vol else None,
                 "volume_vsn": vol.volume_serial_number if vol else None,
                 "drive_letter": vol.last_known_drive_letter if vol else None,
-                "group": grp.name if grp else None,
+                "album": grp.name if grp else None,
                 "effective_date": it.effective_date.isoformat(),
                 "exif_date": it.exif_date.isoformat() if it.exif_date else None,
                 "file_size_bytes": it.file_size_bytes,
                 "dimensions": {"width": it.width, "height": it.height},
+                "rotation_angle": it.rotation_angle,
                 "file_hash": it.file_hash,
                 "is_duplicate": not it.is_primary_duplicate,
+                "is_backup_copy": it.is_backup_copy,
                 "is_blurry": it.is_blurry,
                 "blur_score": it.blur_score,
             }
         )
 
     dest_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    OperationLogger.log("EXPORT_JSON", f"Zapisano eksport JSON ({len(payload)} poz.) do {dest_file.name}", status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>"
         f"✓ Zapisano {len(payload)} rekordów na dysku: <code class='bg-slate-900 px-1.5 py-0.5 rounded text-white'>{dest_file}</code>"
@@ -722,7 +1349,10 @@ def export_json_to_disk(
 
 @router.post("/move-files")
 def move_physical_files_action(
-    destination_path: str = Form(...),
+    destination_path: Optional[str] = Form(None),
+    target_volume_id: Optional[str] = Form(None),
+    target_subfolder: Optional[str] = Form(""),
+    force_offline_todo: bool = Form(False),
     scope: str = Form("selected"),
     selected_ids: List[str] = Form(default=[]),
     q: Optional[str] = Form(None),
@@ -738,16 +1368,10 @@ def move_physical_files_action(
     db: Session = Depends(get_db),
 ):
     """
-    Physically moves selected or filtered files to any destination folder on disk/USB,
-    updating their WindowsVolume and relative_path in SQLite transactionally.
+    Moves selected or filtered files to a target device and folder.
+    Supports both direct physical moves (when source and target drives are online)
+    and Offline Mode logical moves queued in the TODO list (Requirement 4b).
     """
-    import shutil
-
-    clean_dest = destination_path.strip(' \t\n\r"\'')
-    if len(clean_dest) == 2 and clean_dest[1] == ":":
-        clean_dest += "\\"
-    dest_dir = Path(clean_dest).resolve()
-
     items = resolve_target_items(
         db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
         group_id, tag, year, anomaly_only, blurry_only, duplicates_only
@@ -755,65 +1379,137 @@ def move_physical_files_action(
     if not items:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików do przeniesienia.</span>")
 
+    svc = StorageAutomationService(db)
+    tv_id = to_int(target_volume_id)
+    sub_folder = (target_subfolder or "").strip()
+
     try:
-        BackupManager().create_backup("pre_physical_move")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        vsn, label, root = WindowsVolumeInspector.get_volume_info(dest_dir)
-        root_path = Path(root).resolve()
-
-        target_vol = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == vsn))
-        if not target_vol:
-            target_vol = WindowsVolume(
-                volume_serial_number=vsn,
-                volume_label=label,
-                last_known_drive_letter=root,
-                is_online=True,
+        if tv_id:
+            res = svc.schedule_or_execute_moves(
+                items, target_volume_id=tv_id, target_subfolder=sub_folder, force_offline_todo=force_offline_todo
             )
-            db.add(target_vol)
-            db.commit()
-            db.refresh(target_vol)
-        else:
-            target_vol.last_known_drive_letter = root
-            target_vol.is_online = True
-            db.commit()
+            msg = f"🚚 Przeniesiono fizycznie: {res['moved_physically']} plików"
+            if res["queued_offline"] > 0:
+                msg += f" | Zapisano na liście TODO (przeniesienie logiczne offline): {res['queued_offline']} plików (cel: {res['target_volume_label']}/{res['target_subfolder']})"
+            return HTMLResponse(
+                f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
+                headers={"HX-Trigger": "refresh-all"},
+            )
 
-        moved_cnt = 0
-        for it in items:
-            src_vol = db.get(WindowsVolume, it.volume_id)
-            if not src_vol:
-                continue
-            src_file = Path(src_vol.last_known_drive_letter) / it.relative_path
-            if not src_file.exists():
-                continue
+        if not destination_path or not destination_path.strip():
+            return HTMLResponse("<span class='text-rose-400 text-xs'>Wybierz dysk docelowy lub podaj ścieżkę.</span>")
 
-            dest_file = dest_dir / it.file_name
-            if src_file.resolve() == dest_file.resolve():
-                continue
+        clean_dest = destination_path.strip(' \t\n\r"\'')
+        if len(clean_dest) == 2 and clean_dest[1] == ":":
+            clean_dest += "\\"
+        dest_dir = Path(clean_dest)
+        drive_part = os.path.splitdrive(str(dest_dir))[0]
+        drive_root = (drive_part.rstrip("\\/") + "\\") if drive_part else "C:\\"
 
-            c = 1
-            while dest_file.exists():
-                dest_file = dest_dir / f"{src_file.stem}_{c}{src_file.suffix}"
-                c += 1
+        if Path(drive_root).exists() and not force_offline_todo:
+            dest_dir_resolved = dest_dir.resolve()
+            dest_dir_resolved.mkdir(parents=True, exist_ok=True)
+            vsn, label, root = WindowsVolumeInspector.get_volume_info(dest_dir_resolved)
+            root_path = Path(root).resolve()
 
-            shutil.move(str(src_file), str(dest_file))
-            it.file_name = dest_file.name
-            it.volume_id = target_vol.id
+            target_vol = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == vsn))
+            if not target_vol:
+                target_vol = WindowsVolume(
+                    volume_serial_number=vsn,
+                    volume_label=label,
+                    last_known_drive_letter=root,
+                    is_online=True,
+                )
+                db.add(target_vol)
+                db.commit()
+                db.refresh(target_vol)
+            else:
+                target_vol.last_known_drive_letter = root
+                target_vol.is_online = True
+                db.commit()
+
             try:
-                it.relative_path = dest_file.resolve().relative_to(root_path).as_posix()
+                rel_sub = dest_dir_resolved.relative_to(root_path).as_posix()
+                if rel_sub == ".":
+                    rel_sub = ""
             except ValueError:
-                it.relative_path = dest_file.name
-            moved_cnt += 1
+                rel_sub = ""
 
-        db.commit()
-        return HTMLResponse(
-            f"<span class='text-emerald-400 text-xs font-semibold'>"
-            f"🚚 Przeniesiono fizycznie {moved_cnt} plików do: <code class='bg-slate-900 px-1.5 py-0.5 rounded text-white'>{dest_dir}</code>"
-            f"</span>",
-            headers={"HX-Trigger": "refresh-all"},
-        )
+            res = svc.schedule_or_execute_moves(
+                items, target_volume_id=target_vol.id, target_subfolder=rel_sub, force_offline_todo=False
+            )
+            msg = f"🚚 Przeniesiono fizycznie {res['moved_physically']} plików do {dest_dir_resolved}"
+            if res["queued_offline"] > 0:
+                msg += f" (w kolejce TODO dla odłączonych dysków źródłowych: {res['queued_offline']})"
+            return HTMLResponse(
+                f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
+                headers={"HX-Trigger": "refresh-all"},
+            )
+        else:
+            # Target drive letter is offline -> match existing WindowsVolume by drive letter or create placeholder
+            target_vol = db.scalar(
+                select(WindowsVolume).where(WindowsVolume.last_known_drive_letter.ilike(f"{drive_part}%"))
+            )
+            if not target_vol:
+                return HTMLResponse(
+                    f"<span class='text-rose-400 text-xs'>Dysk {drive_root} nie jest podłączony ani zarejestrowany w bazie. Wybierz zarejestrowany dysk z listy.</span>"
+                )
+            rel_parts = [p for p in dest_dir.parts if not p.endswith(":\\") and not p.endswith(":")]
+            rel_sub = "/".join(rel_parts)
+            res = svc.schedule_or_execute_moves(
+                items, target_volume_id=target_vol.id, target_subfolder=rel_sub, force_offline_todo=True
+            )
+            return HTMLResponse(
+                f"<span class='text-amber-300 text-xs font-semibold'>"
+                f"📋 Dysk jest Offline — logicznie przeniesiono i dodano do listy TODO: {res['queued_offline']} plików."
+                f"</span>",
+                headers={"HX-Trigger": "refresh-all"},
+            )
     except Exception as e:
         return HTMLResponse(f"<span class='text-rose-400 text-xs font-semibold'>Błąd przenoszenia: {e}</span>")
+
+
+def _execute_move_to_trash_items(db: Session, item_ids: List[str], job_id: Optional[int] = None) -> Tuple[int, int]:
+    trash_dir = DATA_DIR / "kosz"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(item_ids))).all())
+    moved_files = 0
+    processed = 0
+
+    for idx, it in enumerate(items):
+        if job_id and ProcessManager.is_stop_requested(job_id):
+            ProcessManager.update_progress(
+                job_id,
+                remaining_ids=[x.id for x in items[idx:]],
+                status="STOPPED",
+                message=f"Zatrzymano przenoszenie do kosza po {processed}/{len(items)}.",
+                db=db,
+            )
+            db.commit()
+            return processed, moved_files
+
+        vol = db.get(WindowsVolume, it.volume_id)
+        if vol:
+            src_p = Path(vol.last_known_drive_letter) / it.relative_path
+            if src_p.exists():
+                dest_p = trash_dir / f"{it.id}_{it.file_name}"
+                try:
+                    shutil.move(str(src_p), str(dest_p))
+                    moved_files += 1
+                except Exception as exc:
+                    logger.debug("Move to trash physical warning: %s", exc)
+        it.is_trashed = True
+        processed += 1
+
+    if job_id:
+        ProcessManager.finish_job(
+            job_id,
+            status="COMPLETED",
+            message=f"Przeniesiono do Kosza: {processed} pozycji (fizycznie: {moved_files}).",
+            db=db,
+        )
+    db.commit()
+    return processed, moved_files
 
 
 @router.post("/move-to-trash")
@@ -833,15 +1529,7 @@ def move_items_to_local_trash(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    """
-    Reversible Trash: moves physical file to data/kosz/{item.id}_{item.file_name},
-    retaining volume_id, relative_path, and group_id in SQLite so it can be restored to its exact origin!
-    """
-    import shutil
-
     BackupManager().create_backup("pre_trash_move")
-    trash_dir = DATA_DIR / "kosz"
-    trash_dir.mkdir(parents=True, exist_ok=True)
 
     t_gid = to_int(trash_group_id)
     if t_gid:
@@ -861,24 +1549,18 @@ def move_items_to_local_trash(
     if not items and not t_gid:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych elementów do przeniesienia do kosza.</span>")
 
-    moved_files = 0
-    for it in items:
-        vol = db.get(WindowsVolume, it.volume_id)
-        if vol:
-            src_p = Path(vol.last_known_drive_letter) / it.relative_path
-            if src_p.exists():
-                dest_p = trash_dir / f"{it.id}_{it.file_name}"
-                try:
-                    shutil.move(str(src_p), str(dest_p))
-                    moved_files += 1
-                except Exception:
-                    pass
-        it.is_trashed = True
+    item_ids = [it.id for it in items]
+    job_id = ProcessManager.create_job(
+        job_type="move_to_trash",
+        title=f"Przenoszenie do Kosza ({len(item_ids)} poz.)",
+        item_ids=item_ids,
+        db=db,
+    )
+    processed, moved_files = _execute_move_to_trash_items(db, item_ids, job_id=job_id)
 
-    db.commit()
     return HTMLResponse(
         f"<span class='text-amber-300 text-xs font-semibold'>"
-        f"🗑️ Przeniesiono do Kosza: {len(items)} pozycji (fizycznie przeniesiono do data/kosz: {moved_files}). Możesz je przywrócić z widoku Kosza."
+        f"🗑️ Przeniesiono do Kosza: {processed} pozycji (fizycznie przeniesiono do data/kosz: {moved_files}). Możesz je przywrócić z widoku Kosza."
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -886,17 +1568,11 @@ def move_items_to_local_trash(
 
 @router.post("/restore-from-trash")
 def restore_from_trash(
-    restore_mode: str = Form("selected"),  # 'selected', 'all', or 'group'
+    restore_mode: str = Form("selected"),
     restore_group_id: Optional[str] = Form(None),
     selected_ids: List[str] = Form(default=[]),
     db: Session = Depends(get_db),
 ):
-    """
-    Restores trashed files and/or groups back to their original directory on the original USB volume.
-    Recreates the original subfolder if needed.
-    """
-    import shutil
-
     trash_dir = DATA_DIR / "kosz"
     r_gid = to_int(restore_group_id)
 
@@ -907,7 +1583,6 @@ def restore_from_trash(
             g_obj = db.get(MediaGroup, gid)
             if g_obj:
                 g_obj.is_trashed = False
-                # Also restore parent groups if they were trashed
                 curr_p = g_obj.parent_id
                 while curr_p:
                     p_obj = db.get(MediaGroup, curr_p)
@@ -923,40 +1598,37 @@ def restore_from_trash(
         items = list(db.scalars(select(MediaItem).where(MediaItem.is_trashed == True)).all())
 
     restored_files = 0
-    offline_skipped = 0
+    restored_logical = 0
 
     for it in items:
         vol = db.get(WindowsVolume, it.volume_id)
         trash_file = trash_dir / f"{it.id}_{it.file_name}"
 
-        if vol and Path(vol.last_known_drive_letter).exists():
+        if vol and Path(vol.last_known_drive_letter).exists() and trash_file.exists():
             orig_full_path = Path(vol.last_known_drive_letter) / it.relative_path
             orig_parent_dir = orig_full_path.parent
             orig_parent_dir.mkdir(parents=True, exist_ok=True)
 
-            if trash_file.exists():
-                target_restore_path = orig_full_path
-                c = 1
-                while target_restore_path.exists():
-                    target_restore_path = orig_parent_dir / f"{orig_full_path.stem}_restored_{c}{orig_full_path.suffix}"
-                    c += 1
-                shutil.move(str(trash_file), str(target_restore_path))
-                it.file_name = target_restore_path.name
-                it.relative_path = target_restore_path.resolve().relative_to(Path(vol.last_known_drive_letter).resolve()).as_posix()
-                restored_files += 1
+            target_restore_path = orig_full_path
+            c = 1
+            while target_restore_path.exists():
+                target_restore_path = orig_parent_dir / f"{orig_full_path.stem}_restored_{c}{orig_full_path.suffix}"
+                c += 1
+            shutil.move(str(trash_file), str(target_restore_path))
+            it.file_name = target_restore_path.name
+            it.relative_path = target_restore_path.resolve().relative_to(Path(vol.last_known_drive_letter).resolve()).as_posix()
+            restored_files += 1
 
-            it.is_trashed = False
-            if it.group_id:
-                g_obj = db.get(MediaGroup, it.group_id)
-                if g_obj:
-                    g_obj.is_trashed = False
-        else:
-            offline_skipped += 1
+        it.is_trashed = False
+        restored_logical += 1
+        if it.group_id:
+            g_obj = db.get(MediaGroup, it.group_id)
+            if g_obj:
+                g_obj.is_trashed = False
 
     db.commit()
-    msg = f"♻️ Przywrócono z Kosza na pierwotne miejsce: {restored_files} plików."
-    if offline_skipped > 0:
-        msg += f" (Pominięto {offline_skipped} plików – ich dysk źródłowy jest obecnie odłączony)."
+    msg = f"♻️ Przywrócono z Kosza: {restored_logical} pozycji (fizycznie na dysk: {restored_files})."
+    OperationLogger.log("TRASH_RESTORE", msg, status="OK", db=db)
 
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
@@ -969,7 +1641,6 @@ def empty_trash_permanently(
     selected_ids: List[str] = Form(default=[]),
     db: Session = Depends(get_db),
 ):
-    """Permanently deletes files from data/kosz and removes their records from SQLite."""
     trash_dir = DATA_DIR / "kosz"
     stmt = select(MediaItem).where(MediaItem.is_trashed == True)
     if selected_ids:
@@ -982,14 +1653,14 @@ def empty_trash_permanently(
         if trash_file.exists():
             try:
                 trash_file.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Could not unlink trash file %s: %s", trash_file, exc)
         thumb_p = THUMBNAILS_DIR / it.thumbnail_relative_path
         if thumb_p.exists():
             try:
                 thumb_p.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Could not unlink thumbnail %s: %s", thumb_p, exc)
         db.delete(it)
         deleted_cnt += 1
 
@@ -998,10 +1669,12 @@ def empty_trash_permanently(
             db.delete(tg)
 
     db.commit()
+    OperationLogger.log("TRASH_EMPTY", f"Trwale opróżniono Kosz ({deleted_cnt} plików).", status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-rose-400 text-xs font-semibold'>🔥 Trwale usunięto z Kosza: {deleted_cnt} plików.</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
+
 
 @router.post("/rename-volume")
 def rename_volume_action(
@@ -1013,8 +1686,10 @@ def rename_volume_action(
     if not vol or not new_label.strip():
         return HTMLResponse("<span class='text-rose-400 text-xs'>Nieprawidłowa nazwa dysku.</span>")
 
+    old_label = vol.volume_label
     vol.volume_label = new_label.strip()[:64]
     db.commit()
+    OperationLogger.log("VOLUME_RENAME", f"Zmieniono nazwę dysku z '{old_label}' na '{vol.volume_label}'.", status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>✓ Zmieniono nazwę dysku na: {vol.volume_label}</span>",
         headers={"HX-Trigger": "refresh-all"},
@@ -1038,10 +1713,6 @@ def unindex_items_from_db(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    """
-    Removes media records and cached thumbnails from SQLite without touching
-    the original physical files on disk/USB.
-    """
     u_vid = to_int(unindex_volume_id)
     if u_vid:
         items = list(db.scalars(select(MediaItem).where(MediaItem.volume_id == u_vid)).all())
@@ -1060,8 +1731,8 @@ def unindex_items_from_db(
         if thumb_p.exists():
             try:
                 thumb_p.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Unindex thumbnail cleanup warning: %s", exc)
         db.delete(it)
         removed_cnt += 1
 
@@ -1071,12 +1742,71 @@ def unindex_items_from_db(
             db.delete(vol)
 
     db.commit()
+    OperationLogger.log("UNINDEX", f"Wyindeksowano z bazy {removed_cnt} pozycji (bez usuwania plików).", status="OK", db=db)
     return HTMLResponse(
         f"<span class='text-sky-300 text-xs font-semibold'>"
         f"✖️ Usunięto z indeksu bazy: {removed_cnt} pozycji (oryginalne pliki na dysku pozostały nienaruszone)."
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
+
+
+def _execute_delete_permanently_items(db: Session, item_ids: List[str], job_id: Optional[int] = None) -> Tuple[int, int]:
+    trash_dir = DATA_DIR / "kosz"
+    items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(item_ids))).all())
+    deleted_disk = 0
+    removed_db = 0
+
+    for idx, it in enumerate(items):
+        if job_id and ProcessManager.is_stop_requested(job_id):
+            ProcessManager.update_progress(
+                job_id,
+                remaining_ids=[x.id for x in items[idx:]],
+                status="STOPPED",
+                message=f"Zatrzymano trwałe usuwanie po {removed_db}/{len(items)}.",
+                db=db,
+            )
+            db.commit()
+            return deleted_disk, removed_db
+
+        vol = db.get(WindowsVolume, it.volume_id)
+        if vol:
+            src_p = Path(vol.last_known_drive_letter) / it.relative_path
+            if src_p.exists():
+                try:
+                    src_p.unlink()
+                    deleted_disk += 1
+                except OSError as exc:
+                    logger.debug("Permanent delete unlink warning: %s", exc)
+
+        trash_p = trash_dir / f"{it.id}_{it.file_name}"
+        if trash_p.exists():
+            try:
+                trash_p.unlink()
+                deleted_disk += 1
+            except OSError as exc:
+                logger.debug("Permanent delete trash unlink warning: %s", exc)
+
+        thumb_p = THUMBNAILS_DIR / it.thumbnail_relative_path
+        if thumb_p.exists():
+            try:
+                thumb_p.unlink()
+            except OSError as exc:
+                logger.debug("Permanent delete thumb unlink warning: %s", exc)
+
+        db.delete(it)
+        removed_db += 1
+
+    if job_id:
+        ProcessManager.finish_job(
+            job_id,
+            status="COMPLETED",
+            message=f"Trwale usunięto z dysku: {deleted_disk} plików (z bazy: {removed_db}).",
+            db=db,
+        )
+    db.commit()
+    return deleted_disk, removed_db
+
 
 @router.post("/delete-permanently")
 def delete_files_permanently_from_disk(
@@ -1095,12 +1825,7 @@ def delete_files_permanently_from_disk(
     duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    """
-    Permanently deletes the physical files from the source USB/local disk,
-    removes their thumbnails, and deletes their records from SQLite.
-    """
     BackupManager().create_backup("pre_permanent_disk_delete")
-    trash_dir = DATA_DIR / "kosz"
 
     d_gid = to_int(delete_group_id)
     grp_to_delete = None
@@ -1118,41 +1843,19 @@ def delete_files_permanently_from_disk(
     if not items and not grp_to_delete:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych elementów do trwałego usunięcia.</span>")
 
-    deleted_disk = 0
-    removed_db = 0
-    for it in items:
-        vol = db.get(WindowsVolume, it.volume_id)
-        if vol:
-            src_p = Path(vol.last_known_drive_letter) / it.relative_path
-            if src_p.exists():
-                try:
-                    src_p.unlink()
-                    deleted_disk += 1
-                except OSError:
-                    pass
+    item_ids = [it.id for it in items]
+    job_id = ProcessManager.create_job(
+        job_type="delete_permanently",
+        title=f"Trwałe usuwanie plików z dysku ({len(item_ids)} poz.)",
+        item_ids=item_ids,
+        db=db,
+    )
+    deleted_disk, removed_db = _execute_delete_permanently_items(db, item_ids, job_id=job_id)
 
-        trash_p = trash_dir / f"{it.id}_{it.file_name}"
-        if trash_p.exists():
-            try:
-                trash_p.unlink()
-                deleted_disk += 1
-            except OSError:
-                pass
-
-        thumb_p = THUMBNAILS_DIR / it.thumbnail_relative_path
-        if thumb_p.exists():
-            try:
-                thumb_p.unlink()
-            except OSError:
-                pass
-
-        db.delete(it)
-        removed_db += 1
-
-    if grp_to_delete:
+    if grp_to_delete and not ProcessManager.is_stop_requested(job_id):
         db.delete(grp_to_delete)
+        db.commit()
 
-    db.commit()
     return HTMLResponse(
         f"<span class='text-rose-400 text-xs font-semibold'>"
         f"🔥 Trwale usunięto fizycznie z dysku: {deleted_disk} plików (usunięto z bazy: {removed_db})."

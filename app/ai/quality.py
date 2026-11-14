@@ -1,18 +1,22 @@
+import logging
 from pathlib import Path
 from typing import Tuple, Optional
 import cv2
 import numpy as np
 from PIL import Image
 
+logger = logging.getLogger("MediaQuality")
+
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
-except ImportError:
-    pass
+except ImportError as exc:
+    logger.debug("pillow_heif not available: %s", exc)
 
 
 class MediaQualityAnalyzer:
-    # Zdjęcia z wynikiem < 45.0 są faktycznie rozmyte / poruszone
+    """Evaluates media decoding integrity and perceptual subject sharpness via Laplacian/Sobel energy."""
+
     DEFAULT_BLUR_THRESHOLD: float = 45.0
 
     @classmethod
@@ -29,7 +33,7 @@ class MediaQualityAnalyzer:
         elif max(h, w) < 256:
             gray = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_CUBIC)
 
-        # 1. Remove high-ISO sensor noise (3x3 Gaussian sigma=0.7) so grain isn't mistaken for sharpness
+        # 1. Remove high-ISO sensor noise (3x3 Gaussian sigma=0.7) so grain is not mistaken for sharpness
         denoised = cv2.GaussianBlur(gray, (3, 3), 0.7)
 
         # 2. Compute Laplacian (fine edges) and Sobel (coarse gradients)
@@ -49,9 +53,7 @@ class MediaQualityAnalyzer:
                 p_grad = grad[y : y + step_y, x : x + step_x]
                 mean_grad = float(np.mean(p_grad))
                 if mean_grad < 3.5:
-                    # Flat region (sky, wall, bokeh) -> ignore
                     continue
-                # High-frequency energy combined with edge crispness ratio (Laplacian / Sobel)
                 p95_lap = float(np.percentile(p_lap, 95))
                 crispness_ratio = float(np.mean(p_lap)) / (mean_grad + 1.0)
                 patch_scores.append(p95_lap * crispness_ratio)
@@ -59,7 +61,6 @@ class MediaQualityAnalyzer:
         if not patch_scores:
             return 10.0
 
-        # 90th percentile represents the sharpest subject in the frame
         return round(float(np.percentile(patch_scores, 90)) * 2.2, 1)
 
     @classmethod
@@ -81,7 +82,8 @@ class MediaQualityAnalyzer:
 
             score = cls._compute_subject_sharpness(gray)
             return False, bool(score < threshold), score
-        except Exception:
+        except Exception as exc:
+            logger.debug("Image analysis failed for %s: %s", path, exc)
             return True, False, None
 
     @classmethod

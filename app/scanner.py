@@ -1,11 +1,13 @@
 import ctypes
 from ctypes import wintypes
 import datetime
+import filecmp
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 import uuid
 import cv2
 from PIL import ExifTags, Image, ImageOps
@@ -13,11 +15,13 @@ from app.database import THUMBNAILS_DIR
 from app.models import MediaItem, WindowsVolume, MediaEmbedding
 from app.ai.embeddings import OnDemandClipEmbedder
 
+logger = logging.getLogger("Scanner")
+
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
-except ImportError:
-    pass
+except ImportError as exc:
+    logger.debug("pillow_heif not available: %s", exc)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".gif", ".avif"}
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".mts", ".m2ts", ".3gp", ".mpg", ".mpeg"}
@@ -31,6 +35,8 @@ DATE_PATTERNS = [
 
 
 class WindowsVolumeInspector:
+    """Inspects Windows hardware volume serial numbers (VSN) and labels via Win32 kernel32 API."""
+
     @staticmethod
     def get_volume_info(path: Path) -> Tuple[str, str, str]:
         abs_path = path.resolve()
@@ -60,13 +66,31 @@ class WindowsVolumeInspector:
                 vsn_hex = f"{(vsn_int >> 16) & 0xFFFF:04X}-{vsn_int & 0xFFFF:04X}"
                 label = volume_name.value if volume_name.value else "UNNAMED_DRIVE"
                 return vsn_hex, label, drive_root
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("GetVolumeInformationW fallback for %s: %s", drive_root, exc)
 
         return f"VOL_{drive.rstrip(':') or 'LOCAL'}", "LOCAL_STORAGE", drive_root
 
+    @classmethod
+    def get_connected_vsn_map(cls) -> Dict[str, Tuple[str, str]]:
+        """Returns mapping of {vsn_hex: (drive_root, volume_label)} for all currently mounted Windows drives."""
+        mounted: Dict[str, Tuple[str, str]] = {}
+        try:
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            for i in range(26):
+                if bitmask & (1 << i):
+                    drive_letter = f"{chr(65 + i)}:\\"
+                    if Path(drive_letter).exists():
+                        vsn, label, root = cls.get_volume_info(Path(drive_letter))
+                        mounted[vsn] = (root, label)
+        except Exception as exc:
+            logger.debug("Logical drive scan warning: %s", exc)
+        return mounted
+
 
 class FastHasher:
+    """Computes full SHA-256 for images, fast partial 3x64KB SHA-256 for videos, and multi-layer 100% verification."""
+
     CHUNK_SIZE = 64 * 1024
 
     @classmethod
@@ -91,11 +115,86 @@ class FastHasher:
             hasher.update(f.read(cls.CHUNK_SIZE))
         return hasher.hexdigest()
 
+    @classmethod
+    def compute_multi_hashes(cls, file_path: Path) -> Tuple[str, str, str]:
+        """Computes three independent full-stream cryptographic digests (SHA-256, BLAKE2b, MD5) in a single pass."""
+        h_sha256 = hashlib.sha256()
+        h_blake2b = hashlib.blake2b()
+        h_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(256 * 1024):
+                h_sha256.update(chunk)
+                h_blake2b.update(chunk)
+                h_md5.update(chunk)
+        return h_sha256.hexdigest(), h_blake2b.hexdigest(), h_md5.hexdigest()
+
+    @classmethod
+    def verify_files_identical_100_percent(cls, path_a: Path, path_b: Path) -> Tuple[bool, str, Optional[str]]:
+        """
+        Multi-layer independent verification guaranteeing 100% certainty that path_a and path_b
+        are distinct physical files with identical byte-for-byte content and valid structure.
+        """
+        try:
+            if not path_a.exists() or not path_b.exists():
+                return False, "Jeden z plików fizycznie nie istnieje na dysku.", None
+            if not path_a.is_file() or not path_b.is_file():
+                return False, "Ścieżka nie wskazuje na prawidłowy plik regularny.", None
+
+            res_a = path_a.resolve()
+            res_b = path_b.resolve()
+            if res_a == res_b:
+                return False, "Oba rekordy wskazują na ten sam fizyczny plik (ochrona przed usunięciem jedynej kopii).", None
+
+            try:
+                if os.path.samefile(res_a, res_b):
+                    return False, "Pliki mają ten sam deskryptor sprzętowy inode/hardlink.", None
+            except OSError as exc:
+                logger.debug("os.path.samefile check info: %s", exc)
+
+            stat_a = res_a.stat()
+            stat_b = res_b.stat()
+            if stat_a.st_size <= 0 or stat_b.st_size <= 0:
+                return False, "Plik ma zerowy rozmiar (0 bajtów).", None
+            if stat_a.st_size != stat_b.st_size:
+                return False, f"Różny rozmiar plików ({stat_a.st_size} B vs {stat_b.st_size} B).", None
+
+            # Layer 1 & 2: Full SHA-256, Full BLAKE2b, and Full MD5 cryptographic verification
+            sha_a, blake_a, md5_a = cls.compute_multi_hashes(res_a)
+            sha_b, blake_b, md5_b = cls.compute_multi_hashes(res_b)
+            if sha_a != sha_b:
+                return False, "Niezgodność pełnej sumy SHA-256.", None
+            if blake_a != blake_b:
+                return False, "Niezgodność pełnej sumy BLAKE2b.", None
+            if md5_a != md5_b:
+                return False, "Niezgodność pełnej sumy MD5.", None
+
+            # Layer 3: Direct byte-by-byte stream comparison (shallow=False forces full content comparison)
+            if not filecmp.cmp(str(res_a), str(res_b), shallow=False):
+                return False, "Bezpośrednie porównanie strumieni bajtowych (filecmp) wykryło różnicę.", None
+
+            # Layer 4: Media structural decode integrity verification on retained file
+            ext = res_a.suffix.lower()
+            if ext in IMAGE_EXTS:
+                try:
+                    with Image.open(res_a) as img_a, Image.open(res_b) as img_b:
+                        if img_a.size != img_b.size or img_a.mode != img_b.mode:
+                            return False, "Niezgodność wymiarów lub przestrzeni barw obrazu.", None
+                        img_a.verify()
+                except Exception as img_exc:
+                    logger.debug("Image structural decode warning: %s", img_exc)
+                    return False, f"Błąd struktury obrazu podczas weryfikacji: {img_exc}", None
+
+            return True, "Zweryfikowano w 100% (Rozmiar + SHA-256 + BLAKE2b + MD5 + Bajt-po-bajcie).", sha_a
+        except Exception as exc:
+            return False, f"Wyjątek weryfikacji bezpieczeństwa: {exc}", None
+
     hash_image = hash_image_full
     hash_video = hash_video_partial
 
 
 class MetadataDateResolver:
+    """Extracts and resolves media creation dates from EXIF, filename patterns, and filesystem metadata."""
+
     @staticmethod
     def parse_exif(path: Path) -> Optional[datetime.datetime]:
         try:
@@ -109,9 +208,10 @@ class MetadataDateResolver:
                             val = str(exif[tag_id]).strip("\x00").strip()
                             try:
                                 return datetime.datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
-                            except ValueError:
-                                pass
-        except Exception:
+                            except ValueError as exc:
+                                logger.debug("Unparseable EXIF date '%s': %s", val, exc)
+        except Exception as exc:
+            logger.debug("EXIF extraction skipped for %s: %s", path, exc)
             return None
         return None
 
@@ -159,6 +259,8 @@ class MetadataDateResolver:
 
 
 class ThumbnailService:
+    """Generates lightweight 300px WebP thumbnails on the local disk for offline browsing."""
+
     @classmethod
     def generate(cls, path: Path, media_id: str, is_img: bool) -> Tuple[str, Optional[int], Optional[int], Optional[float]]:
         dest = THUMBNAILS_DIR / f"{media_id}.webp"
@@ -167,8 +269,8 @@ class ThumbnailService:
                 orig_w, orig_h = img.size
                 try:
                     img.draft("RGB", (320, 320))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Image.draft not applicable: %s", exc)
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((300, 300), Image.Resampling.BILINEAR)
                 if img.mode != "RGB":
@@ -202,6 +304,13 @@ class ThumbnailService:
 
 
 class FileScannerService:
+    """Indexes individual image and video files into MediaItem entities with thumbnails and 512-D vectors."""
+
+    @staticmethod
+    def is_in_backup_folder(rel_path: str) -> bool:
+        parts = [p.lower() for p in Path(rel_path).parts if p not in ("", ".", "/", "\\")]
+        return bool(parts and parts[0] == "backup")
+
     @classmethod
     def process_file(cls, path: Path, volume: WindowsVolume, rel_override: Optional[str] = None) -> Optional[MediaItem]:
         ext = path.suffix.lower()
@@ -225,7 +334,8 @@ class FileScannerService:
         try:
             thumb_name, w, h, dur = ThumbnailService.generate(path, media_id, is_img)
             corrupted = False
-        except Exception:
+        except Exception as exc:
+            logger.debug("Thumbnail generation failed for %s: %s", path, exc)
             thumb_name = f"{media_id}.webp"
             (THUMBNAILS_DIR / thumb_name).touch()
             w, h, dur, corrupted = None, None, None, True
@@ -239,6 +349,7 @@ class FileScannerService:
             except ValueError:
                 rel_path = path.name
 
+        is_backup = cls.is_in_backup_folder(rel_path)
         now = datetime.datetime.utcnow()
         item = MediaItem(
             id=media_id,
@@ -250,10 +361,13 @@ class FileScannerService:
             mime_type=f"{'image' if is_img else 'video'}/{ext.lstrip('.')}",
             file_hash=file_hash,
             hash_algorithm="sha256" if is_img else "partial_3x64k",
-            is_primary_duplicate=True,
+            is_primary_duplicate=not is_backup,
+            is_backup_copy=is_backup,
+            verified_sha256=file_hash if is_img else None,
             width=w,
             height=h,
             duration_seconds=dur,
+            rotation_angle=0,
             exif_date=exif,
             filename_date=fn_dt,
             fs_ctime=ctime,
@@ -271,7 +385,7 @@ class FileScannerService:
             updated_at=now,
         )
 
-        # Automatyczne wyliczenie wektora 512-D z miniatury podczas indeksowania
+        # Compute 512-D visual embedding from cached thumbnail during indexing
         thumb_full = THUMBNAILS_DIR / thumb_name
         if not corrupted and thumb_full.exists() and thumb_full.stat().st_size > 0:
             try:
@@ -279,7 +393,7 @@ class FileScannerService:
                 item.embedding = MediaEmbedding(
                     media_id=media_id, model_name=OnDemandClipEmbedder.MODEL_NAME, dimensions=512, vector=blob
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Embedding generation skipped for %s: %s", media_id, exc)
 
         return item
