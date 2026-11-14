@@ -2306,6 +2306,129 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertIn("do_usuniecia", q_tags)
                 self.assertIn("do_usuniecia:niedoswietlone", q_tags)
 
+            # Test quality defect sub-filters, defect counts in sidebar, and modal details
+            r_sb_q = self.client.get("/media/sidebar")
+            self.assertEqual(r_sb_q.status_code, 200)
+            self.assertIn("Wady jakości (do usunięcia)", r_sb_q.text)
+            self.assertIn("Niedoświetlone (ciemne)", r_sb_q.text)
+            self.assertIn("do_usuniecia:niedoswietlone", r_sb_q.text)
+
+            r_q_filter = self.client.get("/media/search?quality_defect=niedoswietlone")
+            self.assertEqual(r_q_filter.status_code, 200)
+            self.assertIn("ciemne_foto.png", r_q_filter.text)
+            self.assertIn("CIEMNE", r_q_filter.text)
+
+            r_q_tag = self.client.get("/media/search?tag=do_usuniecia:niedoswietlone")
+            self.assertEqual(r_q_tag.status_code, 200)
+            self.assertIn("ciemne_foto.png", r_q_tag.text)
+
+            r_q_all = self.client.get("/media/search?quality_defect=all")
+            self.assertEqual(r_q_all.status_code, 200)
+            self.assertIn("ciemne_foto.png", r_q_all.text)
+
+            with self.TestingSessionLocal() as db:
+                dark_id = db.scalar(select(MediaItem.id).where(MediaItem.file_name == "ciemne_foto.png"))
+            r_det_q = self.client.get(f"/media/{dark_id}/detail")
+            self.assertEqual(r_det_q.status_code, 200)
+            self.assertIn("Wykryte wady jakości", r_det_q.text)
+            self.assertIn("Niedoświetlone (skrajnie ciemne)", r_det_q.text)
+
+            # Exercise all defect branches in get_media_detail and search sort/filter
+            with self.TestingSessionLocal() as db:
+                multi_def = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=va_id,
+                    relative_path="multi_def.jpg",
+                    file_name="multi_def.jpg",
+                    file_size_bytes=1000,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash="fakehash_multi_def",
+                    hash_algorithm="sha256",
+                    width=100,
+                    height=100,
+                    is_corrupted=True,
+                    is_blurry=True,
+                    blur_score=10.0,
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=datetime.datetime(2023, 5, 1, 12, 0),
+                    thumbnail_relative_path="multi.webp",
+                )
+                db.add(multi_def)
+                db.flush()
+                for qt in [
+                    "do_usuniecia:uszkodzone",
+                    "do_usuniecia:przeswietlone",
+                    "do_usuniecia:brak_detali",
+                    "do_usuniecia:niska_rozdzielczosc",
+                    "do_usuniecia:rozmyte",
+                    "do_usuniecia:rozmyte",
+                ]:
+                    db.add(MediaTag(media_id=multi_def.id, tag=qt, confidence=1.0, source_model="quality_check"))
+                db.commit()
+                multi_id = multi_def.id
+
+            r_det_multi = self.client.get(f"/media/{multi_id}/detail")
+            self.assertEqual(r_det_multi.status_code, 200)
+            self.assertIn("Plik uszkodzony", r_det_multi.text)
+            self.assertIn("Prześwietlone", r_det_multi.text)
+            self.assertIn("Brak detali", r_det_multi.text)
+            self.assertIn("Niska rozdzielczość", r_det_multi.text)
+
+            # Test corrupted fallback and blurry fallback without tags
+            with self.TestingSessionLocal() as db:
+                corr_fallback = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=va_id,
+                    relative_path="corr_fb.jpg",
+                    file_name="corr_fb.jpg",
+                    file_size_bytes=500,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash="fakehash_corrfb",
+                    hash_algorithm="sha256",
+                    is_corrupted=True,
+                    is_blurry=False,
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=now_dt,
+                    thumbnail_relative_path="corrfb.webp",
+                )
+                blur_fallback = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=va_id,
+                    relative_path="blur_fb.jpg",
+                    file_name="blur_fb.jpg",
+                    file_size_bytes=600,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash="fakehash_blurfb",
+                    hash_algorithm="sha256",
+                    is_corrupted=False,
+                    is_blurry=True,
+                    blur_score=15.0,
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=now_dt,
+                    thumbnail_relative_path="blurfb.webp",
+                )
+                db.add_all([corr_fallback, blur_fallback])
+                db.commit()
+                cfb_id, bfb_id = corr_fallback.id, blur_fallback.id
+
+            self.assertEqual(self.client.get(f"/media/{cfb_id}/detail").status_code, 200)
+            self.assertEqual(self.client.get(f"/media/{bfb_id}/detail").status_code, 200)
+
+            # Additional search filters and sort options coverage
+            self.assertEqual(self.client.get("/media/search?year=2023").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?year=invalid").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?quality_defect=niedoswietlone&tag=ciemne").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?sort_by=size_asc").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?sort_by=size_desc").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?sort_by=name_asc").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?sort_by=blur_asc").status_code, 200)
+
             r_df = self.client.post(
                 "/actions/analyze-all",
                 data={"analysis_type": "duplicates_fast", "scope": "all_drives", "run_sync": "true"},

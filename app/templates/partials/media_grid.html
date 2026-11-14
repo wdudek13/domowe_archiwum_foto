@@ -10,7 +10,24 @@
                 <span class="bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">💾 Urządzenie: {{ active_volume.volume_label }} ({{ active_volume.last_known_drive_letter }})</span>
             {% endif %}
             {% if active_tag %}
-                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Tag: {{ active_tag }}</span>
+                {% if active_tag.startswith('do_usuniecia') %}
+                    <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">
+                        ⚠️ Wada jakości:
+                        {% if active_tag == 'do_usuniecia' %}Wszystkie wadliwe
+                        {% elif active_tag == 'do_usuniecia:uszkodzone' %}Uszkodzone pliki
+                        {% elif active_tag == 'do_usuniecia:rozmyte' %}Rozmyte / brak ostrości
+                        {% elif active_tag == 'do_usuniecia:niedoswietlone' %}Niedoświetlone (ciemne)
+                        {% elif active_tag == 'do_usuniecia:przeswietlone' %}Prześwietlone (jasne)
+                        {% elif active_tag == 'do_usuniecia:brak_detali' %}Brak detali (płaskie)
+                        {% elif active_tag == 'do_usuniecia:niska_rozdzielczosc' %}Niska rozdzielczość (&lt;160px)
+                        {% else %}{{ active_tag }}{% endif %}
+                    </span>
+                {% else %}
+                    <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Tag: {{ active_tag }}</span>
+                {% endif %}
+            {% endif %}
+            {% if active_quality_defect %}
+                <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">⚠️ Wada jakości: {{ active_quality_defect }}</span>
             {% endif %}
             {% if active_folder %}
                 <span class="bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">📂 Katalog: {{ active_folder }}</span>
@@ -37,6 +54,47 @@
         </div>
         {% endif %}
     </div>
+
+    <!-- Pasek narzędzi Wad Jakości (Kandydaci do usunięcia) -->
+    {% if (active_tag and active_tag.startswith('do_usuniecia')) or active_quality_defect or blurry_only %}
+    <div class="bg-orange-950/30 border border-orange-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div>
+            <div class="font-bold text-orange-300 text-sm flex items-center space-x-1.5">
+                <span>⚠️ Kandydaci do usunięcia —
+                    {% if active_tag == 'do_usuniecia:uszkodzone' or active_quality_defect == 'uszkodzone' %}Uszkodzone pliki (błędy odczytu/nagłówka)
+                    {% elif active_tag == 'do_usuniecia:rozmyte' or active_quality_defect == 'rozmyte' %}Zdjęcia rozmyte i nieostre (niski wskaźnik ostrości)
+                    {% elif active_tag == 'do_usuniecia:niedoswietlone' or active_quality_defect == 'niedoswietlone' %}Skrajnie niedoświetlone (zbyt ciemne)
+                    {% elif active_tag == 'do_usuniecia:przeswietlone' or active_quality_defect == 'przeswietlone' %}Skrajnie prześwietlone (zbyt jasne)
+                    {% elif active_tag == 'do_usuniecia:brak_detali' or active_quality_defect == 'brak_detali' %}Brak detali (płaskie / jednolite kadry)
+                    {% elif active_tag == 'do_usuniecia:niska_rozdzielczosc' or active_quality_defect == 'niska_rozdzielczosc' %}Niska rozdzielczość (&lt;160 px)
+                    {% else %}Wszystkie wykryte wadliwe zdjęcia{% endif %}
+                    ({{ total_matching }} szt.)
+                </span>
+            </div>
+            <div class="text-slate-300 text-[11px]">Przejrzyj poniższe zdjęcia zaklasyfikowane do usunięcia. Możesz je zaznaczyć i masowo przenieść do Kosza lub trwale usunąć.</div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    onclick="selectAllVisible(true)"
+                    class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg font-medium border border-borderBg">
+                ☑️ Zaznacz widoczne
+            </button>
+            <button type="button"
+                    hx-post="/actions/move-to-trash"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-confirm="Czy na pewno przenieść zaznaczone wadliwe pliki do Kosza?"
+                    hx-target="#global-notification"
+                    class="bg-rose-700 hover:bg-rose-600 text-white px-3.5 py-1.5 rounded-lg font-semibold shadow">
+                🗑️ Przenieś do Kosza
+            </button>
+            <button type="button"
+                    onclick="openAiModalWithType('quality')"
+                    class="bg-purple-700 hover:bg-purple-600 text-white px-3 py-1.5 rounded-lg font-medium">
+                ⚡ Ponów analizę jakości
+            </button>
+        </div>
+    </div>
+    {% endif %}
 
     <!-- Pasek narzędzi Niezgodności Dat (Rozbieżności folder / plik / EXIF / kopiowanie) -->
     {% if anomaly_only %}
@@ -400,6 +458,30 @@
                             <span onclick="htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                                   class="bg-rose-700 hover:bg-rose-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px] cursor-pointer">DUPLIKAT (Porównaj)</span>
                         {% endif %}
+                        {% set d_tags = [] %}
+                        {% for t in item.tags %}
+                            {% if t.source_model == 'quality_check' or t.tag.startswith('do_usuniecia:') %}
+                                {% set _ = d_tags.append(t.tag) %}
+                            {% endif %}
+                        {% endfor %}
+                        {% if 'do_usuniecia:uszkodzone' in d_tags or item.is_corrupted %}
+                            <span class="bg-rose-900 text-rose-200 border border-rose-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Plik uszkodzony">💥 USZKODZONY</span>
+                        {% endif %}
+                        {% if 'do_usuniecia:rozmyte' in d_tags or (item.is_blurry and not d_tags) %}
+                            <span class="bg-amber-900 text-amber-200 border border-amber-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Rozmyte / brak ostrości (Laplacian: {{ '%.1f'|format(item.blur_score or 0) }})">🌫️ ROZMYTE</span>
+                        {% endif %}
+                        {% if 'do_usuniecia:niedoswietlone' in d_tags %}
+                            <span class="bg-slate-900 text-slate-300 border border-slate-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Niedoświetlone (zbyt ciemne)">🌑 CIEMNE</span>
+                        {% endif %}
+                        {% if 'do_usuniecia:przeswietlone' in d_tags %}
+                            <span class="bg-yellow-900 text-yellow-200 border border-yellow-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Prześwietlone (zbyt jasne)">☀️ JASNE</span>
+                        {% endif %}
+                        {% if 'do_usuniecia:brak_detali' in d_tags %}
+                            <span class="bg-zinc-800 text-zinc-300 border border-zinc-600 font-bold px-1 py-0.5 rounded text-[10px]" title="Brak detali / kadr pusty">⚪ PUSTE</span>
+                        {% endif %}
+                        {% if 'do_usuniecia:niska_rozdzielczosc' in d_tags %}
+                            <span class="bg-purple-950 text-purple-200 border border-purple-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Niska rozdzielczość (<160px)">🔍 MINI</span>
+                        {% endif %}
                         {% if item.embedding %}<span class="bg-purple-900/90 text-purple-200 px-1 rounded text-[9px] font-mono">512D</span>{% endif %}
                         {% if item.has_date_anomaly %}
                             <span class="bg-amber-500 text-black font-bold px-1 rounded text-[10px]" title="{{ item.date_anomaly_reason }}">! Data</span>
@@ -451,6 +533,9 @@
                   class="absolute top-1 right-1 z-20 bg-rose-700 text-white text-[8px] font-bold px-1 rounded cursor-pointer">DUP</span>
             {% elif item.embedding %}
             <span class="absolute top-1 right-1 z-20 bg-purple-900/80 text-purple-200 text-[8px] px-1 rounded font-mono">512D</span>
+            {% endif %}
+            {% if item.is_corrupted or item.is_blurry %}
+            <span class="absolute top-1 right-8 z-20 bg-orange-700 text-white text-[8px] font-bold px-1 rounded" title="Kandydat do usunięcia (wada jakości)">⚠️</span>
             {% endif %}
             <img src="/media/thumbnails/{{ item.thumbnail_relative_path }}"
                  alt="{{ item.file_name }}" loading="lazy"
@@ -545,8 +630,29 @@
                                       title="Kliknij, aby porównać wszystkie kopie tego pliku"
                                       class="bg-rose-700 hover:bg-rose-600 text-white font-bold px-1.5 py-0.5 rounded cursor-pointer">DUPLIKAT (Porównaj)</span>
                             {% endif %}
-                            {% if item.is_blurry %}
-                                <span class="bg-orange-900 text-orange-200 px-1 rounded">BLUR</span>
+                            {% set d_tags = [] %}
+                            {% for t in item.tags %}
+                                {% if t.source_model == 'quality_check' or t.tag.startswith('do_usuniecia:') %}
+                                    {% set _ = d_tags.append(t.tag) %}
+                                {% endif %}
+                            {% endfor %}
+                            {% if 'do_usuniecia:uszkodzone' in d_tags or item.is_corrupted %}
+                                <span class="bg-rose-800 text-rose-100 font-bold px-1 rounded shadow" title="Plik uszkodzony">USZKODZONY</span>
+                            {% endif %}
+                            {% if 'do_usuniecia:rozmyte' in d_tags or (item.is_blurry and not d_tags) %}
+                                <span class="bg-amber-800 text-amber-100 font-bold px-1 rounded shadow" title="Rozmyte / brak ostrości (Laplacian: {{ '%.1f'|format(item.blur_score or 0) }})">ROZMYTE</span>
+                            {% endif %}
+                            {% if 'do_usuniecia:niedoswietlone' in d_tags %}
+                                <span class="bg-slate-900 text-slate-200 border border-slate-600 font-bold px-1 rounded shadow" title="Niedoświetlone (zbyt ciemne)">CIEMNE</span>
+                            {% endif %}
+                            {% if 'do_usuniecia:przeswietlone' in d_tags %}
+                                <span class="bg-yellow-700 text-yellow-100 font-bold px-1 rounded shadow" title="Prześwietlone (zbyt jasne)">JASNE</span>
+                            {% endif %}
+                            {% if 'do_usuniecia:brak_detali' in d_tags %}
+                                <span class="bg-zinc-800 text-zinc-200 border border-zinc-600 font-bold px-1 rounded shadow" title="Brak detali / kadr pusty">BRAK DETALI</span>
+                            {% endif %}
+                            {% if 'do_usuniecia:niska_rozdzielczosc' in d_tags %}
+                                <span class="bg-purple-900 text-purple-200 border border-purple-600 font-bold px-1 rounded shadow" title="Niska rozdzielczość (<160px)">MINI</span>
                             {% endif %}
                         </div>
                     </div>
@@ -569,11 +675,13 @@
 
                         {% if item.tags %}
                         <div class="flex flex-wrap gap-1">
-                            {% for t in item.tags[:3] %}
+                            {% for t in item.tags %}
+                            {% if not t.tag.startswith('do_usuniecia') and loop.index <= 3 %}
                             <span onclick="applySidebarFilter({_reset: true, tag: '{{ t.tag }}'})"
                                   class="cursor-pointer bg-indigo-950/80 hover:bg-indigo-800 text-indigo-300 border border-indigo-800/60 px-1.5 py-0.2 rounded text-[9px] truncate max-w-[95px]">
                                 {{ t.tag }}
                             </span>
+                            {% endif %}
                             {% endfor %}
                         </div>
                         {% endif %}

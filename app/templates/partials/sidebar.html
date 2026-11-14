@@ -46,10 +46,53 @@
                 <span>👥 Duplikaty binarne</span>
                 <span class="font-mono text-[10px]">{{ total_dups }}</span>
             </button>
-            <button onclick="applySidebarFilter({_reset: true, blurry_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-orange-300">
-                <span>🔍 Rozmyte / Nieostre / Wadliwe</span>
-                <span class="font-mono text-[10px]">{{ total_blurry }}</span>
-            </button>
+            <div class="pt-1 mt-1 border-t border-borderBg/40 space-y-0.5">
+                <div class="flex items-center justify-between px-1 text-[10px] font-bold text-orange-400 uppercase tracking-wider">
+                    <span>⚠️ Wady jakości (do usunięcia)</span>
+                    <button type="button"
+                            onclick="const sub = document.getElementById('quality-defects-sub'); sub.classList.toggle('hidden'); this.innerText = sub.classList.contains('hidden') ? '▼' : '▲';"
+                            class="text-[10px] text-slate-400 hover:text-orange-300 px-1 font-mono">
+                        ▼
+                    </button>
+                </div>
+                <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia'})"
+                        class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-orange-950/40 text-orange-300 font-medium">
+                    <span>⚠️ Wszystkie wadliwe zdjęcia</span>
+                    <span class="font-mono text-[10px] bg-orange-950/80 border border-orange-800/60 px-1.5 py-0.5 rounded text-orange-200">{{ defect_counts.all if defect_counts else total_blurry }}</span>
+                </button>
+                <div id="quality-defects-sub" class="pl-2 space-y-0.5">
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:uszkodzone'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-rose-950/50 text-rose-300 text-[11px]">
+                        <span>💥 Uszkodzone pliki</span>
+                        <span class="font-mono text-[10px] bg-rose-950/80 border border-rose-800/50 px-1.5 py-0.2 rounded">{{ defect_counts.corrupted if defect_counts else 0 }}</span>
+                    </button>
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:rozmyte'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-amber-950/50 text-amber-300 text-[11px]">
+                        <span>🌫️ Rozmyte / brak ostrości</span>
+                        <span class="font-mono text-[10px] bg-amber-950/80 border border-amber-800/50 px-1.5 py-0.2 rounded">{{ defect_counts.blurry if defect_counts else 0 }}</span>
+                    </button>
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:niedoswietlone'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-slate-800 text-slate-300 text-[11px]">
+                        <span>🌑 Niedoświetlone (ciemne)</span>
+                        <span class="font-mono text-[10px] bg-slate-900 border border-slate-700 px-1.5 py-0.2 rounded">{{ defect_counts.dark if defect_counts else 0 }}</span>
+                    </button>
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:przeswietlone'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-yellow-950/50 text-yellow-300 text-[11px]">
+                        <span>☀️ Prześwietlone (jasne)</span>
+                        <span class="font-mono text-[10px] bg-yellow-950/80 border border-yellow-800/50 px-1.5 py-0.2 rounded">{{ defect_counts.bright if defect_counts else 0 }}</span>
+                    </button>
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:brak_detali'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-zinc-800 text-zinc-300 text-[11px]">
+                        <span>⚪ Brak detali (płaskie)</span>
+                        <span class="font-mono text-[10px] bg-zinc-900 border border-zinc-700 px-1.5 py-0.2 rounded">{{ defect_counts.detail if defect_counts else 0 }}</span>
+                    </button>
+                    <button onclick="applySidebarFilter({_reset: true, tag: 'do_usuniecia:niska_rozdzielczosc'})"
+                            class="w-full flex justify-between items-center px-2 py-1 rounded-lg hover:bg-purple-950/50 text-purple-300 text-[11px]">
+                        <span>🔍 Niska rozdz. (&lt;160px)</span>
+                        <span class="font-mono text-[10px] bg-purple-950/80 border border-purple-800/50 px-1.5 py-0.2 rounded">{{ defect_counts.lowres if defect_counts else 0 }}</span>
+                    </button>
+                </div>
+            </div>
             <button type="button" onclick="applySidebarFilter({_reset: true, trashed_only: true})"
                     class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 font-semibold border border-rose-900/40 mt-1">
                 <span>🗑️ Kosz (Usunięte)</span>

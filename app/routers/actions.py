@@ -611,12 +611,15 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                     quality_done = True
                     if mtype == "video":
                         corrupted, blurry, score = MediaQualityAnalyzer.analyze_video(src_p)
+                        _, quality_tags = MediaQualityAnalyzer.classify_quality_tags(
+                            src_p, corrupted, blurry, score
+                        )
                     else:
-                        corrupted, blurry, score = MediaQualityAnalyzer.analyze_image(src_p)
-                    extra_blurry, quality_tags = MediaQualityAnalyzer.classify_quality_tags(
-                        src_p, corrupted, blurry, score, orig_dims=(orig_w, orig_h)
-                    )
-                    blurry = bool(blurry or extra_blurry)
+                        detailed = MediaQualityAnalyzer.analyze_image_detailed(src_p, orig_dims=(orig_w, orig_h))
+                        corrupted = detailed["is_corrupted"]
+                        blurry = detailed["is_blurry"]
+                        score = detailed["blur_score"]
+                        quality_tags = detailed["quality_tags"]
 
                 computed_batch.append((mid, tags, vec_blob, quality_done, corrupted, blurry, score, quality_tags, repaired_dims))
                 AI_BATCH_STATE["processed"] += 1

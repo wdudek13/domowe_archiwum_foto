@@ -92,6 +92,7 @@ def apply_media_filters(
     unbacked_only: bool = False,
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
+    quality_defect: Optional[str] = None,
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
@@ -110,8 +111,19 @@ def apply_media_filters(
         stmt = stmt.where(MediaItem.group_id.in_(subtree_ids))
     if ungrouped_only:
         stmt = stmt.where(MediaItem.group_id.is_(None))
+    if quality_defect and quality_defect.strip():
+        qdef = quality_defect.strip().lower()
+        if qdef in ("all", "any"):
+            stmt = stmt.join(MediaItem.tags).where(MediaTag.tag.ilike("do_usuniecia%"))
+        else:
+            defect_tag = qdef if qdef.startswith("do_usuniecia:") else f"do_usuniecia:{qdef}"
+            stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == defect_tag)
     if tag and tag.strip():
-        stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == tag.strip())
+        if not quality_defect or not quality_defect.strip():
+            stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == tag.strip())
+        else:
+            tag_alias = aliased(MediaTag)
+            stmt = stmt.join(tag_alias, tag_alias.media_id == MediaItem.id).where(tag_alias.tag == tag.strip())
     if untagged_only:
         stmt = stmt.where(~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
     if unvectored_only:
@@ -205,11 +217,20 @@ def build_sidebar_context(db: Session) -> dict:
     top_tags = db.execute(
         select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
         .join(MediaItem, MediaItem.id == MediaTag.media_id)
-        .where(MediaItem.is_trashed == False)
+        .where(MediaItem.is_trashed == False, MediaTag.source_model != "quality_check")
         .group_by(MediaTag.tag)
         .order_by(desc("cnt"))
         .limit(35)
     ).all()
+
+    defect_counts_raw = dict(
+        db.execute(
+            select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)))
+            .join(MediaItem, MediaItem.id == MediaTag.media_id)
+            .where(MediaItem.is_trashed == False, MediaTag.source_model == "quality_check")
+            .group_by(MediaTag.tag)
+        ).all()
+    )
 
     years = db.execute(
         select(extract("year", MediaItem.effective_date).label("yr"), func.count(MediaItem.id))
@@ -227,6 +248,16 @@ def build_sidebar_context(db: Session) -> dict:
             or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
         )
     ) or 0
+    total_defects_all = defect_counts_raw.get("do_usuniecia", 0) or total_blurry
+    defect_counts = {
+        "all": total_defects_all,
+        "corrupted": defect_counts_raw.get("do_usuniecia:uszkodzone", 0),
+        "blurry": defect_counts_raw.get("do_usuniecia:rozmyte", 0),
+        "dark": defect_counts_raw.get("do_usuniecia:niedoswietlone", 0),
+        "bright": defect_counts_raw.get("do_usuniecia:przeswietlone", 0),
+        "detail": defect_counts_raw.get("do_usuniecia:brak_detali", 0),
+        "lowres": defect_counts_raw.get("do_usuniecia:niska_rozdzielczosc", 0),
+    }
     total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
     total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id))) or 0
     total_untagged = db.scalar(
@@ -260,6 +291,8 @@ def build_sidebar_context(db: Session) -> dict:
         "total_anomalies": total_anomalies,
         "total_dups": total_dups,
         "total_blurry": total_blurry,
+        "total_defects_all": total_defects_all,
+        "defect_counts": defect_counts,
         "total_trashed": total_trashed,
         "total_vectors": total_vectors,
         "total_untagged": total_untagged,
@@ -290,6 +323,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     unbacked_only = to_bool(qp.get("unbacked_only"))
     unvectored_only = to_bool(qp.get("unvectored_only"))
     unanalyzed_quality_only = to_bool(qp.get("unanalyzed_quality_only"))
+    quality_defect = qp.get("quality_defect")
     sort_by = qp.get("sort_by", "date_desc")
     view_mode = qp.get("view_mode", "grid")
     page_int = max(1, to_int(qp.get("page")) or 1)
@@ -299,7 +333,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     filtered_stmt = apply_media_filters(
         base_stmt, db, q, media_type, vol_id_int, folder_prefix, grp_id_int, tag, yr_int,
         anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only,
-        unvectored_only, unanalyzed_quality_only
+        unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect
     ).distinct()
 
     count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
@@ -377,6 +411,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         "active_group": active_group,
         "active_volume": active_volume,
         "active_tag": tag,
+        "active_quality_defect": quality_defect,
         "active_volume_id": vol_id_int,
         "active_folder": folder_prefix,
         "trashed_only": trashed_only,
@@ -548,6 +583,36 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
         f_dt, f_prec, f_seg = folder_info
         folder_date_str = f"{f_dt.strftime('%Y-%m-%d')} ({f_prec}, katalog: '{f_seg}')"
 
+    quality_tags = [t for t in it.tags if t.source_model == "quality_check" or t.tag.startswith("do_usuniecia")]
+    semantic_tags = [t for t in it.tags if t.source_model != "quality_check" and not t.tag.startswith("do_usuniecia")]
+
+    defect_labels = []
+    seen_tags = set()
+    for qt in quality_tags:
+        if qt.tag in seen_tags:
+            continue
+        seen_tags.add(qt.tag)
+        if qt.tag == "do_usuniecia:uszkodzone":
+            defect_labels.append({"tag": qt.tag, "name": "Plik uszkodzony", "desc": "Błąd nagłówka / dekompresji / uszkodzone bajty", "badge_class": "bg-rose-950 text-rose-300 border-rose-700"})
+        elif qt.tag == "do_usuniecia:rozmyte":
+            blur_val = f"{it.blur_score:.1f}" if it.blur_score is not None else "0.0"
+            defect_labels.append({"tag": qt.tag, "name": f"Rozmyte / brak ostrości (wynik: {blur_val})", "desc": f"Niski wskaźnik ostrości Laplaciana ({blur_val} < 45.0)", "badge_class": "bg-amber-950 text-amber-300 border-amber-700"})
+        elif qt.tag == "do_usuniecia:niedoswietlone":
+            defect_labels.append({"tag": qt.tag, "name": "Niedoświetlone (skrajnie ciemne)", "desc": "Średnia jasność < 15.0 lub 95. percentyl < 38.0", "badge_class": "bg-slate-900 text-slate-300 border-slate-700"})
+        elif qt.tag == "do_usuniecia:przeswietlone":
+            defect_labels.append({"tag": qt.tag, "name": "Prześwietlone (skrajnie jasne)", "desc": "Średnia jasność > 243.0 lub 5. percentyl > 220.0", "badge_class": "bg-yellow-950 text-yellow-300 border-yellow-700"})
+        elif qt.tag == "do_usuniecia:brak_detali":
+            defect_labels.append({"tag": qt.tag, "name": "Brak detali (płaski / pusty kadr)", "desc": "Odchylenie standardowe luminancji < 6.5 (jednolite tło)", "badge_class": "bg-zinc-900 text-zinc-300 border-zinc-700"})
+        elif qt.tag == "do_usuniecia:niska_rozdzielczosc":
+            dims_str = f"{it.width}x{it.height}" if it.width and it.height else "< 160px"
+            defect_labels.append({"tag": qt.tag, "name": f"Niska rozdzielczość ({dims_str})", "desc": "Dłuższa krawędź < 160 px", "badge_class": "bg-purple-950 text-purple-300 border-purple-700"})
+
+    if it.is_corrupted and not any(d["tag"] == "do_usuniecia:uszkodzone" for d in defect_labels):
+        defect_labels.append({"tag": "do_usuniecia:uszkodzone", "name": "Plik uszkodzony", "desc": "Błąd odczytu pliku źródłowego", "badge_class": "bg-rose-950 text-rose-300 border-rose-700"})
+    if it.is_blurry and not any(d["tag"] == "do_usuniecia:rozmyte" for d in defect_labels):
+        blur_val = f"{it.blur_score:.1f}" if it.blur_score is not None else "0.0"
+        defect_labels.append({"tag": "do_usuniecia:rozmyte", "name": f"Rozmyte / brak ostrości (wynik: {blur_val})", "desc": "Niski wskaźnik ostrości Laplaciana", "badge_class": "bg-amber-950 text-amber-300 border-amber-700"})
+
     return render_template(
         request,
         "partials/modal_detail.html",
@@ -557,5 +622,8 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,
             "folder_date_str": folder_date_str,
+            "quality_tags": quality_tags,
+            "semantic_tags": semantic_tags,
+            "defect_labels": defect_labels,
         },
     )

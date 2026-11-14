@@ -310,7 +310,7 @@
             if (!form) return;
             clearPersistedSelection();
             if (paramsObj._reset) {
-                ['volume_id', 'folder_prefix', 'group_id', 'tag', 'year'].forEach(k => {
+                ['volume_id', 'folder_prefix', 'group_id', 'tag', 'quality_defect', 'year'].forEach(k => {
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.value = '';
                 });

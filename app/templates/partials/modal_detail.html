@@ -68,6 +68,36 @@
                     <div class="flex justify-between"><span class="text-slate-500">Album:</span><span class="text-indigo-300 font-semibold">{{ item.group.name if item.group else 'Brak (Swobodna pula)' }}</span></div>
                 </div>
 
+                <!-- Diagnostyka jakości i wady (Kandydat do usunięcia) -->
+                {% if defect_labels %}
+                <div class="mt-3 p-3 rounded-xl bg-orange-950/30 border border-orange-700/60 space-y-2">
+                    <div class="flex items-center justify-between">
+                        <div class="font-bold text-orange-300 text-xs flex items-center space-x-1.5">
+                            <span>⚠️ Wykryte wady jakości (kandydat do usunięcia):</span>
+                        </div>
+                        <button type="button"
+                                hx-post="/actions/move-to-trash"
+                                hx-vals='{"scope": "selected", "selected_ids": "{{ item.id }}"}'
+                                hx-target="#global-notification"
+                                onclick="this.closest('.fixed').remove();"
+                                class="bg-rose-800 hover:bg-rose-700 text-white text-[11px] px-2.5 py-1 rounded font-semibold shadow">
+                            🗑️ Przenieś do Kosza
+                        </button>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                        {% for d in defect_labels %}
+                        <button type="button"
+                                onclick="this.closest('.fixed').remove(); applySidebarFilter({_reset: true, tag: '{{ d.tag }}'})"
+                                title="{{ d.desc }} — kliknij aby filtrować wszystkie takie zdjęcia"
+                                class="{{ d.badge_class }} border text-[11px] px-2.5 py-1 rounded-full font-medium hover:brightness-125 transition flex items-center space-x-1">
+                            <span>{{ d.name }}</span>
+                            <span class="text-[9px] opacity-75">🔍</span>
+                        </button>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
                 <!-- Szybka zmiana daty lub usunięcie z listy niezgodności dat (Req 4a) -->
                 <div class="mt-3 p-2.5 rounded-xl bg-slate-900/90 border border-borderBg space-y-2">
                     <form hx-post="/actions/change-date"
@@ -117,13 +147,13 @@
                 <div class="mt-4">
                     <span class="text-slate-400 font-semibold">Wygenerowane Tagi AI (Kliknij aby filtrować):</span>
                     <div class="flex flex-wrap gap-1.5 mt-2">
-                        {% for t in item.tags %}
+                        {% for t in (semantic_tags if semantic_tags is defined else item.tags) %}
                         <button onclick="this.closest('.fixed').remove(); applySidebarFilter({_reset: true, tag: '{{ t.tag }}'})"
                                 class="bg-indigo-950 hover:bg-indigo-800 text-indigo-300 border border-indigo-700/60 text-[11px] px-2.5 py-1 rounded-full transition">
                             🏷️ {{ t.tag }} <span class="text-indigo-400 font-mono">({{ "%.0f"|format(t.confidence*100) }}%)</span>
                         </button>
                         {% else %}
-                        <span class="text-slate-500 italic">Brak tagów. Kliknij przycisk '⚡ Analizuj AI' na pasku.</span>
+                        <span class="text-slate-500 italic">Brak obiektów rozpoznanych przez AI.</span>
                         {% endfor %}
                     </div>
                 </div>
