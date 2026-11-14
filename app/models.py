@@ -17,6 +17,8 @@ class WindowsVolume(Base):
     file_system: Mapped[str] = mapped_column(String(32), default="NTFS", nullable=False)
     last_known_drive_letter: Mapped[str] = mapped_column(String(16), nullable=False)
     is_online: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
+    total_space_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, default=0, nullable=True)
+    free_space_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, default=0, nullable=True)
     last_seen_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
     media_items: Mapped[List["MediaItem"]] = relationship("MediaItem", back_populates="volume")

@@ -81,6 +81,38 @@
         </div>
     </form>
 
+    <!-- Sekcja Przywracania bazy SQLite z backupu na Google Drive -->
+    <div class="bg-slate-900/90 border border-amber-700/50 p-4 rounded-xl space-y-2.5">
+        <div class="flex items-center justify-between">
+            <h4 class="font-bold text-amber-300 text-xs">♻️ Przywracanie bazy SQLite z backupu na Google Drive</h4>
+            <span class="text-[10px] text-slate-400">Automatyczna weryfikacja sumy MD5 + kopia bezpieczeństwa <code>pre_restore</code></span>
+        </div>
+        {% if db_backups %}
+        <form hx-post="/actions/gdrive-restore-db"
+              hx-target="#gdrive-panel-body"
+              hx-confirm="Czy na pewno chcesz pobrać wybraną kopię bazy z Google Drive i przywrócić z niej bieżącą bazę SQLite? (Aktualna baza zostanie wcześniej zapisana w data/backups/)."
+              class="flex flex-wrap items-center gap-3">
+            <input type="hidden" name="folder_id" value="{{ active_folder_id }}">
+            <select name="file_id" required
+                    class="flex-1 min-w-[220px] bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200 font-mono text-[11px]">
+                {% for db_f in db_backups %}
+                <option value="{{ db_f.id }}">
+                    {{ db_f.name }} ({{ db_f.createdTime[:19].replace('T', ' ') if db_f.createdTime else '?' }}, MD5: {{ db_f.md5Checksum[:10] if db_f.md5Checksum else '-' }})
+                </option>
+                {% endfor %}
+            </select>
+            <button type="submit"
+                    class="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-lg font-semibold shadow transition">
+                ♻️ Pobierz i przywróć wybraną bazę z Google Drive
+            </button>
+        </form>
+        {% else %}
+        <div class="text-slate-400 italic text-[11px]">
+            W wybranej kartotece nie znaleziono kopii zapasowej bazy (<code>.db</code> / <code>.sqlite</code>). Użyj najpierw przycisku „Wyślij Backup Bazy SQLite”.
+        </div>
+        {% endif %}
+    </div>
+
     <!-- Dowód wgrania: Podgląd zawartości wybranego katalogu na Google Drive -->
     <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
         <div class="flex items-center justify-between">
@@ -99,20 +131,33 @@
                         <th class="py-1.5 px-2">Rozmiar</th>
                         <th class="py-1.5 px-2">Suma MD5 (Google Drive)</th>
                         <th class="py-1.5 px-2">Data wgrania</th>
-                        <th class="py-1.5 px-2 text-right">Podgląd</th>
+                        <th class="py-1.5 px-2 text-right">Akcje / Podgląd</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-borderBg/40 font-mono">
                     {% for cf in cloud_files %}
+                    {% set cf_lower = (cf.name or '')|lower %}
                     <tr class="hover:bg-slate-800/50">
                         <td class="py-1.5 px-2 text-slate-200 truncate max-w-[180px]" title="{{ cf.name }}">{{ cf.name }}</td>
                         <td class="py-1.5 px-2 text-slate-400">{{ "%.2f"|format((cf.size|int) / (1024*1024)) if cf.size else '?' }} MB</td>
                         <td class="py-1.5 px-2 text-emerald-400 text-[10px]">{{ cf.md5Checksum or 'Folder/Doc' }}</td>
                         <td class="py-1.5 px-2 text-slate-400 text-[10px]">{{ cf.createdTime[:19].replace('T', ' ') if cf.createdTime else '' }}</td>
-                        <td class="py-1.5 px-2 text-right">
-                            <a href="{{ cf.webViewLink }}" target="_blank" class="bg-sky-900/70 hover:bg-sky-700 text-sky-200 px-2 py-0.5 rounded text-[10px]">
+                        <td class="py-1.5 px-2 text-right space-x-1 whitespace-nowrap">
+                            {% if cf_lower.endswith('.db') or cf_lower.endswith('.sqlite') or cf_lower.endswith('.sqlite3') %}
+                            <button type="button"
+                                    hx-post="/actions/gdrive-restore-db"
+                                    hx-vals='{"file_id": "{{ cf.id }}", "folder_id": "{{ active_folder_id }}"}'
+                                    hx-target="#gdrive-panel-body"
+                                    hx-confirm="Czy na pewno przywrócić bazę z pliku '{{ cf.name }}'?"
+                                    class="bg-amber-700/80 hover:bg-amber-600 text-amber-100 px-2 py-0.5 rounded text-[10px] font-sans font-semibold">
+                                ♻️ Przywróć tę bazę
+                            </button>
+                            {% endif %}
+                            {% if cf.webViewLink %}
+                            <a href="{{ cf.webViewLink }}" target="_blank" class="bg-sky-900/70 hover:bg-sky-700 text-sky-200 px-2 py-0.5 rounded text-[10px] font-sans">
                                 Pokaż na Drive &nearr;
                             </a>
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}

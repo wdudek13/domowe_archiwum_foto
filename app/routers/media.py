@@ -160,21 +160,7 @@ def build_flat_album_choices(groups: List[MediaGroup]) -> List[dict]:
 def build_sidebar_context(db: Session) -> dict:
     svc = StorageAutomationService(db)
     volumes = svc.refresh_volumes_online_status()
-    vol_space = {}
-    for v in volumes:
-        if v.is_online:
-            try:
-                u = shutil.disk_usage(v.last_known_drive_letter)
-                vol_space[v.id] = {
-                    "free_gb": u.free / (1024 ** 3),
-                    "total_gb": u.total / (1024 ** 3),
-                    "used_pct": int((u.used / u.total) * 100) if u.total else 0,
-                }
-            except Exception as exc:
-                logger.debug("disk_usage warning for %s: %s", v.last_known_drive_letter, exc)
-                vol_space[v.id] = None
-        else:
-            vol_space[v.id] = None
+    vol_space = svc.get_volume_space_map(volumes)
 
     vol_counts = dict(
         db.execute(

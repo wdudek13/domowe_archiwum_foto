@@ -29,14 +29,20 @@
         {% endif %}
     </div>
 
-    <!-- Pasek narzędzi Anomalii Daty (Requirement 4a Multimedia) -->
+    <!-- Pasek narzędzi Anomalii Daty (Rozbieżności folder / plik / EXIF / kopiowanie) -->
     {% if anomaly_only %}
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
-            <div class="font-bold text-amber-300 text-sm">⚠️ Lista zdjęć z nieprawidłową datą / anomalią EXIF ({{ total_matching }} szt.)</div>
-            <div class="text-slate-300 text-[11px]">Możesz ustawić nową datę dla wybranych zdjęć (co usunie je z tej listy) lub usunąć zdjęcia z tej listy na życzenie bez zmiany daty.</div>
+            <div class="font-bold text-amber-300 text-sm">⚠️ Wykryte rozbieżności dat (folder / nazwa pliku / EXIF / data pliku) ({{ total_matching }} szt.)</div>
+            <div class="text-slate-300 text-[11px]">Oznacza pliki z niezgodnością dat między folderem, nazwą pliku, EXIF lub datą zmodyfikowaną podczas kopiowania (ustawiono datę najbardziej prawdopodobną).</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    hx-post="/actions/recalculate-date-anomalies"
+                    hx-target="#global-notification"
+                    class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-semibold">
+                🔄 Przelicz źródła dat
+            </button>
             <form hx-post="/actions/change-date"
                   hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                   hx-target="#global-notification"
@@ -243,6 +249,13 @@
                 <button type="submit" class="bg-amber-700 hover:bg-amber-600 text-white px-2.5 py-1 rounded">📅 Zmień datę albumu</button>
             </form>
 
+            <!-- Obrót całego albumu o +90° -->
+            <form hx-post="/actions/rotate-media" hx-target="#global-notification" class="flex items-center space-x-1">
+                <input type="hidden" name="album_id" value="{{ active_group.id }}">
+                <input type="hidden" name="delta" value="90">
+                <button type="submit" class="bg-sky-700 hover:bg-sky-600 text-white px-2.5 py-1 rounded font-medium">⟳ Obróć album +90°</button>
+            </form>
+
             <!-- Konsolidacja na wybrany dysk -->
             <form hx-post="/actions/consolidate" hx-target="#global-notification" class="flex items-center space-x-1">
                 <input type="hidden" name="group_id" value="{{ active_group.id }}">
@@ -368,6 +381,11 @@
                                     class="text-[10px] bg-emerald-900 hover:bg-emerald-700 text-emerald-200 px-1 py-0.5 rounded">✓ OK</button>
                         {% endif %}
                         <button type="button" hx-get="/semantic/similar/{{ item.id }}" hx-target="#media-grid" class="text-[10px] bg-slate-800 hover:bg-purple-900 text-purple-300 px-1.5 py-0.5 rounded">🔍 Podobne</button>
+                        <button type="button"
+                                hx-post="/actions/rotate-media"
+                                hx-vals='{"media_id": "{{ item.id }}", "delta": 90}'
+                                hx-target="#global-notification"
+                                class="text-[10px] bg-slate-800 hover:bg-sky-900 text-sky-300 px-1.5 py-0.5 rounded">⟳ +90°</button>
                         <button type="button"
                                 hx-post="/actions/move-to-trash"
                                 hx-vals='{"scope": "selected", "selected_ids": "{{ item.id }}"}'

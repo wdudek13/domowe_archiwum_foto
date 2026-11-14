@@ -59,6 +59,52 @@ class BackupManager:
         self._rotate()
         return dest_path
 
+    def restore_from_backup(self, source_backup_path: Path) -> Path:
+        """
+        Verifies a downloaded or local SQLite backup file and atomically restores it
+        into the active database using sqlite3.Connection.backup().
+        Creates a safety pre_restore backup before overwriting existing data.
+        """
+        source_path = Path(source_backup_path)
+        if not source_path.exists() or not source_path.is_file():
+            raise FileNotFoundError(f"Plik kopii zapasowej nie istnieje: {source_path}")
+
+        src_check = sqlite3.connect(source_path.as_posix())
+        try:
+            cur = src_check.cursor()
+            cur.execute("PRAGMA integrity_check;")
+            integrity = [row[0] for row in cur.fetchall()]
+            if integrity != ["ok"]:
+                raise RuntimeError("Plik kopii zapasowej jest uszkodzony lub nie jest prawidłową bazą Domowego Archiwum Foto.")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='media_items';")
+            if not cur.fetchone():
+                raise RuntimeError("Plik kopii zapasowej jest uszkodzony lub nie jest prawidłową bazą Domowego Archiwum Foto.")
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"Plik kopii zapasowej jest uszkodzony lub nie jest prawidłową bazą Domowego Archiwum Foto: {exc}"
+            ) from exc
+        finally:
+            src_check.close()
+
+        if self.db_path.exists():
+            self.create_backup("pre_restore")
+
+        if self.db_path.resolve() == db_module.DB_PATH.resolve():
+            db_module.engine.dispose()
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        source_conn = sqlite3.connect(source_path.as_posix())
+        dest_conn = sqlite3.connect(self.db_path.as_posix(), timeout=30.0)
+        try:
+            with dest_conn:
+                source_conn.backup(dest_conn, pages=250, sleep=0.005)
+        finally:
+            dest_conn.close()
+            source_conn.close()
+
+        db_module.ensure_schema_migrations(self.db_path)
+        return self.db_path
+
     def _rotate(self) -> None:
         backups = sorted(
             list(self.backup_dir.glob("media_vault_*.db")),

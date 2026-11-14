@@ -9,11 +9,12 @@ import threading
 import traceback
 from typing import List, Optional, Tuple
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from sqlalchemy import select, delete, update
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
+import app.database as db_module
 from app.database import get_db, SessionLocal, THUMBNAILS_DIR, DATA_DIR
 from app.models import (
     WindowsVolume,
@@ -85,8 +86,56 @@ def resolve_target_items(
     return list(db.scalars(stmt).unique().all())
 
 
+def _compute_scan_relative_path(full: Path, abs_root: Path, root_resolved: Path, abs_target: Path) -> str:
+    """Computes a stable relative path without collapsing Windows junctions into duplicate target paths."""
+    abs_full = Path(os.path.abspath(full))
+    try:
+        return abs_full.relative_to(abs_root).as_posix()
+    except ValueError:
+        try:
+            return full.resolve().relative_to(root_resolved).as_posix()
+        except ValueError:
+            try:
+                return abs_full.relative_to(abs_target).as_posix()
+            except ValueError:
+                return full.name
+
+
+def _commit_scan_batch(db: Session, batch_items: List[MediaItem], vol_id: int) -> int:
+    """Commits a batch of scanned MediaItems, falling back to row-by-row conflict-safe insert on error."""
+    if not batch_items:
+        return 0
+    try:
+        db.add_all(batch_items)
+        db.commit()
+        return len(batch_items)
+    except Exception as exc:
+        logger.warning("Scan batch commit fallback due to conflict/error (%s); inserting row-by-row.", exc)
+        db.rollback()
+        added = 0
+        for item in batch_items:
+            exists_id = db.scalar(
+                select(MediaItem.id).where(
+                    MediaItem.volume_id == vol_id,
+                    MediaItem.relative_path == item.relative_path,
+                )
+            )
+            if exists_id:
+                continue
+            try:
+                db.add(item)
+                db.commit()
+                added += 1
+            except Exception as row_exc:
+                logger.debug("Skipping conflicting scan item %s: %s", item.relative_path, row_exc)
+                db.rollback()
+        return added
+
+
 def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int] = None) -> dict:
     clean = path_str.strip(' \t\n\r"\'')
+    if not clean:
+        return {"status": "error", "message": "Podaj poprawną ścieżkę do skanowania."}
     if len(clean) == 2 and clean[1] == ":":
         clean += "\\"
     target = Path(clean).resolve()
@@ -97,15 +146,26 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
     try:
         vsn, label, root = WindowsVolumeInspector.get_volume_info(target)
         root_path = Path(root).resolve()
+        abs_root = Path(os.path.abspath(root))
+        abs_target = Path(os.path.abspath(target))
 
         with SessionLocal() as db:
             vol = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == vsn))
+            try:
+                usage = shutil.disk_usage(root)
+                total_b, free_b = int(usage.total), int(usage.free)
+            except Exception as exc:
+                logger.debug("disk_usage skipped during scan for %s: %s", root, exc)
+                total_b, free_b = 0, 0
+
             if not vol:
                 vol = WindowsVolume(
                     volume_serial_number=vsn,
                     volume_label=label,
                     last_known_drive_letter=root,
                     is_online=True,
+                    total_space_bytes=total_b,
+                    free_space_bytes=free_b,
                 )
                 db.add(vol)
                 db.commit()
@@ -113,6 +173,9 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
             else:
                 vol.last_known_drive_letter = root
                 vol.is_online = True
+                if total_b > 0 or free_b > 0:
+                    vol.total_space_bytes = total_b
+                    vol.free_space_bytes = free_b
                 db.commit()
 
             existing_rows = db.execute(
@@ -120,8 +183,11 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                 .where(MediaItem.volume_id == vol.id)
             ).all()
             existing_map = {r[0]: (r[1], r[2]) for r in existing_rows}
+            existing_map_lower = {r[0].lower(): (r[0], r[1], r[2]) for r in existing_rows}
 
             candidates_to_add = []
+            queued_rels_lower: set[str] = set()
+            ids_to_delete: List[str] = []
             found_total = 0
             already_in_db = 0
             repaired_thumbs = 0
@@ -134,14 +200,16 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
 
                     full = Path(r) / f
                     found_total += 1
-                    try:
-                        rel = full.resolve().relative_to(root_path).as_posix()
-                    except ValueError:
-                        rel = full.name
+                    rel = _compute_scan_relative_path(full, abs_root, root_path, abs_target)
+                    rel_low = rel.lower()
 
-                    if rel in existing_map and not force_rescan:
+                    if rel_low in queued_rels_lower:
+                        continue
+
+                    in_existing = rel in existing_map or rel_low in existing_map_lower
+                    if in_existing and not force_rescan:
                         already_in_db += 1
-                        item_id, thumb_name = existing_map[rel]
+                        item_id, thumb_name = existing_map.get(rel) or existing_map_lower[rel_low][1:]
                         thumb_file = THUMBNAILS_DIR / thumb_name
                         if not thumb_file.exists() or thumb_file.stat().st_size == 0:
                             try:
@@ -150,11 +218,17 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                             except Exception as exc:
                                 logger.debug("Thumbnail repair failed for %s: %s", full, exc)
                     else:
-                        if rel in existing_map and force_rescan:
-                            db.execute(delete(MediaItem).where(MediaItem.id == existing_map[rel][0]))
+                        if in_existing and force_rescan:
+                            del_id = existing_map[rel][0] if rel in existing_map else existing_map_lower[rel_low][1]
+                            ids_to_delete.append(del_id)
+                        queued_rels_lower.add(rel_low)
                         candidates_to_add.append((full, rel))
 
-            own_job = False
+            if ids_to_delete:
+                for i in range(0, len(ids_to_delete), 500):
+                    db.execute(delete(MediaItem).where(MediaItem.id.in_(ids_to_delete[i : i + 500])))
+                db.commit()
+
             if job_id is None and candidates_to_add:
                 job_id = ProcessManager.create_job(
                     job_type="scan",
@@ -163,7 +237,6 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                     params={"path": clean, "force_rescan": force_rescan},
                     db=db,
                 )
-                own_job = True
 
             def _worker(args):
                 f_path, r_path = args
@@ -171,11 +244,15 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
 
             indexed = 0
             stopped_early = False
+            pending_batch: List[MediaItem] = []
             if candidates_to_add:
                 with ThreadPoolExecutor(max_workers=min(4, (os.cpu_count() or 2))) as pool:
                     for idx, item in enumerate(pool.map(_worker, candidates_to_add)):
                         if job_id and ProcessManager.is_stop_requested(job_id):
                             stopped_early = True
+                            if pending_batch:
+                                indexed += _commit_scan_batch(db, pending_batch, vol.id)
+                                pending_batch.clear()
                             remaining_paths = [c[1] for c in candidates_to_add[idx:]]
                             ProcessManager.update_progress(
                                 job_id,
@@ -187,14 +264,17 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                             db.commit()
                             break
                         if item:
-                            db.add(item)
-                            indexed += 1
-                            if indexed % 50 == 0:
-                                db.commit()
+                            pending_batch.append(item)
+                            if len(pending_batch) >= 50:
+                                added_now = _commit_scan_batch(db, pending_batch, vol.id)
+                                indexed += added_now
+                                pending_batch.clear()
                                 if job_id:
-                                    ProcessManager.update_progress(job_id, processed_delta=50, db=db)
+                                    ProcessManager.update_progress(job_id, processed_delta=added_now, db=db)
                                     db.commit()
-                db.commit()
+                if pending_batch:
+                    indexed += _commit_scan_batch(db, pending_batch, vol.id)
+                    pending_batch.clear()
 
             svc = StorageAutomationService(db)
             dup_total = svc.flag_duplicate_clusters()
@@ -207,7 +287,7 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                     db=db,
                 )
                 db.commit()
-            elif own_job and not candidates_to_add:
+            elif not job_id:
                 OperationLogger.log(
                     "SCAN",
                     f"Skanowanie {label} ({vsn}): znaleziono {found_total}, nowych: 0, już w bazie: {already_in_db}",
@@ -594,6 +674,20 @@ def control_background_process(
                 svc.execute_backup_and_deduplication(job_id=job.id)
                 ProcessManager.finish_job(job.id, status="COMPLETED", message="Backup i deduplikacja wznowione i wykonane.", db=db)
                 db.commit()
+            elif job.job_type == "scan":
+                scan_path = str(params.get("path") or "").strip()
+                if not scan_path:
+                    ProcessManager.finish_job(
+                        job.id,
+                        status="FAILED",
+                        message="Brak zapisanej ścieżki skanowania w parametrach zadania.",
+                        db=db,
+                    )
+                    db.commit()
+                else:
+                    f_rescan = bool(params.get("force_rescan", False))
+                    execute_scan(scan_path, force_rescan=f_rescan, job_id=job.id)
+                    db.expire_all()
 
     resp = get_status_and_logs_panel(request, db)
     resp.headers["HX-Trigger"] = "refresh-all"
@@ -606,21 +700,9 @@ def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, d
     pref_vid = to_int(target_volume_id)
     plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
     unbacked_files = svc.detect_files_without_backup()
-
-    vol_space = {}
-    for vid, v in plan["volumes"].items():
-        if v.is_online:
-            try:
-                u = shutil.disk_usage(v.last_known_drive_letter)
-                vol_space[vid] = {
-                    "free_gb": u.free / (1024 ** 3),
-                    "total_gb": u.total / (1024 ** 3),
-                    "used_pct": int((u.used / u.total) * 100) if u.total else 0,
-                }
-            except Exception:
-                vol_space[vid] = None
-        else:
-            vol_space[vid] = None
+    volumes_list = list(plan["volumes"].values())
+    vol_space = svc.get_volume_space_map(volumes_list)
+    latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
 
     return render_template(
         request,
@@ -629,10 +711,68 @@ def get_backup_panel(request: Request, target_volume_id: Optional[str] = None, d
             "plan": plan,
             "unbacked_files": unbacked_files[:200],
             "unbacked_total": len(unbacked_files),
-            "volumes": list(plan["volumes"].values()),
+            "volumes": volumes_list,
             "vol_space": vol_space,
             "execution_result": None,
+            "offline_report": None,
+            "latest_report_exists": latest_report_exists,
         },
+    )
+
+
+@router.post("/prepare-offline-report")
+def prepare_offline_report_action(
+    request: Request,
+    preferred_target_volume_id: Optional[str] = Form(None),
+    target_panel: str = Form("backup"),
+    db: Session = Depends(get_db),
+):
+    """Prepares the offline backup/dedup/move procedure and saves a local text report before physical execution."""
+    svc = StorageAutomationService(db)
+    pref_vid = to_int(preferred_target_volume_id)
+    report_res = svc.generate_offline_procedure_report(preferred_target_volume_id=pref_vid)
+
+    if target_panel == "todo":
+        return render_template(
+            request,
+            "partials/todo_panel.html",
+            {
+                "summary": report_res["pending_summary"],
+                "exec_report": None,
+                "offline_report": report_res,
+            },
+        )
+
+    plan = report_res["plan"]
+    unbacked_files = svc.detect_files_without_backup()
+    volumes_list = list(plan["volumes"].values())
+    vol_space = svc.get_volume_space_map(volumes_list)
+    return render_template(
+        request,
+        "partials/backup_panel.html",
+        {
+            "plan": plan,
+            "unbacked_files": unbacked_files[:200],
+            "unbacked_total": len(unbacked_files),
+            "volumes": volumes_list,
+            "vol_space": vol_space,
+            "execution_result": None,
+            "offline_report": report_res,
+            "latest_report_exists": True,
+        },
+    )
+
+
+@router.get("/download-offline-report")
+def download_offline_report_file(db: Session = Depends(get_db)):
+    """Downloads the latest offline backup/dedup/move procedure text report."""
+    latest_file = db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt"
+    if not latest_file.exists():
+        StorageAutomationService(db).generate_offline_procedure_report()
+    return FileResponse(
+        latest_file,
+        media_type="text/plain; charset=utf-8",
+        filename="raport_procedura_offline.txt",
     )
 
 
@@ -686,20 +826,9 @@ def execute_backup_action(
 
     plan = svc.build_backup_and_dedup_plan(preferred_target_volume_id=pref_vid)
     unbacked_files = svc.detect_files_without_backup()
-    vol_space = {}
-    for vid, v in plan["volumes"].items():
-        if v.is_online:
-            try:
-                u = shutil.disk_usage(v.last_known_drive_letter)
-                vol_space[vid] = {
-                    "free_gb": u.free / (1024 ** 3),
-                    "total_gb": u.total / (1024 ** 3),
-                    "used_pct": int((u.used / u.total) * 100) if u.total else 0,
-                }
-            except Exception:
-                vol_space[vid] = None
-        else:
-            vol_space[vid] = None
+    volumes_list = list(plan["volumes"].values())
+    vol_space = svc.get_volume_space_map(volumes_list)
+    latest_report_exists = (db_module.REPORTS_DIR / "raport_procedura_offline_ostatni.txt").exists()
 
     resp = render_template(
         request,
@@ -708,9 +837,11 @@ def execute_backup_action(
             "plan": plan,
             "unbacked_files": unbacked_files[:200],
             "unbacked_total": len(unbacked_files),
-            "volumes": list(plan["volumes"].values()),
+            "volumes": volumes_list,
             "vol_space": vol_space,
             "execution_result": exec_result,
+            "offline_report": None,
+            "latest_report_exists": latest_report_exists,
         },
     )
     resp.headers["HX-Trigger"] = "refresh-all"
@@ -727,6 +858,7 @@ def get_offline_todo_panel(request: Request, db: Session = Depends(get_db)):
         {
             "summary": summary,
             "exec_report": None,
+            "offline_report": None,
         },
     )
 
@@ -742,6 +874,7 @@ def execute_offline_todo_moves(request: Request, db: Session = Depends(get_db)):
         {
             "summary": summary,
             "exec_report": report,
+            "offline_report": None,
         },
     )
     resp.headers["HX-Trigger"] = "refresh-all"
@@ -768,6 +901,7 @@ def rollback_offline_todo_moves(
         {
             "summary": summary,
             "exec_report": report,
+            "offline_report": None,
         },
     )
     resp.headers["HX-Trigger"] = "refresh-all"
@@ -1067,25 +1201,71 @@ def clear_date_anomaly_without_changing_date(
     )
 
 
+@router.post("/recalculate-date-anomalies")
+def recalculate_date_anomalies_action(db: Session = Depends(get_db)):
+    """Re-evaluates date discrepancies across folder name, filename, EXIF, and copy-modified timestamps."""
+    svc = StorageAutomationService(db)
+    res = svc.recalculate_date_anomalies()
+    msg = (
+        f"📅 Przeliczono źródła dat dla {res['evaluated']} plików: "
+        f"wykryto rozbieżności / modyfikacje kopiowania: {res['anomalies_found']} | "
+        f"automatycznie ustawiono prawdopodobną datę: {res['dates_updated']}."
+    )
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
 @router.post("/rotate-media")
 def rotate_media_action(
     request: Request,
     media_id: Optional[str] = Form(None),
+    album_id: Optional[str] = Form(None),
     delta: int = Form(90),
+    scope: str = Form("selected"),
     selected_ids: List[str] = Form(default=[]),
+    q: Optional[str] = Form(None),
+    media_type: str = Form("all"),
+    volume_id: Optional[str] = Form(None),
+    folder_prefix: Optional[str] = Form(None),
+    group_id: Optional[str] = Form(None),
+    tag: Optional[str] = Form(None),
+    year: Optional[str] = Form(None),
+    anomaly_only: bool = Form(False),
+    blurry_only: bool = Form(False),
+    duplicates_only: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """
-    Requirement 4b & 4c (Multimedia): Rotates photo(s) and persists rotation_angle (0, 90, 180, 270)
-    in SQLite so the photo is always displayed in the proper orientation.
+    Rotates a single photo, a selected list of photos, a filtered set, or an entire album hierarchy
+    and persists rotation_angle (0, 90, 180, 270) in SQLite.
     """
-    target_ids = [media_id] if media_id else selected_ids
-    if not target_ids:
-        return JSONResponse({"status": "error", "message": "Brak ID zdjęcia."}, status_code=400)
+    aid = to_int(album_id)
+    if media_id:
+        items = list(db.scalars(select(MediaItem).where(MediaItem.id == media_id)).all())
+        if not items:
+            return JSONResponse({"status": "error", "message": "Nie znaleziono zdjęcia."}, status_code=404)
+    elif aid:
+        svc = StorageAutomationService(db)
+        subtree_ids = svc.get_group_subtree_ids(aid)
+        items = list(
+            db.scalars(
+                select(MediaItem).where(MediaItem.group_id.in_(subtree_ids), MediaItem.is_trashed == False)
+            ).all()
+        )
+    elif scope == "selected":
+        if not selected_ids:
+            return JSONResponse({"status": "error", "message": "Brak ID zdjęcia."}, status_code=400)
+        items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(selected_ids))).all())
+    else:
+        items = resolve_target_items(
+            db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only
+        )
 
-    items = list(db.scalars(select(MediaItem).where(MediaItem.id.in_(target_ids))).all())
     if not items:
-        return JSONResponse({"status": "error", "message": "Nie znaleziono zdjęcia."}, status_code=404)
+        return JSONResponse({"status": "error", "message": "Brak zdjęć w wybranym zakresie do obrócenia."}, status_code=404)
 
     new_angles = {}
     for it in items:
@@ -1104,10 +1284,23 @@ def rotate_media_action(
     accept = request.headers.get("accept", "")
     if "application/json" in accept or request.headers.get("x-requested-with") == "XMLHttpRequest":
         first_id = items[0].id
-        return JSONResponse({"status": "ok", "media_id": first_id, "rotation_angle": new_angles[first_id], "angles": new_angles})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "count": len(items),
+                "media_id": first_id,
+                "rotation_angle": new_angles[first_id],
+                "angles": new_angles,
+            }
+        )
+
+    if len(items) == 1:
+        msg = f"↻ Obrócono zdjęcie i zapisano kąt ({items[0].rotation_angle}°) w bazie."
+    else:
+        msg = f"↻ Obrócono {len(items)} zdjęć o {delta}° i zapisano kąty w bazie."
 
     return HTMLResponse(
-        f"<span class='text-emerald-400 text-xs font-semibold'>↻ Obrócono zdjęcie i zapisano kąt ({items[0].rotation_angle}°) w bazie.</span>",
+        f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
 
@@ -1130,6 +1323,28 @@ def consolidate_group_endpoint(
         )
     except Exception as e:
         return HTMLResponse(f"<span class='text-rose-400 text-xs font-semibold'>Błąd konsolidacji: {e}</span>")
+
+
+def _filter_db_backups(cloud_files: list) -> list:
+    return [
+        f for f in cloud_files
+        if str(f.get("name", "")).lower().endswith((".db", ".sqlite", ".sqlite3"))
+    ]
+
+
+def _load_gdrive_fallback(folder_id: Optional[str]) -> tuple:
+    from app.cloud.google_drive import GoogleDriveManager
+
+    folders = []
+    cloud_files = []
+    try:
+        gdrive = GoogleDriveManager()
+        folders = gdrive.list_folders()
+        if folder_id:
+            cloud_files = gdrive.list_files_in_folder(folder_id)
+    except Exception as inner_exc:
+        logger.debug("GDrive fallback listing failed: %s", inner_exc)
+    return folders, cloud_files, _filter_db_backups(cloud_files)
 
 
 @router.get("/gdrive-panel")
@@ -1158,6 +1373,7 @@ def get_gdrive_panel(
                 "folders": folders,
                 "active_folder_id": active_fid,
                 "cloud_files": cloud_files,
+                "db_backups": _filter_db_backups(cloud_files),
                 "error_msg": None,
                 "status_report": False,
             },
@@ -1170,6 +1386,7 @@ def get_gdrive_panel(
                 "folders": [],
                 "active_folder_id": "",
                 "cloud_files": [],
+                "db_backups": [],
                 "error_msg": str(e),
                 "status_report": False,
             },
@@ -1251,6 +1468,7 @@ def sync_to_google_drive(
                 "folders": folders,
                 "active_folder_id": target_fid,
                 "cloud_files": cloud_files,
+                "db_backups": _filter_db_backups(cloud_files),
                 "error_msg": None,
                 "status_report": True,
                 "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1262,15 +1480,7 @@ def sync_to_google_drive(
         return resp
 
     except Exception as e:
-        folders = []
-        cloud_files = []
-        try:
-            gdrive = GoogleDriveManager()
-            folders = gdrive.list_folders()
-            if folder_id:
-                cloud_files = gdrive.list_files_in_folder(folder_id)
-        except Exception as inner_exc:
-            logger.debug("GDrive fallback listing failed: %s", inner_exc)
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
         return render_template(
             request,
             "partials/gdrive_panel.html",
@@ -1278,10 +1488,84 @@ def sync_to_google_drive(
                 "folders": folders,
                 "active_folder_id": folder_id or "",
                 "cloud_files": cloud_files,
+                "db_backups": db_backups,
                 "error_msg": str(e),
                 "status_report": False,
             },
         )
+
+
+@router.post("/gdrive-restore-db")
+def restore_db_from_google_drive(
+    request: Request,
+    file_id: str = Form(...),
+    folder_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    from app.cloud.google_drive import GoogleDriveManager
+    import app.database as db_module
+
+    temp_file: Optional[Path] = None
+    try:
+        gdrive = GoogleDriveManager()
+        safe_fid = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in file_id)
+        temp_file = db_module.BACKUP_DIR / f"cloud_restore_{safe_fid}.db"
+        dl_info = gdrive.download_and_verify_backup(file_id, temp_file)
+
+        # Release active session before overwriting database pages via SQLite backup API
+        db.close()
+
+        BackupManager().restore_from_backup(temp_file)
+
+        summary = (
+            f"Przywrócono bazę SQLite z kopii na Google Drive: {dl_info['name']} "
+            f"(MD5 zweryfikowane: {dl_info['md5'][:12]}..., {dl_info['size_bytes']} B). "
+            f"Poprzednia baza została zabezpieczona w data/backups/."
+        )
+        OperationLogger.log("GDRIVE_DB_RESTORE", summary, status="OK")
+
+        folders = gdrive.list_folders()
+        active_fid = folder_id.strip() if (folder_id and folder_id.strip()) else (folders[0]["id"] if folders else "")
+        cloud_files = gdrive.list_files_in_folder(active_fid) if active_fid else []
+
+        resp = render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": active_fid,
+                "cloud_files": cloud_files,
+                "db_backups": _filter_db_backups(cloud_files),
+                "error_msg": None,
+                "status_report": True,
+                "finished_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status_summary": summary,
+                "uploaded_results": [],
+            },
+        )
+        resp.headers["HX-Trigger"] = "refresh-all"
+        return resp
+    except Exception as e:
+        logger.error("Google Drive DB restore failed: %s", e)
+        folders, cloud_files, db_backups = _load_gdrive_fallback(folder_id)
+        return render_template(
+            request,
+            "partials/gdrive_panel.html",
+            {
+                "folders": folders,
+                "active_folder_id": folder_id or "",
+                "cloud_files": cloud_files,
+                "db_backups": db_backups,
+                "error_msg": str(e),
+                "status_report": False,
+            },
+        )
+    finally:
+        if temp_file and temp_file.exists():
+            try:
+                temp_file.unlink()
+            except OSError as exc:
+                logger.debug("Could not clean temporary cloud restore file %s: %s", temp_file, exc)
 
 
 @router.post("/export-json-disk")

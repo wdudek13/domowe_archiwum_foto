@@ -8,9 +8,10 @@ from sqlalchemy import select, text, update, delete, func
 from sqlalchemy.orm import Session, joinedload
 
 from app.backup import BackupManager
+import app.database as db_module
 from app.models import MediaItem, WindowsVolume, MediaGroup, PendingFileMove
 from app.operation_log import OperationLogger
-from app.scanner import FastHasher, WindowsVolumeInspector
+from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 
 logger = logging.getLogger("StorageOps")
 
@@ -25,7 +26,7 @@ class StorageAutomationService:
         self.backup_mgr = BackupManager()
 
     def refresh_volumes_online_status(self) -> List[WindowsVolume]:
-        """Updates online status and drive letters for all tracked volumes using hardware VSN detection."""
+        """Updates online status, drive letters, and persisted free/total disk capacity for all tracked volumes."""
         connected_map = WindowsVolumeInspector.get_connected_vsn_map()
         volumes = list(self.db.scalars(select(WindowsVolume)).all())
         now = datetime.datetime.utcnow()
@@ -39,8 +40,53 @@ class StorageAutomationService:
                 vol.is_online = Path(vol.last_known_drive_letter).exists()
                 if vol.is_online:
                     vol.last_seen_at = now
+
+            if vol.is_online:
+                try:
+                    usage = shutil.disk_usage(vol.last_known_drive_letter)
+                    vol.total_space_bytes = int(usage.total)
+                    vol.free_space_bytes = int(usage.free)
+                except Exception as exc:
+                    logger.debug("disk_usage update skipped for %s: %s", vol.last_known_drive_letter, exc)
         self.db.commit()
         return volumes
+
+    def get_volume_space_map(self, volumes: List[WindowsVolume], commit_updates: bool = True) -> Dict[int, Optional[Dict[str, Any]]]:
+        """
+        Returns available capacity per volume, refreshing live usage for online drives and falling
+        back to persisted SQLite values when drives are offline.
+        """
+        vol_space: Dict[int, Optional[Dict[str, Any]]] = {}
+        dirty = False
+        for v in volumes:
+            if v.is_online:
+                try:
+                    u = shutil.disk_usage(v.last_known_drive_letter)
+                    v.total_space_bytes = int(u.total)
+                    v.free_space_bytes = int(u.free)
+                    dirty = True
+                except Exception as exc:
+                    logger.debug("disk_usage warning for %s: %s", v.last_known_drive_letter, exc)
+
+            total_b = int(v.total_space_bytes or 0)
+            free_b = int(v.free_space_bytes or 0)
+            if total_b > 0 or free_b > 0:
+                used_b = max(0, total_b - free_b) if total_b else 0
+                used_pct = max(0, min(100, int((used_b / total_b) * 100))) if total_b else 0
+                vol_space[v.id] = {
+                    "free_bytes": free_b,
+                    "total_bytes": total_b,
+                    "free_gb": free_b / (1024 ** 3),
+                    "total_gb": total_b / (1024 ** 3),
+                    "used_pct": used_pct,
+                    "is_offline_cached": not v.is_online,
+                }
+            else:
+                vol_space[v.id] = None
+
+        if dirty and commit_updates:
+            self.db.commit()
+        return vol_space
 
     def flag_duplicate_clusters(self) -> int:
         """
@@ -246,18 +292,26 @@ class StorageAutomationService:
         return unbacked
 
     @classmethod
-    def check_volume_free_space(cls, drive_letter: str, required_bytes: int) -> Tuple[bool, int]:
-        """Checks if the mounted volume has enough free space (including safety buffer)."""
+    def check_volume_free_space(
+        cls,
+        drive_letter: str,
+        required_bytes: int,
+        fallback_free_bytes: Optional[int] = None,
+    ) -> Tuple[bool, int]:
+        """Checks if the mounted volume (or cached offline space) has enough free space including buffer."""
         try:
             usage = shutil.disk_usage(drive_letter)
             has_space = usage.free >= (required_bytes + cls.MIN_FREE_SPACE_BUFFER_BYTES)
             return has_space, int(usage.free)
         except Exception:
+            if fallback_free_bytes is not None and fallback_free_bytes > 0:
+                has_space = fallback_free_bytes >= (required_bytes + cls.MIN_FREE_SPACE_BUFFER_BYTES)
+                return has_space, int(fallback_free_bytes)
             return False, 0
 
     def build_backup_and_dedup_plan(self, preferred_target_volume_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Analyzes the entire database to build a pairwise device execution plan for:
+        Analyzes the entire database to build a pairwise device execution plan and offline capacity balance for:
         1) Assigning Originals with same-device duplicates to 'Ważne - <device>' -> YYYY -> YYYY-MM (Rule 2b, 2d).
         2) Creating missing backups in 'backup/' folder on a DIFFERENT device than Original (Rule 1a, 1d, 1g).
         3) Removing all extra duplicate copies after 100% multi-layer verification so only [1 Original + 1 Backup] remain (Rule 1e, 1f).
@@ -279,7 +333,6 @@ class StorageAutomationService:
         for it in all_items:
             by_hash[it.file_hash].append(it)
 
-        # Choose default backup target volume for each source volume
         sorted_vols = sorted(volumes.values(), key=lambda v: (not v.is_online, v.id))
 
         def pick_backup_volume(src_vol_id: int) -> Optional[WindowsVolume]:
@@ -297,15 +350,15 @@ class StorageAutomationService:
         unbacked_count = 0
         redundant_duplicates_count = 0
         single_device_warning = len(volumes) < 2
+        reclaimed_bytes_by_vol: Dict[int, int] = defaultdict(int)
+        required_bytes_by_vol: Dict[int, int] = defaultdict(int)
 
         for fhash, cluster in by_hash.items():
-            # Group non-backup copies by volume to apply Rule 2d & 2b
             non_backup_by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
             for it in cluster:
                 if not it.is_backup_copy:
                     non_backup_by_vol[it.volume_id].append(it)
 
-            # Select Original: prefer volume with >=2 non-backup copies (Rule 2d), else existing primary
             best_orig: Optional[MediaItem] = None
             best_vol_dup_cnt = -1
             for vid, v_items in non_backup_by_vol.items():
@@ -319,11 +372,9 @@ class StorageAutomationService:
             if best_vol_dup_cnt >= 2 and orig_vol:
                 important_candidates.append((best_orig, orig_vol))
 
-            # Find existing backup copy on a DIFFERENT device
             other_vol_copies = [x for x in cluster if x.volume_id != best_orig.volume_id and x.id != best_orig.id]
             chosen_backup: Optional[MediaItem] = None
             if other_vol_copies:
-                # Prefer copy already in 'backup/' folder, then online volume
                 other_vol_copies.sort(
                     key=lambda x: (not x.is_backup_copy, not volumes[x.volume_id].is_online if x.volume_id in volumes else True, x.id)
                 )
@@ -334,6 +385,8 @@ class StorageAutomationService:
                 target_vol = pick_backup_volume(best_orig.volume_id)
                 if target_vol:
                     pair_key = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
+                    dst_rel = f"backup/{best_orig.effective_date.strftime('%Y/%Y-%m')}/{best_orig.file_name}"
+                    required_bytes_by_vol[target_vol.id] += int(best_orig.file_size_bytes or 0)
                     pair_tasks[pair_key]["backups_to_copy"].append(
                         {
                             "orig_item_id": best_orig.id,
@@ -341,19 +394,26 @@ class StorageAutomationService:
                             "dst_vol_id": target_vol.id,
                             "file_size": best_orig.file_size_bytes,
                             "file_name": best_orig.file_name,
+                            "src_relative_path": best_orig.relative_path,
+                            "dst_relative_path": dst_rel,
+                            "file_hash": best_orig.file_hash,
                         }
                     )
             else:
                 if not chosen_backup.is_backup_copy:
                     pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                    dst_rel = f"backup/{chosen_backup.effective_date.strftime('%Y/%Y-%m')}/{chosen_backup.file_name}"
                     pair_tasks[pair_key]["backups_to_relocate"].append(
                         {
                             "backup_item_id": chosen_backup.id,
                             "vol_id": chosen_backup.volume_id,
+                            "file_name": chosen_backup.file_name,
+                            "file_size": chosen_backup.file_size_bytes,
+                            "src_relative_path": chosen_backup.relative_path,
+                            "dst_relative_path": dst_rel,
                         }
                     )
 
-            # All other copies (neither best_orig nor chosen_backup) are redundant duplicates to be removed
             for item in cluster:
                 if item.id == best_orig.id:
                     continue
@@ -362,6 +422,7 @@ class StorageAutomationService:
                 redundant_duplicates_count += 1
                 ref_vol_id = best_orig.volume_id
                 pair_key = (min(ref_vol_id, item.volume_id), max(ref_vol_id, item.volume_id))
+                reclaimed_bytes_by_vol[item.volume_id] += int(item.file_size_bytes or 0)
                 pair_tasks[pair_key]["duplicates_to_delete"].append(
                     {
                         "dup_item_id": item.id,
@@ -369,10 +430,32 @@ class StorageAutomationService:
                         "ref_item_id": best_orig.id,
                         "ref_vol_id": best_orig.volume_id,
                         "backup_item_id": chosen_backup.id if chosen_backup else None,
+                        "file_name": item.file_name,
+                        "file_size": item.file_size_bytes,
+                        "dup_relative_path": item.relative_path,
+                        "ref_relative_path": best_orig.relative_path,
                     }
                 )
 
-        # Order pairs: pairs where both volumes are online first, then pairs with 1 online volume, then offline
+        volume_space_summary: Dict[int, Dict[str, Any]] = {}
+        for vid, v in volumes.items():
+            known_free = int(v.free_space_bytes or 0)
+            known_total = int(v.total_space_bytes or 0)
+            has_known = known_total > 0 or known_free > 0
+            reclaimed = reclaimed_bytes_by_vol.get(vid, 0)
+            required = required_bytes_by_vol.get(vid, 0)
+            projected = known_free + reclaimed - required
+            volume_space_summary[vid] = {
+                "volume": v,
+                "known_free_bytes": known_free,
+                "known_total_bytes": known_total,
+                "has_known_capacity": has_known,
+                "reclaimed_bytes": reclaimed,
+                "required_bytes": required,
+                "projected_free_bytes": projected,
+                "space_ok": (not has_known) or (projected >= self.MIN_FREE_SPACE_BUFFER_BYTES),
+            }
+
         ordered_pairs = []
         for (va_id, vb_id), tasks in pair_tasks.items():
             va = volumes.get(va_id)
@@ -401,6 +484,7 @@ class StorageAutomationService:
 
         return {
             "volumes": volumes,
+            "volume_space_summary": volume_space_summary,
             "important_candidates": important_candidates,
             "ordered_pairs": ordered_pairs,
             "unbacked_count": unbacked_count,
@@ -1114,3 +1198,180 @@ class StorageAutomationService:
 
         self.db.commit()
         return updated
+
+    def generate_offline_procedure_report(self, preferred_target_volume_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Builds the offline backup, deduplication, and pending move plan using persisted disk capacities
+        and saves a human-readable Polish text report on the local disk before any physical changes occur.
+        """
+        plan = self.build_backup_and_dedup_plan(preferred_target_volume_id=preferred_target_volume_id)
+        pending_summary = self.get_pending_moves_summary()
+        volumes: Dict[int, WindowsVolume] = plan["volumes"]
+        vol_space_summary: Dict[int, Dict[str, Any]] = plan["volume_space_summary"]
+
+        now_dt = datetime.datetime.now()
+        ts_str = now_dt.strftime("%Y%m%d_%H%M%S")
+        lines: List[str] = [
+            "=" * 84,
+            "DOMOWE ARCHIWUM FOTO — RAPORT PROCEDURY BACKUPU, DEDUPLIKACJI I ZMIAN (TRYB OFFLINE)",
+            f"Wygenerowano: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+            "Przeznaczenie: Weryfikacja poprawności planowanych operacji przed podjęciem fizycznych zmian na dyskach.",
+            "=" * 84,
+            "",
+            "1. STAN DYSKÓW I BILANS MIEJSCA (ZAPISANE W BAZIE DLA TRYBU OFFLINE):",
+        ]
+
+        if not volumes:
+            lines.append("   Brak zarejestrowanych urządzeń w bazie.")
+        else:
+            for vid in sorted(volumes.keys()):
+                v = volumes[vid]
+                sp = vol_space_summary[vid]
+                status_lbl = "ONLINE" if v.is_online else "OFFLINE (Dane z bazy SQLite)"
+                if sp["has_known_capacity"]:
+                    free_mb = sp["known_free_bytes"] / (1024 * 1024)
+                    total_mb = sp["known_total_bytes"] / (1024 * 1024)
+                    recl_mb = sp["reclaimed_bytes"] / (1024 * 1024)
+                    req_mb = sp["required_bytes"] / (1024 * 1024)
+                    proj_mb = sp["projected_free_bytes"] / (1024 * 1024)
+                    cap_note = "OK" if sp["space_ok"] else "UWAGA: NIEWYSTARCZAJĄCE MIEJSCE!"
+                    lines.append(
+                        f"   - [{status_lbl}] {v.volume_label} ({v.last_known_drive_letter}, VSN: {v.volume_serial_number})"
+                    )
+                    lines.append(
+                        f"     Pojemność całkowita: {total_mb:.2f} MB | Wolne w bazie: {free_mb:.2f} MB | "
+                        f"Do odzyskania z duplikatów: +{recl_mb:.2f} MB | Wymagane na backup: -{req_mb:.2f} MB | "
+                        f"Prognoza po operacji: {proj_mb:.2f} MB [{cap_note}]"
+                    )
+                else:
+                    lines.append(
+                        f"   - [{status_lbl}] {v.volume_label} ({v.last_known_drive_letter}, VSN: {v.volume_serial_number}) — brak zapisanej pojemności"
+                    )
+
+        lines.extend(["", "2. PLANOWANE OPERACJE BACKUPU I DEDUPLIKACJI (WG PAR URZĄDZEŃ A <-> B):"])
+        if not plan["ordered_pairs"]:
+            lines.append("   Brak brakujących kopii zapasowych oraz nadmiarowych duplikatów do usunięcia.")
+        else:
+            for idx, pair in enumerate(plan["ordered_pairs"], start=1):
+                va = pair["vol_a"]
+                vb = pair["vol_b"]
+                va_lbl = f"{va.volume_label} ({va.last_known_drive_letter})" if va else "?"
+                vb_lbl = f"{vb.volume_label} ({vb.last_known_drive_letter})" if vb else "?"
+                pair_state = "GOTOWA (OBA ONLINE)" if pair["both_online"] else "OFFLINE / WYMAGA PODŁĄCZENIA"
+                lines.append(f"   --- Para #{idx}: {va_lbl} <-> {vb_lbl} [{pair_state}] ---")
+                tasks = pair["tasks"]
+
+                for ct in tasks["backups_to_copy"]:
+                    sv = volumes.get(ct["src_vol_id"])
+                    dv = volumes.get(ct["dst_vol_id"])
+                    sz_mb = (ct["file_size"] or 0) / (1024 * 1024)
+                    lines.append(
+                        f"     [KOPIOWANIE BACKUPU] {(sv.volume_label if sv else '?')}:{ct.get('src_relative_path', ct['file_name'])} "
+                        f"-> {(dv.volume_label if dv else '?')}:{ct.get('dst_relative_path', 'backup/')} ({sz_mb:.2f} MB)"
+                    )
+
+                for rt in tasks["backups_to_relocate"]:
+                    rv = volumes.get(rt["vol_id"])
+                    lines.append(
+                        f"     [PRZENIESIENIE DO backup/] {(rv.volume_label if rv else '?')}:{rt.get('src_relative_path', '')} "
+                        f"-> {(rv.volume_label if rv else '?')}:{rt.get('dst_relative_path', 'backup/')}"
+                    )
+
+                for dt in tasks["duplicates_to_delete"]:
+                    dv = volumes.get(dt["dup_vol_id"])
+                    rv = volumes.get(dt["ref_vol_id"])
+                    sz_mb = (dt.get("file_size") or 0) / (1024 * 1024)
+                    lines.append(
+                        f"     [USUNIĘCIE DUPLIKATU] {(dv.volume_label if dv else '?')}:{dt.get('dup_relative_path', dt.get('file_name', ''))} "
+                        f"({sz_mb:.2f} MB) | Zachowany oryginał: {(rv.volume_label if rv else '?')}:{dt.get('ref_relative_path', '')}"
+                    )
+
+        lines.extend(["", "3. OCZEKUJĄCE PRZENIESIENIA PLIKÓW Z LISTY TODO (TRYB OFFLINE):"])
+        if not pending_summary["todos"]:
+            lines.append("   Lista TODO jest pusta — brak oczekujących przeniesień plików.")
+        else:
+            for td in pending_summary["todos"]:
+                sv_lbl = td.source_volume.volume_label if td.source_volume else "?"
+                tv_lbl = td.target_volume.volume_label if td.target_volume else "?"
+                lines.append(
+                    f"   - [PRZENIESIENIE TODO #{td.id}] {sv_lbl}:{td.source_relative_path} -> {tv_lbl}:{td.target_relative_path}"
+                )
+
+        lines.extend(["", "4. ORYGINAŁY Z DUPLIKATAMI NA TYM SAMYM DYSKU (DO ALBUMU 'WAŻNE'):"])
+        if not plan["important_candidates"]:
+            lines.append("   Brak nowych kandydatów.")
+        else:
+            for orig_it, orig_v in plan["important_candidates"]:
+                lines.append(
+                    f"   - {orig_v.volume_label}:{orig_it.relative_path} -> Album: Ważne - {orig_v.volume_label} / {orig_it.effective_date.strftime('%Y / %Y-%m')}"
+                )
+
+        lines.extend(["", "=" * 84])
+        report_text = "\n".join(lines)
+
+        reports_dir = db_module.REPORTS_DIR
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_file = reports_dir / f"raport_procedura_offline_{ts_str}.txt"
+        latest_file = reports_dir / "raport_procedura_offline_ostatni.txt"
+        report_file.write_text(report_text, encoding="utf-8")
+        latest_file.write_text(report_text, encoding="utf-8")
+
+        OperationLogger.log(
+            "OFFLINE_REPORT",
+            f"Wygenerowano raport procedury offline: {report_file.name}",
+            status="OK",
+            details={
+                "report_path": str(report_file),
+                "unbacked_count": plan["unbacked_count"],
+                "redundant_duplicates_count": plan["redundant_duplicates_count"],
+                "pending_todos_count": pending_summary["total_pending"],
+            },
+            db=self.db,
+        )
+
+        return {
+            "report_path": str(report_file),
+            "latest_path": str(latest_file),
+            "report_text": report_text,
+            "plan": plan,
+            "pending_summary": pending_summary,
+        }
+
+    def recalculate_date_anomalies(self) -> Dict[str, int]:
+        """
+        Re-evaluates date discrepancies across folder name, filename, EXIF, and filesystem timestamps
+        for all active records, assigning the most probable date and flagging copy-modified timestamps.
+        """
+        items = list(self.db.scalars(select(MediaItem).where(MediaItem.is_trashed == False)).all())
+        evaluated = 0
+        anomalies_found = 0
+        dates_updated = 0
+
+        for it in items:
+            evaluated += 1
+            fn_dt = it.filename_date or MetadataDateResolver.parse_filename(it.file_name)
+            it.filename_date = fn_dt
+            folder_info = MetadataDateResolver.parse_folder_date(Path(it.relative_path), rel_path=it.relative_path)
+            effective, anomaly, reason = MetadataDateResolver.evaluate_date_sources(
+                it.exif_date, fn_dt, it.fs_ctime, it.fs_mtime, folder_info=folder_info
+            )
+            if it.effective_date != effective:
+                it.effective_date = effective
+                dates_updated += 1
+            it.has_date_anomaly = anomaly
+            it.date_anomaly_reason = reason
+            if anomaly:
+                anomalies_found += 1
+
+        self.db.commit()
+        OperationLogger.log(
+            "DATE_ANOMALY_RECALC",
+            f"Przeliczono daty i anomalie dla {evaluated} plików (anomalii: {anomalies_found}, skorygowanych dat: {dates_updated}).",
+            status="OK",
+            db=self.db,
+        )
+        return {
+            "evaluated": evaluated,
+            "anomalies_found": anomalies_found,
+            "dates_updated": dates_updated,
+        }

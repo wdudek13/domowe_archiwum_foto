@@ -14,9 +14,10 @@ DB_DIR = DATA_DIR / "db"
 BACKUP_DIR = DATA_DIR / "backups"
 THUMBNAILS_DIR = DATA_DIR / "thumbnails"
 LOGS_DIR = DATA_DIR / "logs"
+REPORTS_DIR = DATA_DIR / "reports"
 OPERATIONS_LOG_FILE = LOGS_DIR / "operations.log"
 
-for directory in (DB_DIR, BACKUP_DIR, THUMBNAILS_DIR, LOGS_DIR):
+for directory in (DB_DIR, BACKUP_DIR, THUMBNAILS_DIR, LOGS_DIR, REPORTS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DB_DIR / "media_vault.db"
@@ -53,6 +54,14 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
     conn = sqlite3.connect(target_db_path.as_posix(), timeout=10.0)
     try:
         cur = conn.cursor()
+        cur.execute("PRAGMA table_info(windows_volumes);")
+        v_cols = {row[1] for row in cur.fetchall()}
+        if v_cols:
+            if "total_space_bytes" not in v_cols:
+                cur.execute("ALTER TABLE windows_volumes ADD COLUMN total_space_bytes BIGINT DEFAULT 0;")
+            if "free_space_bytes" not in v_cols:
+                cur.execute("ALTER TABLE windows_volumes ADD COLUMN free_space_bytes BIGINT DEFAULT 0;")
+
         cur.execute("PRAGMA table_info(media_groups);")
         g_cols = {row[1] for row in cur.fetchall()}
         if g_cols:

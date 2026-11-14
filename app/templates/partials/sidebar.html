@@ -162,12 +162,19 @@
                 {% if sp %}
                 <div class="space-y-0.5">
                     <div class="flex justify-between text-[10px] font-mono text-slate-400">
-                        <span>Wolne: <strong class="text-emerald-400">{{ "%.1f"|format(sp.free_gb) }} GB</strong> / {{ "%.1f"|format(sp.total_gb) }} GB</span>
+                        <span>
+                            Wolne{% if sp.is_offline_cached %} (Offline){% endif %}:
+                            <strong class="{% if sp.is_offline_cached %}text-amber-300{% else %}text-emerald-400{% endif %}">{{ "%.1f"|format(sp.free_gb) }} GB</strong>
+                            / {{ "%.1f"|format(sp.total_gb) }} GB
+                        </span>
                         <span>{{ sp.used_pct }}%</span>
                     </div>
                     <div class="w-full h-1 bg-slate-800 rounded overflow-hidden">
                         <div class="h-full {% if sp.used_pct > 90 %}bg-rose-500{% elif sp.used_pct > 75 %}bg-amber-500{% else %}bg-indigo-500{% endif %}" style="width: {{ sp.used_pct }}%"></div>
                     </div>
+                    {% if sp.is_offline_cached %}
+                    <div class="text-[9px] text-amber-400/80 font-mono">Offline (z bazy) • VSN: {{ v.volume_serial_number }}</div>
+                    {% endif %}
                 </div>
                 {% else %}
                 <div class="text-[10px] text-slate-500 font-mono">Offline • VSN: {{ v.volume_serial_number }}</div>

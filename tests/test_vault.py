@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -76,12 +77,13 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.backup_dir = self.root / "backups"
         self.thumbs_dir = self.root / "thumbnails"
         self.logs_dir = self.root / "logs"
+        self.reports_dir = self.root / "reports"
         self.log_file = self.logs_dir / "operations.log"
         self.drive_a = self.root / "DriveA"
         self.drive_b = self.root / "DriveB"
         self.drive_c_offline = self.root / "DriveC_Offline"
 
-        for d in (self.backup_dir, self.thumbs_dir, self.logs_dir, self.drive_a, self.drive_b):
+        for d in (self.backup_dir, self.thumbs_dir, self.logs_dir, self.reports_dir, self.drive_a, self.drive_b):
             d.mkdir(parents=True, exist_ok=True)
 
         self.engine = create_engine(
@@ -110,6 +112,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             patch("app.database.DB_PATH", self.db_path),
             patch("app.database.BACKUP_DIR", self.backup_dir),
             patch("app.database.THUMBNAILS_DIR", self.thumbs_dir),
+            patch("app.database.REPORTS_DIR", self.reports_dir),
             patch("app.database.OPERATIONS_LOG_FILE", self.log_file),
             patch("app.database.SessionLocal", self.TestingSessionLocal),
             patch("app.scanner.THUMBNAILS_DIR", self.thumbs_dir),
@@ -240,12 +243,124 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual(fn_dt, datetime.datetime(2021, 5, 10, 12, 30, 45))
         self.assertEqual(effective_dt, fn_dt)
         self.assertTrue(anomaly)
-        self.assertIn("Brak metadanych EXIF", reason)
+        self.assertIn("kopiowaniu", reason)
+
+        # Missing EXIF alone WITHOUT source discrepancy must NOT trigger an anomaly
+        plain_img = create_synthetic_jpeg(self.drive_a / "random_shot.jpg")
+        _, _, _, _, _, plain_anom, plain_reason = MetadataDateResolver.resolve_dates(plain_img, is_image=True)
+        self.assertFalse(plain_anom)
+        self.assertIsNone(plain_reason)
+
+        # Folder date discrepancy after file copy: folder 2019-08 vs filesystem timestamps in 2026
+        folder_img = create_synthetic_jpeg(self.drive_a / "2019-08_Grecja" / "beach.jpg")
+        _, _, _, _, f_eff, f_anom, f_rsn = MetadataDateResolver.resolve_dates(
+            folder_img, is_image=True, rel_path="2019-08_Grecja/beach.jpg"
+        )
+        self.assertTrue(f_anom)
+        self.assertEqual((f_eff.year, f_eff.month), (2019, 8))
+        self.assertIn("folderem", f_rsn)
+
+        # Day-level folder date and copy-modified ctime vs mtime discrepancy
+        day_eff, day_anom, _ = MetadataDateResolver.evaluate_date_sources(
+            exif=None,
+            fn_date=None,
+            ctime=datetime.datetime(2026, 5, 1, 10, 0),
+            mtime=datetime.datetime(2022, 7, 15, 14, 0),
+            folder_info=(datetime.datetime(2022, 7, 15, 0, 0), "day", "2022-07-15"),
+        )
+        self.assertTrue(day_anom)
+        self.assertEqual(day_eff, datetime.datetime(2022, 7, 15, 14, 0))
+
+        # Copy discrepancy without folder/EXIF/filename when ctime differs >24h from mtime
+        cp_eff, cp_anom, cp_rsn = MetadataDateResolver.evaluate_date_sources(
+            exif=None,
+            fn_date=None,
+            ctime=datetime.datetime(2026, 6, 1, 10, 0),
+            mtime=datetime.datetime(2021, 3, 20, 9, 0),
+            folder_info=None,
+        )
+        self.assertTrue(cp_anom)
+        self.assertEqual(cp_eff, datetime.datetime(2021, 3, 20, 9, 0))
+        self.assertIn("kopiowaniu", cp_rsn)
+
+        # Discrepancy between EXIF and filename resolved by matching folder date
+        cons_eff, cons_anom, cons_rsn = MetadataDateResolver.evaluate_date_sources(
+            exif=datetime.datetime(2023, 5, 10, 12, 0),
+            fn_date=datetime.datetime(2021, 5, 10, 12, 0),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
+            mtime=datetime.datetime(2026, 1, 1, 10, 0),
+            folder_info=(datetime.datetime(2023, 1, 1, 0, 0), "year", "Wakacje_2023"),
+        )
+        self.assertTrue(cons_anom)
+        self.assertEqual(cons_eff.year, 2023)
+        self.assertIn(">24h", cons_rsn)
+
+        # Folder confirms filename when EXIF disagrees, and EXIF/filename agreement
+        eff_fn_fold, anom_fn_fold, _ = MetadataDateResolver.evaluate_date_sources(
+            exif=datetime.datetime(2024, 5, 10, 12, 0),
+            fn_date=datetime.datetime(2021, 5, 10, 12, 0),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
+            mtime=datetime.datetime(2026, 1, 1, 10, 0),
+            folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
+        )
+        self.assertTrue(anom_fn_fold)
+        self.assertEqual(eff_fn_fold.year, 2021)
+
+        eff_agree, anom_agree, _ = MetadataDateResolver.evaluate_date_sources(
+            exif=datetime.datetime(2022, 4, 5, 11, 0),
+            fn_date=datetime.datetime(2022, 4, 5, 11, 0),
+            ctime=datetime.datetime(2022, 4, 5, 11, 5),
+            mtime=datetime.datetime(2022, 4, 5, 11, 5),
+            folder_info=MetadataDateResolver.parse_folder_date(self.drive_a / "2022-04-05" / "a.jpg", rel_path="abcdef0123456789abcdef/2022-04-05/a.jpg"),
+        )
+        self.assertFalse(anom_agree)
+        self.assertEqual(eff_agree, datetime.datetime(2022, 4, 5, 11, 0))
+
+        # No folder: fs_oldest breaks tie between EXIF and filename; or overrides single wrong EXIF/fn
+        self.assertEqual(
+            MetadataDateResolver.evaluate_date_sources(
+                exif=datetime.datetime(2022, 1, 2, 10, 0),
+                fn_date=datetime.datetime(2024, 1, 2, 10, 0),
+                ctime=datetime.datetime(2022, 1, 2, 10, 0),
+                mtime=datetime.datetime(2022, 1, 2, 10, 0),
+            )[0].year,
+            2022,
+        )
+        self.assertEqual(
+            MetadataDateResolver.evaluate_date_sources(
+                exif=datetime.datetime(2024, 1, 2, 10, 0),
+                fn_date=datetime.datetime(2022, 1, 2, 10, 0),
+                ctime=datetime.datetime(2022, 1, 2, 10, 0),
+                mtime=datetime.datetime(2022, 1, 2, 10, 0),
+            )[0].year,
+            2022,
+        )
+        self.assertEqual(
+            MetadataDateResolver.evaluate_date_sources(
+                exif=datetime.datetime(2026, 1, 2, 10, 0),
+                fn_date=None,
+                ctime=datetime.datetime(2020, 6, 5, 10, 0),
+                mtime=datetime.datetime(2020, 6, 5, 10, 0),
+                folder_info=(datetime.datetime(2020, 6, 1, 0, 0), "month", "2020-06"),
+            )[0].year,
+            2020,
+        )
+        self.assertEqual(
+            MetadataDateResolver.evaluate_date_sources(
+                exif=None,
+                fn_date=datetime.datetime(2026, 1, 2, 10, 0),
+                ctime=datetime.datetime(2020, 6, 5, 10, 0),
+                mtime=datetime.datetime(2020, 6, 5, 10, 0),
+                folder_info=(datetime.datetime(2020, 6, 1, 0, 0), "month", "2020-06"),
+            )[0].year,
+            2020,
+        )
 
         # Test EXIF parsing on JpegImageFile (valid and >24h diff anomaly)
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "2023:05:10 12:30:45"}):
             ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(img_file, is_image=True)
             self.assertEqual(ex_dt, datetime.datetime(2023, 5, 10, 12, 30, 45))
+            self.assertEqual(eff_dt, fn_dt)
             self.assertTrue(anom)
             self.assertIn(">24h", rsn)
 
@@ -682,6 +797,37 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             # Error cases for rotate-media
             self.assertEqual(self.client.post("/actions/rotate-media", data={}).status_code, 400)
             self.assertEqual(self.client.post("/actions/rotate-media", data={"media_id": "nonexistent"}).status_code, 404)
+
+            # Batch rotation by selected list, album_id, and filtered scope
+            r_rot_list = self.client.post(
+                "/actions/rotate-media",
+                data={"scope": "selected", "selected_ids": [it1_id, it2_id], "delta": 90},
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(r_rot_list.status_code, 200)
+            self.assertEqual(r_rot_list.json()["count"], 2)
+
+            r_rot_alb = self.client.post(
+                "/actions/rotate-media",
+                data={"album_id": str(grp_id), "delta": 90},
+            )
+            self.assertEqual(r_rot_alb.status_code, 200)
+            self.assertIn("Obrócono 2 zdjęć", r_rot_alb.text)
+
+            r_rot_flt = self.client.post(
+                "/actions/rotate-media",
+                data={"scope": "filtered", "group_id": str(grp_id), "delta": 90},
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(r_rot_flt.status_code, 200)
+            db.expire_all()
+            self.assertEqual(db.get(MediaItem, it1_id).rotation_angle, 270)
+            self.assertEqual(db.get(MediaItem, it2_id).rotation_angle, 270)
+
+            # Test recalculate-date-anomalies endpoint
+            r_recalc = self.client.post("/actions/recalculate-date-anomalies")
+            self.assertEqual(r_recalc.status_code, 200)
+            self.assertIn("Przeliczono źródła dat", r_recalc.text)
 
     # =========================================================================
     # 5. OFFLINE MODE, TODO QUEUE, PAIRWISE EXECUTION & AUTOMATIC ROLLBACK
@@ -1590,10 +1736,363 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             with patch.object(g_mgr, "upload_and_verify", return_value={"id": "c2", "name": "b.db", "size_bytes": 100, "md5": "abc", "verified": True, "purged_local": False}):
                 self.client.post("/actions/gdrive-sync", data={"mode": "db_backup"})
 
-        j_scan = ProcessManager.create_job("scan", "Scan Stop", ["mv_item.jpg"])
+        j_scan = ProcessManager.create_job(
+            "scan",
+            "Scan Stop",
+            ["mv_item.jpg"],
+            params={"path": str(self.drive_a), "force_rescan": False},
+        )
         ProcessManager.request_stop(j_scan)
         with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-MV-99", "Dysk_MV", str(self.drive_a))):
             execute_scan(str(self.drive_a), force_rescan=True, job_id=j_scan)
+
+        # Resume the stopped scan job via /actions/process-control
+        with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-MV-99", "Dysk_MV", str(self.drive_a))):
+            r_res_scan = self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_scan)})
+            self.assertEqual(r_res_scan.status_code, 200)
+
+        # Verify empty path guard in execute_scan and scan resume
+        self.assertEqual(execute_scan("   ")["status"], "error")
+        j_scan_empty = ProcessManager.create_job("scan", "Scan Empty Path", ["mv_item.jpg"], params={})
+        self.client.post("/actions/process-control", data={"action": "resume", "job_id": str(j_scan_empty)})
+
+        # Test execute_scan deduplicating duplicate relative_paths (e.g. Windows junctions / fallback collisions)
+        from app.routers.actions import _commit_scan_batch, _compute_scan_relative_path
+        dup_scan_dir = self.root / "DupScanDrive"
+        (dup_scan_dir / "Dir1").mkdir(parents=True, exist_ok=True)
+        (dup_scan_dir / "Dir2").mkdir(parents=True, exist_ok=True)
+        create_synthetic_jpeg(dup_scan_dir / "Dir1" / "same_name.jpg", color=(10, 20, 30))
+        create_synthetic_jpeg(dup_scan_dir / "Dir2" / "same_name.jpg", color=(40, 50, 60))
+        with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("V-SCAN-DUP", "ScanDup", str(dup_scan_dir))), patch(
+            "app.routers.actions._compute_scan_relative_path", return_value="virtual/colliding_rel.jpg"
+        ):
+            scan_dup_res = execute_scan(str(dup_scan_dir))
+            self.assertEqual(scan_dup_res["status"], "ok")
+            self.assertEqual(scan_dup_res["indexed"], 1)
+
+        # Test _compute_scan_relative_path fallback chain
+        p_outside = self.root / "OtherPlace" / "pic.jpg"
+        self.assertEqual(
+            _compute_scan_relative_path(p_outside, Path("C:/NonExistentRoot"), Path("C:/NonExistentRoot"), self.root),
+            "OtherPlace/pic.jpg",
+        )
+        self.assertEqual(
+            _compute_scan_relative_path(p_outside, Path("C:/NonExistentRoot"), Path("C:/NonExistentRoot"), Path("D:/AnotherRoot")),
+            "pic.jpg",
+        )
+
+        # Test _commit_scan_batch conflict fallback when batch contains duplicate (volume_id, relative_path)
+        with self.TestingSessionLocal() as db:
+            vol_cb = WindowsVolume(volume_serial_number="V-CB-1", volume_label="CB_Vol", last_known_drive_letter=str(self.drive_a))
+            db.add(vol_cb)
+            db.commit()
+            db.refresh(vol_cb)
+            p_cb1 = create_synthetic_jpeg(self.drive_a / "cb1.jpg", color=(11, 22, 33))
+            p_cb2 = create_synthetic_jpeg(self.drive_a / "cb2.jpg", color=(44, 55, 66))
+            it_cb1_a = FileScannerService.process_file(p_cb1, vol_cb, rel_override="cb_dup.jpg")
+            it_cb1_b = FileScannerService.process_file(p_cb1, vol_cb, rel_override="cb_dup.jpg")
+            it_cb2 = FileScannerService.process_file(p_cb2, vol_cb, rel_override="cb_ok.jpg")
+            added_cb = _commit_scan_batch(db, [it_cb1_a, it_cb1_b, it_cb2], vol_cb.id)
+            self.assertEqual(added_cb, 2)
+
+        # Test GoogleDriveManager.list_db_backups & download_and_verify_backup + BackupManager.restore_from_backup + /actions/gdrive-restore-db
+        snapshot_path = BackupManager(db_path=self.db_path, backup_dir=self.root / "cloud_snaps").create_backup("cloud_snap")
+        snap_bytes = snapshot_path.read_bytes()
+        snap_md5 = GoogleDriveManager.compute_local_md5(snapshot_path)
+
+        mock_svc.files().list().execute.return_value = {
+            "files": [
+                {"id": "db_bkp_1", "name": "media_vault_cloud.db", "size": str(len(snap_bytes)), "md5Checksum": snap_md5, "createdTime": "2026-11-14T10:00:00Z"},
+                {"id": "img_1", "name": "photo.jpg", "size": "123", "md5Checksum": "aaa"},
+            ]
+        }
+        with patch.object(g_mgr, "authenticate", side_effect=_fake_auth):
+            g_mgr.service = None
+            db_bkps = g_mgr.list_db_backups(folder_id="fld1")
+        self.assertEqual(len(db_bkps), 1)
+        self.assertEqual(db_bkps[0]["id"], "db_bkp_1")
+
+        # Mutate DB after snapshot so restore visibly brings data back
+        with self.TestingSessionLocal() as db:
+            db.add(WindowsVolume(volume_serial_number="V-AFTER-SNAP", volume_label="AfterSnap", last_known_drive_letter="W:\\"))
+            db.commit()
+
+        # Verify FileNotFoundError and corrupt DB error in restore_from_backup
+        bm_restore = BackupManager(db_path=self.db_path, backup_dir=self.backup_dir)
+        with self.assertRaises(FileNotFoundError):
+            bm_restore.restore_from_backup(self.root / "missing_backup.db")
+
+        bad_sqlite = self.root / "not_a_db.db"
+        bad_sqlite.write_bytes(b"not sqlite content")
+        with self.assertRaises(RuntimeError):
+            bm_restore.restore_from_backup(bad_sqlite)
+
+        empty_sqlite = self.root / "empty_no_tables.db"
+        c_empty = sqlite3.connect(empty_sqlite.as_posix())
+        c_empty.execute("CREATE TABLE other (id INTEGER);")
+        c_empty.commit()
+        c_empty.close()
+        with self.assertRaises(RuntimeError):
+            bm_restore.restore_from_backup(empty_sqlite)
+
+        # Mock MediaIoBaseDownload to write snapshot bytes cleanly
+        class _FakeDownloader:
+            def __init__(self, fh, _req):
+                self.fh = fh
+
+            def next_chunk(self):
+                self.fh.write(snap_bytes)
+                return None, True
+
+        mock_svc.files().get().execute.return_value = {
+            "id": "db_bkp_1",
+            "name": "media_vault_cloud.db",
+            "size": str(len(snap_bytes)),
+            "md5Checksum": snap_md5,
+            "createdTime": "2026-11-14T10:00:00Z",
+        }
+        dl_dest = self.root / "downloaded_restore.db"
+        with patch("googleapiclient.http.MediaIoBaseDownload", _FakeDownloader):
+            with patch.object(g_mgr, "authenticate", side_effect=_fake_auth):
+                g_mgr.service = None
+                dl_res = g_mgr.download_and_verify_backup("db_bkp_1", dl_dest)
+            self.assertTrue(dl_res["verified"])
+
+            # Checksum mismatch raises RuntimeError
+            mock_svc.files().get().execute.return_value = {
+                "id": "db_bkp_bad",
+                "name": "corrupt.db",
+                "size": str(len(snap_bytes)),
+                "md5Checksum": "ffffffffffffffffffffffffffffffff",
+            }
+            with self.assertRaises(RuntimeError):
+                g_mgr.download_and_verify_backup("db_bkp_bad", self.root / "bad_dl.db")
+
+            # Restore mock metadata and invoke POST /actions/gdrive-restore-db
+            mock_svc.files().get().execute.return_value = {
+                "id": "db_bkp_1",
+                "name": "media_vault_cloud.db",
+                "size": str(len(snap_bytes)),
+                "md5Checksum": snap_md5,
+                "createdTime": "2026-11-14T10:00:00Z",
+            }
+            with patch("app.cloud.google_drive.GoogleDriveManager", return_value=g_mgr):
+                r_rest = self.client.post("/actions/gdrive-restore-db", data={"file_id": "db_bkp_1", "folder_id": "fld1"})
+                self.assertEqual(r_rest.status_code, 200)
+                self.assertIn("Przywrócono bazę SQLite", r_rest.text)
+
+        # Verify restored DB no longer contains V-AFTER-SNAP
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "V-AFTER-SNAP")))
+
+        # Error branch for /actions/gdrive-restore-db
+        with patch("app.cloud.google_drive.GoogleDriveManager", side_effect=RuntimeError("CloudRestoreErr")):
+            r_rest_err = self.client.post("/actions/gdrive-restore-db", data={"file_id": "db_bkp_1", "folder_id": "fld1"})
+            self.assertEqual(r_rest_err.status_code, 200)
+            self.assertIn("CloudRestoreErr", r_rest_err.text)
+
+        # Test HTML5 user guide (/przewodnik) and technical docs (/dokumentacja) routes
+        r_guide = self.client.get("/przewodnik")
+        self.assertEqual(r_guide.status_code, 200)
+        self.assertIn("Przewodnik Użytkownika", r_guide.text)
+
+        r_docs = self.client.get("/dokumentacja")
+        self.assertEqual(r_docs.status_code, 200)
+        self.assertIn("Domowe Archiwum Foto", r_docs.text)
+
+    # =========================================================================
+    # 9. OFFLINE DISK SPACE PERSISTENCE & PRE-EXECUTION TEXT REPORT
+    # =========================================================================
+    def test_offline_space_persistence_and_local_text_report(self):
+        with self.TestingSessionLocal() as db:
+            svc = StorageAutomationService(db)
+            empty_rep = svc.generate_offline_procedure_report()
+            self.assertIn("Brak zarejestrowanych urządzeń", empty_rep["report_text"])
+            self.assertIn("Lista TODO jest pusta", empty_rep["report_text"])
+
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-REP-A",
+                volume_label="Archiwum_Offline_A",
+                last_known_drive_letter="X:\\MissingDriveA\\",
+                is_online=False,
+                total_space_bytes=500 * 1024 * 1024 * 1024,
+                free_space_bytes=120 * 1024 * 1024 * 1024,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-REP-B",
+                volume_label="Backup_Online_B",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            vol_empty = WindowsVolume(
+                volume_serial_number="VSN-REP-EMP",
+                volume_label="Pendrive_Bez_Pojemnosci",
+                last_known_drive_letter="Y:\\MissingEmpty\\",
+                is_online=False,
+                total_space_bytes=0,
+                free_space_bytes=0,
+            )
+            db.add_all([vol_a, vol_b, vol_empty])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_empty)
+
+            # Verify refresh_volumes_online_status keeps cached offline capacity for disconnected volume
+            # and updates live capacity for online volume_b
+            svc.refresh_volumes_online_status()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            self.assertFalse(vol_a.is_online)
+            self.assertEqual(vol_a.free_space_bytes, 120 * 1024 * 1024 * 1024)
+            self.assertTrue(vol_b.is_online)
+            self.assertGreater(vol_b.free_space_bytes, 0)
+
+            # Check fallback_free_bytes works when drive is offline
+            ok_off, fb_bytes = StorageAutomationService.check_volume_free_space(
+                vol_a.last_known_drive_letter, 1024 * 1024, fallback_free_bytes=vol_a.free_space_bytes
+            )
+            self.assertTrue(ok_off)
+            self.assertEqual(fb_bytes, 120 * 1024 * 1024 * 1024)
+
+            # Create sample media items: unbacked item on offline vol_a + duplicate on vol_b + pending TODO move
+            now_dt = datetime.datetime.utcnow()
+            it_orig = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_a.id,
+                relative_path="2022/wakacje_offline.jpg",
+                file_name="wakacje_offline.jpg",
+                file_size_bytes=5 * 1024 * 1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="hash_offline_1",
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                effective_date=datetime.datetime(2022, 7, 1, 12, 0),
+                thumbnail_relative_path="t1.webp",
+            )
+            it_dup_src = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_b.id,
+                relative_path="Stary_Folder/duplikat.jpg",
+                file_name="duplikat.jpg",
+                file_size_bytes=4 * 1024 * 1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="hash_dup_pair",
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                effective_date=datetime.datetime(2022, 8, 1, 12, 0),
+                thumbnail_relative_path="t2.webp",
+            )
+            it_dup_extra = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_b.id,
+                relative_path="Kopia/duplikat_kopia.jpg",
+                file_name="duplikat_kopia.jpg",
+                file_size_bytes=4 * 1024 * 1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="hash_dup_pair",
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                effective_date=datetime.datetime(2022, 8, 1, 12, 0),
+                thumbnail_relative_path="t3.webp",
+            )
+            it_reloc_orig = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_a.id,
+                relative_path="2021/relokacja.jpg",
+                file_name="relokacja.jpg",
+                file_size_bytes=2 * 1024 * 1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="hash_reloc_pair",
+                hash_algorithm="sha256",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                effective_date=datetime.datetime(2021, 9, 1, 12, 0),
+                thumbnail_relative_path="t4.webp",
+            )
+            it_reloc_copy = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_b.id,
+                relative_path="Luzne_Kopie/relokacja.jpg",
+                file_name="relokacja.jpg",
+                file_size_bytes=2 * 1024 * 1024,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="hash_reloc_pair",
+                hash_algorithm="sha256",
+                is_primary_duplicate=False,
+                is_backup_copy=False,
+                fs_ctime=now_dt,
+                fs_mtime=now_dt,
+                effective_date=datetime.datetime(2021, 9, 1, 12, 0),
+                thumbnail_relative_path="t5.webp",
+            )
+            db.add_all([it_orig, it_dup_src, it_dup_extra, it_reloc_orig, it_reloc_copy])
+            db.commit()
+
+            todo = PendingFileMove(
+                media_id=it_orig.id,
+                source_volume_id=vol_a.id,
+                source_relative_path="2022/wakacje_offline.jpg",
+                source_file_name="wakacje_offline.jpg",
+                target_volume_id=vol_b.id,
+                target_relative_path="Nowe/wakacje_offline.jpg",
+                target_file_name="wakacje_offline.jpg",
+                status="PENDING",
+            )
+            db.add(todo)
+            db.commit()
+
+            # Check sidebar and backup panel display cached offline free space
+            r_sb = self.client.get("/media/sidebar")
+            self.assertEqual(r_sb.status_code, 200)
+            self.assertIn("Offline", r_sb.text)
+            self.assertIn("120.0 GB", r_sb.text)
+
+            r_bp = self.client.get("/actions/backup-panel")
+            self.assertEqual(r_bp.status_code, 200)
+            self.assertIn("120.00 GB", r_bp.text)
+
+            # Prepare offline report for backup panel and todo panel and verify saved .txt file on local disk
+            r_prep_bkp = self.client.post(
+                "/actions/prepare-offline-report",
+                data={"preferred_target_volume_id": str(vol_b.id), "target_panel": "backup"},
+            )
+            self.assertEqual(r_prep_bkp.status_code, 200)
+            self.assertIn("Zapisano raport procedury Offline", r_prep_bkp.text)
+            self.assertIn("[KOPIOWANIE BACKUPU]", r_prep_bkp.text)
+            self.assertIn("[PRZENIESIENIE DO backup/]", r_prep_bkp.text)
+            self.assertIn("[USUNIĘCIE DUPLIKATU]", r_prep_bkp.text)
+            self.assertIn("[PRZENIESIENIE TODO", r_prep_bkp.text)
+
+            latest_txt = self.reports_dir / "raport_procedura_offline_ostatni.txt"
+            self.assertTrue(latest_txt.exists())
+            content = latest_txt.read_text(encoding="utf-8")
+            self.assertIn("Archiwum_Offline_A", content)
+            self.assertIn("wakacje_offline.jpg", content)
+
+            r_prep_todo = self.client.post("/actions/prepare-offline-report", data={"target_panel": "todo"})
+            self.assertEqual(r_prep_todo.status_code, 200)
+            self.assertIn("Zapisano raport zmian Offline", r_prep_todo.text)
+
+            r_dl = self.client.get("/actions/download-offline-report")
+            self.assertEqual(r_dl.status_code, 200)
+            self.assertIn("RAPORT PROCEDURY BACKUPU", r_dl.text)
 
 
 if __name__ == "__main__":
