@@ -1,0 +1,93 @@
+<div class="space-y-4 text-xs">
+    <!-- Sekcja 1: Kontrola procesów w tle i niedokończonych zadań (Req 3a, 3b, 3c) -->
+    <div class="bg-slate-900/90 border border-borderBg rounded-xl p-4 space-y-3">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-purple-300 text-sm">⚡ Aktywne oraz Niedokończone Procesy Systemowe</span>
+            <button type="button"
+                    onclick="htmx.ajax('GET', '/actions/status-panel', '#status-panel-body')"
+                    class="text-indigo-400 hover:underline text-[11px]">🔄 Odśwież status</button>
+        </div>
+
+        {% if jobs_summary.all_jobs %}
+        <div class="space-y-2 max-h-60 overflow-y-auto">
+            {% for j in jobs_summary.all_jobs %}
+            {% set pct = ((j.processed_count * 100) // j.total_count) if j.total_count > 0 else (100 if j.status == 'COMPLETED' else 0) %}
+            <div class="p-3 rounded-lg bg-cardBg border {% if j.status == 'RUNNING' %}border-purple-500{% elif j.status in ('STOPPED', 'PAUSED', 'WAITING_FOR_DEVICE') %}border-amber-600{% elif j.status == 'FAILED' %}border-rose-600{% else %}border-borderBg{% endif %} space-y-1.5">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex items-center space-x-2">
+                        <span class="font-mono text-[10px] px-2 py-0.5 rounded font-bold
+                            {% if j.status == 'RUNNING' %}bg-purple-700 text-white animate-pulse
+                            {% elif j.status in ('STOPPED', 'PAUSED', 'WAITING_FOR_DEVICE') %}bg-amber-700 text-white
+                            {% elif j.status == 'COMPLETED' %}bg-emerald-800 text-emerald-100
+                            {% else %}bg-rose-800 text-white{% endif %}">
+                            {{ j.status }}
+                        </span>
+                        <span class="font-semibold text-slate-100">#{{ j.id }} — {{ j.title }}</span>
+                    </div>
+                    <div class="flex items-center space-x-1.5">
+                        {% if j.status == 'RUNNING' %}
+                        <button type="button"
+                                hx-post="/actions/process-control"
+                                hx-vals='{"action": "stop", "job_id": "{{ j.id }}"}'
+                                hx-target="#status-panel-body"
+                                class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded text-[10px] font-semibold">
+                            ⏹️ Zatrzymaj
+                        </button>
+                        {% elif j.status in ('STOPPED', 'PAUSED', 'WAITING_FOR_DEVICE', 'FAILED') %}
+                        <button type="button"
+                                hx-post="/actions/process-control"
+                                hx-vals='{"action": "resume", "job_id": "{{ j.id }}"}'
+                                hx-target="#status-panel-body"
+                                class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded text-[10px] font-semibold">
+                            ▶️ Wznów / Wystartuj
+                        </button>
+                        <button type="button"
+                                hx-post="/actions/process-control"
+                                hx-vals='{"action": "cancel", "job_id": "{{ j.id }}"}'
+                                hx-target="#status-panel-body"
+                                class="bg-slate-800 hover:bg-rose-800 text-rose-200 px-2 py-1 rounded text-[10px]">
+                            ✖️ Usuń
+                        </button>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="flex items-center justify-between text-[11px] text-slate-400">
+                    <span>{{ j.last_message or '' }}</span>
+                    <span class="font-mono">{{ j.processed_count }} / {{ j.total_count }} ({{ pct }}%)</span>
+                </div>
+                <div class="w-full h-1.5 bg-slate-800 rounded overflow-hidden">
+                    <div class="h-full {% if j.status == 'COMPLETED' %}bg-emerald-500{% elif j.status == 'RUNNING' %}bg-purple-500{% else %}bg-amber-500{% endif %}" style="width: {{ pct }}%"></div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="p-4 text-center text-slate-500 italic">Brak zarejestrowanych procesów w tle.</div>
+        {% endif %}
+    </div>
+
+    <!-- Sekcja 2: Log operacji zapisany na dysku (data/logs/operations.log - Req 3d) -->
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-4 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-200">📜 Dziennik Operacji na Dysku (<code>data/logs/operations.log</code>):</span>
+            <span class="text-[10px] text-slate-400 font-mono">Ostatnie {{ logs|length }} wpisów</span>
+        </div>
+        <div class="max-h-64 overflow-y-auto border border-borderBg rounded-lg bg-darkBg p-2 font-mono text-[11px] space-y-1">
+            {% for lg in logs %}
+            <div class="py-1 px-1.5 border-b border-borderBg/40 flex items-start space-x-2">
+                <span class="text-slate-500 flex-shrink-0">[{{ lg.timestamp }}]</span>
+                <span class="px-1.5 rounded text-[10px] font-bold flex-shrink-0
+                    {% if lg.status in ('OK', 'COMPLETED') %}bg-emerald-950 text-emerald-300
+                    {% elif lg.status in ('WARN', 'STOPPED', 'PARTIAL') %}bg-amber-950 text-amber-300
+                    {% elif lg.status in ('ERROR', 'FAILED') %}bg-rose-950 text-rose-300
+                    {% else %}bg-indigo-950 text-indigo-300{% endif %}">
+                    {{ lg.operation_type }}
+                </span>
+                <span class="text-slate-200 break-all">{{ lg.message }}</span>
+            </div>
+            {% else %}
+            <div class="p-4 text-center text-slate-500">Brak wpisów w dzienniku operacji.</div>
+            {% endfor %}
+        </div>
+    </div>
+</div>

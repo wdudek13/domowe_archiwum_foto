@@ -1,0 +1,121 @@
+    <!-- Ukryty kontener z pełnymi statystykami par dysków dla natychmiastowego filtrowania w JS -->
+    <script id="backup-pair-counts-data" type="application/json">{{ pair_counts|safe if pair_counts is defined else '{}' }}</script>
+
+    <!-- Automatycznie wykryta lista plików bez backupu dla wybranych par (Req 1g + 8c) -->
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-300">📋 Lista plików bez backupu na innym urządzeniu (<span id="unbacked-filtered-count">{{ unbacked_total }}</span> / {{ unbacked_all_total if unbacked_all_total is defined else unbacked_total }} szt.{% if unbacked_files|length < unbacked_total %} — podgląd pierwszych <span id="unbacked-shown-count">{{ unbacked_files|length }}</span>{% endif %}):</span>
+            <button type="button"
+                    onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, unbacked_only: true});"
+                    class="text-emerald-400 hover:underline text-[11px]">Pokaż te pliki w głównej galerii &rarr;</button>
+        </div>
+        <div class="max-h-48 overflow-y-auto">
+            {% if unbacked_files %}
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg text-slate-400">
+                        <th class="py-1 px-2">Nazwa pliku</th>
+                        <th class="py-1 px-2">Obecne urządzenie (Oryginał)</th>
+                        <th class="py-1 px-2">Ścieżka</th>
+                        <th class="py-1 px-2">Rozmiar</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for uf in unbacked_files %}
+                    <tr class="unbacked-file-row" data-pair-keys="{{ plan.unbacked_pair_keys_str.get(uf.id, plan.unbacked_pair_map.get(uf.id, '')) if (plan.unbacked_pair_keys_str is defined or plan.unbacked_pair_map is defined) else '' }}" data-volume-id="{{ uf.volume_id }}">
+                        <td class="py-1 px-2 text-slate-200 truncate max-w-[180px]">{{ uf.file_name }}</td>
+                        <td class="py-1 px-2 text-amber-300">{{ uf.volume.volume_label if uf.volume else '?' }} ({{ uf.volume.last_known_drive_letter if uf.volume else '?' }})</td>
+                        <td class="py-1 px-2 text-slate-400 truncate max-w-[220px]">{{ uf.relative_path }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(uf.file_size_bytes / (1024*1024)) }} MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <div id="unbacked-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
+                Brak plików bez backupu przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
+            </div>
+            {% else %}
+            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Wszystkie zindeksowane pliki posiadają zweryfikowany backup na innym urządzeniu!</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Lista duplikatów z wybranych urządzeń / par -->
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-300">👥 Lista duplikatów z wybranych urządzeń (<span id="duplicates-filtered-count">{{ duplicates_total if duplicates_total is defined else plan.redundant_duplicates_count }}</span> / {{ duplicates_all_total if duplicates_all_total is defined else plan.redundant_duplicates_count }} szt.{% if duplicate_files|length < duplicates_total %} — podgląd pierwszych <span id="duplicates-shown-count">{{ duplicate_files|length }}</span>{% endif %}):</span>
+            <button type="button"
+                    onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, duplicates_only: true});"
+                    class="text-rose-400 hover:underline text-[11px]">Pokaż duplikaty w głównej galerii &rarr;</button>
+        </div>
+        <div class="max-h-48 overflow-y-auto">
+            {% if duplicate_files %}
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg text-slate-400">
+                        <th class="py-1 px-2">Nazwa pliku (duplikat)</th>
+                        <th class="py-1 px-2">Urządzenie z duplikatem</th>
+                        <th class="py-1 px-2">Ścieżka duplikatu</th>
+                        <th class="py-1 px-2">Zachowany oryginał</th>
+                        <th class="py-1 px-2">Rozmiar</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for df in duplicate_files %}
+                    <tr class="duplicate-file-row" data-pair-keys="{{ df.pair_keys_str if df.pair_keys_str is defined else df.pair_key_str }}" data-volume-id="{{ df.dup_vol_id }}">
+                        <td class="py-1 px-2 text-rose-200 truncate max-w-[160px]">{{ df.file_name }}</td>
+                        <td class="py-1 px-2 text-amber-300">{{ df.dup_vol_label }} ({{ df.dup_vol_letter }})</td>
+                        <td class="py-1 px-2 text-slate-400 truncate max-w-[180px]">{{ df.dup_relative_path }}</td>
+                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[180px]" title="{{ df.ref_vol_label }}: {{ df.ref_relative_path }}">{{ df.ref_vol_label }}: {{ df.ref_relative_path }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(df.file_size / (1024*1024)) }} MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <div id="duplicates-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
+                Brak duplikatów przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
+            </div>
+            {% else %}
+            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Brak nadmiarowych duplikatów wymagających usunięcia na indeksowanych urządzeniach.</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Lista oryginałów kwalifikowanych do albumu Ważne z wybranych urządzeń / par (Rule 2b & 2d) -->
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-slate-300">⭐ Lista oryginałów dodawanych do albumu „Ważne…” (<span id="important-filtered-count">{{ important_total if important_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }}</span> / {{ important_all_total if important_all_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }} szt.{% if important_files is defined and important_files|length < important_total %} — podgląd pierwszych <span id="important-shown-count">{{ important_files|length }}</span>{% endif %}):</span>
+            <span class="text-amber-400/80 text-[11px]">Automatycznie tworzone podalbumy wg daty (RRRR / RRRR-MM)</span>
+        </div>
+        <div class="max-h-48 overflow-y-auto">
+            {% if important_files %}
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg text-slate-400">
+                        <th class="py-1 px-2">Nazwa pliku</th>
+                        <th class="py-1 px-2">Urządzenie (Oryginał)</th>
+                        <th class="py-1 px-2">Ścieżka oryginału</th>
+                        <th class="py-1 px-2">Docelowy album</th>
+                        <th class="py-1 px-2">Rozmiar</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for imp in important_files %}
+                    <tr class="important-file-row" data-pair-keys="{{ imp.pair_keys_str }}" data-volume-id="{{ imp.vol_id }}">
+                        <td class="py-1 px-2 text-amber-200 truncate max-w-[180px]">{{ imp.file_name }}</td>
+                        <td class="py-1 px-2 text-amber-300">{{ imp.vol_label }} ({{ imp.vol_letter }})</td>
+                        <td class="py-1 px-2 text-slate-400 truncate max-w-[200px]">{{ imp.relative_path }}</td>
+                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[220px]" title="{{ imp.target_album }}">{{ imp.target_album }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(imp.file_size / (1024*1024)) }} MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <div id="important-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
+                Brak plików kwalifikowanych do albumu „Ważne…” dla aktualnie zaznaczonych par urządzeń powyżej.
+            </div>
+            {% else %}
+            <div class="p-4 text-center text-slate-400 font-semibold">Brak plików z lokalnymi duplikatami kwalifikowanych do albumu „Ważne…”.</div>
+            {% endif %}
+        </div>
+    </div>
