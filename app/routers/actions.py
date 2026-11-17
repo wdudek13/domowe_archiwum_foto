@@ -1123,10 +1123,35 @@ def control_background_process(
                     _run_background_ai_batch(job.id, rem_ids, analysis_type=atype)
                 else:
                     ProcessManager.start_background_thread(job.id, _run_background_ai_batch, rem_ids, analysis_type=atype)
-            elif job.job_type == "delete_permanently":
-                _execute_delete_permanently_items(db, rem_ids, job_id=job.id)
-            elif job.job_type == "move_to_trash":
-                _execute_move_to_trash_items(db, rem_ids, job_id=job.id)
+            elif job.job_type in ("delete_permanently", "move_to_trash"):
+                del_mode = "trash" if job.job_type == "move_to_trash" else "permanent"
+                act_url = "/actions/move-to-trash" if del_mode == "trash" else "/actions/delete-permanently"
+                is_dup_job = bool(params.get("is_duplicate_removal") or _has_duplicate_role_in_ids(db, rem_ids))
+                if is_dup_job:
+                    if run_sync:
+                        res = StorageAutomationService(db).execute_safe_duplicate_removal(
+                            item_ids=rem_ids,
+                            delete_mode=del_mode,
+                            force_duplicate_verification=True,
+                            job_id=job.id,
+                            trash_dir=DATA_DIR / "kosz",
+                            thumbnails_dir=THUMBNAILS_DIR,
+                        )
+                        _build_safe_removal_html_response(act_url, del_mode, res, job.id, db)
+                    else:
+                        _start_duplicate_removal_async(
+                            db=db,
+                            item_ids=rem_ids,
+                            delete_mode=del_mode,
+                            force_duplicate_verification=True,
+                            action_url=act_url,
+                            skip_db_backup=True,
+                            existing_job_id=job.id,
+                        )
+                elif job.job_type == "delete_permanently":
+                    _execute_delete_permanently_items(db, rem_ids, job_id=job.id)
+                else:
+                    _execute_move_to_trash_items(db, rem_ids, job_id=job.id)
             elif job.job_type == "backup_dedup":
                 svc = StorageAutomationService(db)
                 svc.execute_backup_and_deduplication(job_id=job.id)
@@ -3050,39 +3075,27 @@ def _build_safe_removal_html_response(
                 {
                     "scope": "selected",
                     "duplicates_only": "true",
-                    "skip_db_backup": "1",
+                    "skip_db_backup": "true",
+                    "continue_job_id": str(job_id),
                     "selected_ids_json": json.dumps(offline_ids),
                 }
             )
         )
         nxt_del = int(nxt.get("delete_count", nxt.get("count", 0)) or 0)
-        nxt_ref = int(nxt.get("verify_only_count", 0) or 0)
-        del_drives = [d for d in res["offline_drives"] if int(d.get("delete_count", d.get("count", 0)) or 0) > 0]
-        drive_breakdown = ", ".join(
-            f"{html_mod.escape(d['vol_label'])}: {int(d.get('delete_count', d.get('count', 0)) or 0)} szt."
-            for d in del_drives
+        other_drives_summary = ", ".join(
+            f"{html_mod.escape(d['vol_label'])} ({html_mod.escape(d['drive_letter'])}): {int(d.get('delete_count', d.get('count', 0)) or 0)} szt."
+            for d in res["offline_drives"]
         )
-        if nxt_del > 0:
-            prompt_desc = (
-                f"<span>🔌 <strong>Podłącz kolejny dysk (pozostało dysków z duplikatami: {len(del_drives)})</strong>: "
-                f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
-                f"— na tym dysku do usunięcia jest <strong>{nxt_del}</strong> duplikatów "
-                f"(łącznie pozostało: <strong>{len(offline_ids)}</strong> szt."
-                f"{f' — {drive_breakdown}' if drive_breakdown else ''}).</span>"
-            )
-        else:
-            prompt_desc = (
-                f"<span>🔌 <strong>Podłącz dysk referencyjny do weryfikacji</strong>: "
-                f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
-                f"— na tym dysku brak duplikatów (0 szt.), zawiera kopie referencyjne (Oryginał/Backup) dla "
-                f"<strong>{nxt_ref}</strong> duplikatów oczekujących na podłączonym dysku.</span>"
-            )
         parts.append(
             f"<div class='mt-1.5 p-2 rounded-lg bg-amber-950/90 border border-amber-500 text-amber-100 flex flex-wrap items-center justify-between gap-2 text-[11px]'>"
-            f"{prompt_desc}"
+            f"<span>🔌 <strong>Podłącz kolejny dysk ({len(res['offline_drives'])} w kolejce)</strong>: "
+            f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
+            f"— do usunięcia na tym dysku: <strong>{nxt_del}</strong> duplikatów "
+            f"(łącznie na odłączonych dyskach: <strong>{len(offline_ids)}</strong> szt."
+            f"{f' [{other_drives_summary}]' if other_drives_summary else ''}).</span>"
             f"<button type='button' hx-post='{action_url}' hx-vals=\"{vals_payload}\" hx-target='#global-notification' "
             f"class='bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded font-semibold shadow cursor-pointer'>"
-            f"▶️ Kontynuuj na podłączonym dysku"
+            f"▶️ Kontynuuj na podłączonym dysku ({nxt_del} szt.)"
             f"</button></div>"
         )
 
@@ -3191,18 +3204,33 @@ def _start_duplicate_removal_async(
     force_duplicate_verification: bool,
     action_url: str,
     skip_db_backup: bool = False,
+    existing_job_id: Optional[int] = None,
 ) -> HTMLResponse:
     if DUP_DELETE_STATE["running"]:
         return get_dup_delete_status()
 
     title_prefix = "Przenoszenie duplikatów do Kosza" if delete_mode == "trash" else "Trwałe usuwanie duplikatów z dysku"
     job_type = "move_to_trash" if delete_mode == "trash" else "delete_permanently"
-    job_id = ProcessManager.create_job(
-        job_type=job_type,
-        title=f"{title_prefix} ({len(item_ids)} poz.)",
-        item_ids=item_ids,
-        db=db,
-    )
+    job_id = None
+    if existing_job_id:
+        existing_job = db.get(BackgroundJob, existing_job_id)
+        if existing_job:
+            existing_job.status = "RUNNING"
+            existing_job.processed_count = 0
+            existing_job.total_count = len(item_ids)
+            existing_job.remaining_ids_json = json.dumps(item_ids, ensure_ascii=False)
+            existing_job.last_message = f"Kontynuacja usuwania duplikatów ({len(item_ids)} poz.)..."
+            existing_job.updated_at = datetime.datetime.now(datetime.UTC)
+            db.commit()
+            job_id = existing_job.id
+    if job_id is None:
+        job_id = ProcessManager.create_job(
+            job_type=job_type,
+            title=f"{title_prefix} ({len(item_ids)} poz.)",
+            item_ids=item_ids,
+            params={"is_duplicate_removal": True, "delete_mode": delete_mode},
+            db=db,
+        )
     DUP_DELETE_STATE.update(
         {
             "running": True,
@@ -3310,6 +3338,7 @@ async def move_items_to_local_trash(
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
     run_sync = _form_bool(form, "run_sync")
     skip_db_backup = _form_bool(form, "skip_db_backup")
+    continue_job_id = to_int(_form_str(form, "continue_job_id"))
     is_htmx = request.headers.get("HX-Request") == "true"
 
     if t_gid:
@@ -3347,6 +3376,7 @@ async def move_items_to_local_trash(
             force_duplicate_verification=bool(duplicates_only),
             action_url="/actions/move-to-trash",
             skip_db_backup=skip_db_backup,
+            existing_job_id=continue_job_id,
         )
 
     if not skip_db_backup:
@@ -3749,6 +3779,7 @@ async def delete_files_permanently_from_disk(
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
     run_sync = _form_bool(form, "run_sync")
     skip_db_backup = _form_bool(form, "skip_db_backup")
+    continue_job_id = to_int(_form_str(form, "continue_job_id"))
     is_htmx = request.headers.get("HX-Request") == "true"
 
     grp_to_delete = None
@@ -3782,6 +3813,7 @@ async def delete_files_permanently_from_disk(
             force_duplicate_verification=bool(duplicates_only),
             action_url="/actions/delete-permanently",
             skip_db_backup=skip_db_backup,
+            existing_job_id=continue_job_id,
         )
 
     if not skip_db_backup:

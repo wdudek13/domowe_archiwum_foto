@@ -4200,6 +4200,10 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 p_dup_a_from_d.write_bytes(p_ref_only.read_bytes())
 
                 p_e_orig = create_synthetic_jpeg(self.drive_a / "e_src.jpg", color=(90, 80, 70))
+                p_e_orig_a2 = self.drive_a / "e_src_copy2.jpg"
+                p_e_orig_a3 = self.drive_a / "e_src_copy3.jpg"
+                p_e_orig_a2.write_bytes(p_e_orig.read_bytes())
+                p_e_orig_a3.write_bytes(p_e_orig.read_bytes())
                 p_e_bkp = self.drive_b / "daf_backup" / "2024" / "06" / "01" / "e_src.jpg"
                 p_e_bkp.parent.mkdir(parents=True, exist_ok=True)
                 p_e_bkp.write_bytes(p_e_orig.read_bytes())
@@ -4216,6 +4220,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                     FileScannerService.process_file(p_e_bkp, vol_b),
                     FileScannerService.process_file(p_e_dup1, vol_e),
                     FileScannerService.process_file(p_e_dup2, vol_e),
+                    FileScannerService.process_file(p_e_orig_a2, vol_a),
+                    FileScannerService.process_file(p_e_orig_a3, vol_a),
                 ]
                 db.add_all(extra_items)
                 db.commit()
@@ -4239,13 +4245,22 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                     time.sleep(0.05)
                 r_off_poll = self.client.get("/actions/dup-delete-status")
                 self.assertEqual(r_off_poll.status_code, 200)
-                # Must ask for DiskE_HasDups (2 duplicates) BEFORE DiskD_RefOnly (0 duplicates) and never prompt online DiskA!
+                # Online duplicate on DiskA (even though DiskD refs are offline!) must be verified & deleted right away!
+                # Prompt must ask ONLY for DiskE_HasDups (2 duplicates), NEVER DiskD_RefOnly or online DiskA!
+                self.assertFalse(p_dup_a_from_d.exists())
                 self.assertIn("DiskE_HasDups", r_off_poll.text)
+                self.assertNotIn("DiskD_RefOnly", r_off_poll.text)
                 self.assertNotIn("<u>DiskA</u>", r_off_poll.text)
-                self.assertIn("na tym dysku do usunięcia jest <strong>2</strong> duplikatów", r_off_poll.text)
-                self.assertIn("&quot;skip_db_backup&quot;: &quot;1&quot;", r_off_poll.text)
+                self.assertIn("do usunięcia na tym dysku: <strong>2</strong> duplikatów", r_off_poll.text)
+                self.assertIn("▶️ Kontynuuj na podłączonym dysku (2 szt.)", r_off_poll.text)
+                self.assertIn("&quot;skip_db_backup&quot;: &quot;true&quot;", r_off_poll.text)
+                self.assertIn("&quot;continue_job_id&quot;:", r_off_poll.text)
 
-                # Clicking continue with skip_db_backup=1 must NOT call BackupManager.create_backup
+                latest_job = db.scalars(select(BackgroundJob).order_by(BackgroundJob.id.desc())).first()
+                self.assertIsNotNone(latest_job)
+
+                # Clicking continue with skip_db_backup=true and continue_job_id must NOT call BackupManager.create_backup
+                # and must reuse the existing BackgroundJob ID
                 with patch("app.routers.actions.BackupManager.create_backup") as mock_bkp:
                     r_cont = self.client.post(
                         "/actions/delete-permanently",
@@ -4254,7 +4269,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                             "scope": "selected",
                             "selected_ids": [extra_items[5].id, extra_items[6].id],
                             "duplicates_only": "true",
-                            "skip_db_backup": "1",
+                            "skip_db_backup": "true",
+                            "continue_job_id": str(latest_job.id),
                         },
                     )
                     self.assertEqual(r_cont.status_code, 200)
@@ -4263,6 +4279,32 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                             break
                         time.sleep(0.05)
                     mock_bkp.assert_not_called()
+                    self.assertEqual(actions_router.DUP_DELETE_STATE["job_id"], latest_job.id)
+
+                # Zadanie 2 Przyczyna B + Zadanie 4: Protected offline Original passed to safe removal is blocked by safety,
+                # and resuming a duplicate job via /actions/process-control uses safe verification (never raw delete!).
+                res_prot = svc.execute_safe_duplicate_removal([extra_items[0].id], delete_mode="permanent", force_duplicate_verification=True)
+                self.assertEqual(res_prot["blocked_safety"], 1)
+                self.assertEqual(len(res_prot["offline_items"]), 0)
+
+                safe_job = BackgroundJob(
+                    job_type="delete_permanently",
+                    title="Safe Dup Job Resume",
+                    status="STOPPED",
+                    processed_count=0,
+                    total_count=1,
+                    params_json=json.dumps({"is_duplicate_removal": True, "delete_mode": "permanent"}),
+                    remaining_ids_json=json.dumps([extra_items[0].id]),
+                )
+                db.add(safe_job)
+                db.commit()
+                db.refresh(safe_job)
+                r_res = self.client.post(
+                    "/actions/process-control",
+                    data={"action": "resume", "job_id": str(safe_job.id), "run_sync": "true"},
+                )
+                self.assertEqual(r_res.status_code, 200)
+                self.assertIsNotNone(db.get(MediaItem, extra_items[0].id))  # Original MUST survive!
 
     def test_maintenance_vacuum_and_orphan_thumbnails(self):
         with self.TestingSessionLocal() as db:

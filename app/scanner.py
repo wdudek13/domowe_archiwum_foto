@@ -190,6 +190,52 @@ class FastHasher:
         except Exception as exc:
             return False, f"Wyjątek weryfikacji bezpieczeństwa: {exc}", None
 
+    @classmethod
+    def verify_candidate_against_cluster_metadata(
+        cls,
+        cand_path: Path,
+        expected_size: int,
+        expected_file_hash: str,
+        hash_algorithm: str,
+        expected_verified_sha256: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """
+        Verifies a physical candidate duplicate on an ONLINE drive against the cluster's
+        recorded cryptographic hashes, exact byte size, and structural header when
+        the reference Original/Backup drives are currently OFFLINE.
+        """
+        try:
+            if not cand_path.exists() or not cand_path.is_file():
+                return False, "Plik kandydata nie istnieje na dysku.", None
+            res_cand = cand_path.resolve()
+            st = res_cand.stat()
+            if st.st_size <= 0 or st.st_size != expected_size:
+                return False, f"Niezgodność rozmiaru pliku ({st.st_size} B vs {expected_size} B).", None
+
+            sha256_hex, _, _ = cls.compute_multi_hashes(res_cand)
+            if expected_verified_sha256 and sha256_hex != expected_verified_sha256:
+                return False, "Niezgodność pełnej sumy SHA-256 ze zweryfikowanym oryginałem/backupem.", None
+
+            if hash_algorithm == "partial_3x64k":
+                part_hash = cls.hash_video_partial(res_cand, st.st_size)
+                if part_hash != expected_file_hash:
+                    return False, "Niezgodność sumy kontrolnej wideo.", None
+            else:
+                if sha256_hex != expected_file_hash:
+                    return False, "Niezgodność pełnej sumy SHA-256.", None
+
+            ext = res_cand.suffix.lower()
+            if ext in IMAGE_EXTS:
+                try:
+                    with Image.open(res_cand) as im:
+                        im.verify()
+                except Exception as img_exc:
+                    return False, f"Błąd struktury obrazu podczas weryfikacji: {img_exc}", None
+
+            return True, "Zweryfikowano w 100% (Rozmiar + SHA-256 + Struktura pliku).", sha256_hex
+        except Exception as exc:
+            return False, f"Wyjątek weryfikacji bezpieczeństwa: {exc}", None
+
     hash_image = hash_image_full
     hash_video = hash_video_partial
 

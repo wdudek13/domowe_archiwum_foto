@@ -1556,6 +1556,22 @@ class StorageAutomationService:
                     step_idx += 1
                     needs_dup_check = force_duplicate_verification or (it.duplicate_role in ("duplicate", "backup_green", "backup_orange"))
                     if needs_dup_check:
+                        cluster = by_hash.get(it.file_hash, [])
+                        surviving = [
+                            x for x in cluster
+                            if x.id != it.id and x.id not in removed_ids and not x.is_trashed
+                        ]
+                        if it.duplicate_role == "original" or it.is_backup_copy or len(surviving) < 2:
+                            blocked_safety += 1
+                            continue
+                        orig = next((x for x in surviving if x.duplicate_role == "original"), surviving[0])
+                        bkp = next(
+                            (x for x in surviving if x.id != orig.id and x.volume_id != orig.volume_id),
+                            next((x for x in surviving if x.id != orig.id), None),
+                        )
+                        if orig is None or bkp is None:
+                            blocked_safety += 1
+                            continue
                         _mark_offline(it, vid)
                     else:
                         # Non-duplicate logical trash/delete for offline volume preserves existing behavior
@@ -1585,8 +1601,8 @@ class StorageAutomationService:
                         x for x in cluster
                         if x.id != cand.id and x.id not in removed_ids and not x.is_trashed
                     ]
-                    # Safety gate 1: Must keep BOTH Original AND Backup (>= 2 copies survive) & never delete the Original
-                    if cand.duplicate_role == "original" or len(surviving) < 2:
+                    # Safety gate 1: Must keep BOTH Original AND Backup (>= 2 copies survive) & never delete Original or vault Backup
+                    if cand.duplicate_role == "original" or cand.is_backup_copy or len(surviving) < 2:
                         blocked_safety += 1
                         continue
 
@@ -1617,18 +1633,6 @@ class StorageAutomationService:
                                 ref_path = rp
                                 break
 
-                    if ref_item is None or ref_path is None:
-                        # Reference drive (Original/Backup) is offline; prefer a drive that also has pending duplicates
-                        ref_vols = [
-                            rc.volume_id for rc in ref_candidates
-                            if volumes.get(rc.volume_id) and not volumes[rc.volume_id].is_online
-                        ]
-                        needed_vid = next((rv_id for rv_id in ref_vols if rv_id in items_by_vol), None)
-                        if needed_vid is None:
-                            needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
-                        _mark_offline(cand, needed_vid, is_ref_only=True)
-                        continue
-
                     # If backup is currently online, verify its file actually exists on disk before trusting it
                     bkp_v = volumes.get(bkp.volume_id)
                     if bkp_v and bkp_v.is_online:
@@ -1637,12 +1641,37 @@ class StorageAutomationService:
                             blocked_safety += 1
                             continue
 
-                    is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, cand_path)
+                    if ref_item is not None and ref_path is not None:
+                        is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, cand_path)
+                    else:
+                        can_verify_from_meta = (
+                            orig.file_size_bytes == bkp.file_size_bytes == cand.file_size_bytes
+                            and (cand.media_type == "image" or bool(orig.verified_sha256 or bkp.verified_sha256))
+                        )
+                        if not can_verify_from_meta:
+                            ref_vols = [
+                                rc.volume_id for rc in ref_candidates
+                                if volumes.get(rc.volume_id) and not volumes[rc.volume_id].is_online
+                            ]
+                            needed_vid = next((rv_id for rv_id in ref_vols if rv_id in items_by_vol), None)
+                            if needed_vid is None:
+                                needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
+                            _mark_offline(cand, needed_vid, is_ref_only=True)
+                            continue
+                        expected_vsha = orig.verified_sha256 or bkp.verified_sha256
+                        is_identical, verify_msg, full_sha = FastHasher.verify_candidate_against_cluster_metadata(
+                            cand_path,
+                            orig.file_size_bytes,
+                            orig.file_hash,
+                            orig.hash_algorithm,
+                            expected_verified_sha256=expected_vsha,
+                        )
+
                     if not is_identical:
                         blocked_verify += 1
                         OperationLogger.log(
                             "DUP_VERIFY_BLOCK",
-                            f"Zablokowano usunięcie {cand_path} (brak 100% zgodności z {ref_path}): {verify_msg}",
+                            f"Zablokowano usunięcie {cand_path} ({verify_msg})",
                             status="WARN",
                             db=self.db,
                             commit=False,
@@ -1655,8 +1684,10 @@ class StorageAutomationService:
                             logger.debug("Rehash collision separate skipped for %s: %s", cand_path, exc)
                         continue
 
-                    ref_item.verified_sha256 = full_sha
-                    orig.verified_sha256 = full_sha
+                    if ref_item is not None and full_sha:
+                        ref_item.verified_sha256 = full_sha
+                    if full_sha:
+                        orig.verified_sha256 = full_sha
 
                     if delete_mode == "trash":
                         dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
@@ -1751,8 +1782,7 @@ class StorageAutomationService:
             if ov and ov.is_online:
                 continue
             del_cnt = offline_delete_counts.get(ovid, 0)
-            ref_cnt = offline_ref_counts.get(ovid, 0)
-            if del_cnt == 0 and ref_cnt == 0:
+            if del_cnt <= 0:
                 continue
             offline_drives_info.append(
                 {
@@ -1760,14 +1790,13 @@ class StorageAutomationService:
                     "vol_label": ov.volume_label if ov else f"#{ovid}",
                     "drive_letter": ov.last_known_drive_letter if ov else "?",
                     "vsn": ov.volume_serial_number if ov else "?",
-                    "count": del_cnt if del_cnt > 0 else ref_cnt,
+                    "count": del_cnt,
                     "delete_count": del_cnt,
-                    "verify_only_count": ref_cnt,
+                    "verify_only_count": offline_ref_counts.get(ovid, 0),
                 }
             )
-        # Prioritize drives that actually hold duplicates to delete (most duplicates first),
-        # never requesting a 0-duplicate reference drive ahead of a drive with duplicates.
-        offline_drives_info.sort(key=lambda d: (d["delete_count"] == 0, -d["delete_count"], -d["verify_only_count"], d["volume_id"]))
+        # Sort offline drives with duplicates to delete from most duplicates to fewest
+        offline_drives_info.sort(key=lambda d: (-d["delete_count"], -d["verify_only_count"], d["volume_id"]))
 
         next_offline_prompt = offline_drives_info[0] if offline_drives_info else None
         return {
