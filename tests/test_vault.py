@@ -3529,10 +3529,21 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertIn((min(va_id, vc_id), max(va_id, vc_id)), pair_keys)
             self.assertIn((min(vb_id, vc_id), max(vb_id, vc_id)), pair_keys)
 
-            # Check pair metrics (Kopie lokalne / Kopie zdalne / Nowe kopie / Do albumu Ważne)
+            # Check pair metrics (per-device + zero double counting + reconciliation)
             p_ac_key_str = f"{min(va_id, vc_id)}:{max(va_id, vc_id)}"
-            p_ab = next(p for p in plan["ordered_pairs"] if p["pair_key"] == (min(va_id, vb_id), max(va_id, vb_id)))
-            self.assertGreaterEqual(p_ab["metrics"]["important_to_assign_count"], 1)
+            imp_sum = sum(p["metrics"]["important_to_assign_count"] for p in plan["ordered_pairs"])
+            self.assertEqual(imp_sum, len(plan["important_candidates"]))
+            self.assertEqual(plan["reconciliation"]["important_pairs_sum"], plan["reconciliation"]["important_plan_total"])
+            self.assertEqual(plan["reconciliation"]["new_copies_pairs_sum"], plan["reconciliation"]["new_copies_plan_total"])
+            for p_item in plan["ordered_pairs"]:
+                self.assertEqual(
+                    p_item["a_metrics"]["new_copies_count"] + p_item["b_metrics"]["new_copies_count"],
+                    p_item["metrics"]["new_copies_count"],
+                )
+                self.assertEqual(
+                    p_item["a_metrics"]["important_to_assign_count"] + p_item["b_metrics"]["important_to_assign_count"],
+                    p_item["metrics"]["important_to_assign_count"],
+                )
 
             # Step 2: Build plan restricted to Pair (va, vc) targeting vc_id
             plan_ac = svc.build_backup_and_dedup_plan(
@@ -3544,16 +3555,19 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             copy_tasks_ac = p_ac_entry["tasks"]["backups_to_copy"]
             self.assertTrue(any(t["orig_item_id"] == item_a.id and t["dst_vol_id"] == vc_id for t in copy_tasks_ac))
 
-        # Step 3: Test GET /actions/backup-panel with selected_pairs
+        # Step 3: Test GET /actions/backup-panel with selected_pairs (per-device pair lines + no giant preview tables)
         r_all = self.client.get("/actions/backup-panel")
         self.assertEqual(r_all.status_code, 200)
         self.assertIn("backup-pair-counts-data", r_all.text)
-        self.assertIn("Lista oryginałów dodawanych do albumu „Ważne…”", r_all.text)
+        self.assertIn("Bilans zgodności", r_all.text)
+        self.assertIn("↳ Na ", r_all.text)
+        self.assertNotIn("Nowe kopie do utworzenia w <code>daf_backup/</code>", r_all.text)
+        self.assertNotIn("Kopie lokalne do przeniesienia do kartoteki", r_all.text)
+        self.assertNotIn("Lista oryginałów dodawanych do albumu „Ważne…”", r_all.text)
 
         r_filtered = self.client.get(f"/actions/backup-panel?target_volume_id={vc_id}&selected_pairs={p_ac_key_str}")
         self.assertEqual(r_filtered.status_code, 200)
-        self.assertIn("unbacked_on_a.jpg", r_filtered.text)
-        self.assertIn("same_dup1.jpg", r_filtered.text)
+        self.assertIn("Wybrane operacje do wykonania", r_filtered.text)
 
         # Step 3b: Test POST /actions/backup-panel-tables with selected pairs and empty pairs
         r_tables = self.client.post(
@@ -3561,8 +3575,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "preferred_target_volume_id": str(vc_id)},
         )
         self.assertEqual(r_tables.status_code, 200)
-        self.assertIn("unbacked_on_a.jpg", r_tables.text)
-        self.assertIn("same_dup1.jpg", r_tables.text)
+        self.assertIn("Wybrane operacje do wykonania", r_tables.text)
         self.assertIn("backup-pair-counts-data", r_tables.text)
 
         r_tables_empty = self.client.post(

@@ -1331,6 +1331,7 @@ def _prepare_backup_panel_context(
     local_reloc_by_pair = plan.get("local_reloc_by_pair", {})
     remote_move_by_pair = plan.get("remote_move_by_pair", {})
     important_by_vol = plan.get("important_count_by_vol", {})
+    important_by_pair = plan.get("important_by_pair", {})
 
     if selected_pairs is not None:
         selected_set = set(effective_pair_keys)
@@ -1345,12 +1346,12 @@ def _prepare_backup_panel_context(
         filtered_remote_moves = [rm for rm in all_remote_moves if rm.get("pair_key_str") in selected_set]
         filtered_important_rows = [
             ir for ir in all_important_rows
-            if ir.get("vol_id") in active_vols
+            if any(pk in selected_set for pk in ir.get("pair_keys", [])) or (not ir.get("pair_keys") and ir.get("vol_id") in active_vols)
         ]
         filtered_unbacked_count = sum(cnt for pk, cnt in unbacked_by_pair.items() if pk in selected_set)
         filtered_local_relocs_count = sum(cnt for pk, cnt in local_reloc_by_pair.items() if pk in selected_set)
         filtered_remote_moves_count = sum(cnt for pk, cnt in remote_move_by_pair.items() if pk in selected_set)
-        filtered_important_count = sum(cnt for vid, cnt in important_by_vol.items() if vid in active_vols)
+        filtered_important_count = sum(cnt for pk, cnt in important_by_pair.items() if pk in selected_set)
     else:
         filtered_unbacked = all_unbacked
         filtered_local_relocs = all_local_relocs
@@ -1367,6 +1368,7 @@ def _prepare_backup_panel_context(
         "local_reloc_by_pair": local_reloc_by_pair,
         "remote_move_by_pair": remote_move_by_pair,
         "important_by_vol": {str(k): v for k, v in important_by_vol.items()},
+        "important_by_pair": important_by_pair,
     }
 
     volumes_list = list(plan["volumes"].values())

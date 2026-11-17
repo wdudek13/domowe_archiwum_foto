@@ -191,36 +191,72 @@
                     <button type="button" onclick="toggleAllBackupPairs(false)" class="text-slate-400 hover:underline">Odznacz wszystkie</button>
                 </div>
             </div>
-            <div class="space-y-1.5">
+            <div class="space-y-2">
                 {% for p in active_pairs %}
-                <label class="p-2 rounded-lg bg-cardBg border {% if p.both_online %}border-emerald-700/60{% else %}border-amber-700/60{% endif %} flex flex-wrap items-center justify-between gap-2 cursor-pointer hover:bg-slate-800/70">
-                    <div class="flex items-center space-x-2">
-                        <input type="checkbox"
-                               name="selected_pairs"
-                               value="{{ p.pair_key_str }}"
-                               {% if selected_pair_keys is not defined or p.pair_key_str in selected_pair_keys %}checked{% endif %}
-                               onchange="filterUnbackedBySelectedPairs()"
-                               class="pair-schedule-checkbox rounded border-borderBg bg-slate-900 text-emerald-500">
-                        {% if p.both_online %}
-                            <span class="bg-emerald-800 text-emerald-100 px-2 py-0.5 rounded text-[10px] font-bold">GOTOWA PARA (ONLINE)</span>
-                        {% else %}
-                            <span class="bg-amber-800 text-amber-100 px-2 py-0.5 rounded text-[10px] font-bold">WYMAGA PODŁĄCZENIA</span>
-                        {% endif %}
-                        <span class="font-semibold text-white">
-                            {{ p.vol_a.volume_label if p.vol_a else '?' }} ({{ p.vol_a.last_known_drive_letter if p.vol_a else '?' }})
-                            ↔
-                            {{ p.vol_b.volume_label if p.vol_b else '?' }} ({{ p.vol_b.last_known_drive_letter if p.vol_b else '?' }})
-                        </span>
+                <label class="p-2.5 rounded-lg bg-cardBg border {% if p.both_online %}border-emerald-700/60{% else %}border-amber-700/60{% endif %} block space-y-1.5 cursor-pointer hover:bg-slate-800/70">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex items-center space-x-2">
+                            <input type="checkbox"
+                                   name="selected_pairs"
+                                   value="{{ p.pair_key_str }}"
+                                   data-local="{{ p.metrics.local_copies_count }}"
+                                   data-remote="{{ p.metrics.remote_copies_count }}"
+                                   data-new="{{ p.metrics.new_copies_count }}"
+                                   data-imp="{{ p.metrics.important_to_assign_count }}"
+                                   {% if selected_pair_keys is not defined or p.pair_key_str in selected_pair_keys %}checked{% endif %}
+                                   onchange="filterUnbackedBySelectedPairs()"
+                                   class="pair-schedule-checkbox rounded border-borderBg bg-slate-900 text-emerald-500">
+                            {% if p.both_online %}
+                                <span class="bg-emerald-800 text-emerald-100 px-2 py-0.5 rounded text-[10px] font-bold">GOTOWA PARA (ONLINE)</span>
+                            {% else %}
+                                <span class="bg-amber-800 text-amber-100 px-2 py-0.5 rounded text-[10px] font-bold">WYMAGA PODŁĄCZENIA</span>
+                            {% endif %}
+                            <span class="font-semibold text-white">
+                                {{ p.vol_a.volume_label if p.vol_a else '?' }} ({{ p.vol_a.last_known_drive_letter if p.vol_a else '?' }})
+                                ↔
+                                {{ p.vol_b.volume_label if p.vol_b else '?' }} ({{ p.vol_b.last_known_drive_letter if p.vol_b else '?' }})
+                            </span>
+                        </div>
+                        <div class="font-mono text-[11px] text-slate-200">
+                            Razem w parze: <strong class="text-white">{{ p.total_ops + p.metrics.important_to_assign_count }}</strong>
+                            (Lok: <strong class="text-sky-400">{{ p.metrics.local_copies_count }}</strong> |
+                            Zdal: <strong class="text-teal-300">{{ p.metrics.remote_copies_count }}</strong> |
+                            Nowe: <strong class="text-emerald-400">{{ p.metrics.new_copies_count }}</strong> |
+                            Ważne: <strong class="text-amber-400">{{ p.metrics.important_to_assign_count }}</strong>)
+                        </div>
                     </div>
-                    <div class="font-mono text-[11px] text-slate-300">
-                        Kopie lokalne: <strong class="text-sky-400">{{ p.metrics.local_copies_count }}</strong> |
-                        Kopie zdalne: <strong class="text-teal-300">{{ p.metrics.remote_copies_count }}</strong> |
-                        Nowe kopie: <strong class="text-emerald-400">{{ p.metrics.new_copies_count }}</strong> |
-                        Do albumu „Ważne”: <strong class="text-amber-400">{{ p.metrics.important_to_assign_count }}</strong>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-1.5 pl-6 text-[10px] font-mono">
+                        <div class="px-2 py-1 rounded bg-slate-900/80 border border-borderBg/70 text-slate-300">
+                            <span class="text-sky-300 font-semibold">↳ Na {{ p.vol_a.volume_label if p.vol_a else '?' }}:</span>
+                            Kopie lok.: <strong class="text-sky-400">{{ p.a_metrics.local_copies_count if p.a_metrics is defined else 0 }}</strong> |
+                            Kopie zdal.: <strong class="text-teal-300">{{ p.a_metrics.remote_copies_count if p.a_metrics is defined else 0 }}</strong> |
+                            Nowe kopie: <strong class="text-emerald-400">{{ p.a_metrics.new_copies_count if p.a_metrics is defined else 0 }}</strong> |
+                            Ważne: <strong class="text-amber-400">{{ p.a_metrics.important_to_assign_count if p.a_metrics is defined else 0 }}</strong>
+                            <span class="text-slate-400">(zmian: {{ p.a_metrics.total_touched if p.a_metrics is defined else 0 }})</span>
+                        </div>
+                        <div class="px-2 py-1 rounded bg-slate-900/80 border border-borderBg/70 text-slate-300">
+                            <span class="text-emerald-300 font-semibold">↳ Na {{ p.vol_b.volume_label if p.vol_b else '?' }}:</span>
+                            Kopie lok.: <strong class="text-sky-400">{{ p.b_metrics.local_copies_count if p.b_metrics is defined else 0 }}</strong> |
+                            Kopie zdal.: <strong class="text-teal-300">{{ p.b_metrics.remote_copies_count if p.b_metrics is defined else 0 }}</strong> |
+                            Nowe kopie: <strong class="text-emerald-400">{{ p.b_metrics.new_copies_count if p.b_metrics is defined else 0 }}</strong> |
+                            Ważne: <strong class="text-amber-400">{{ p.b_metrics.important_to_assign_count if p.b_metrics is defined else 0 }}</strong>
+                            <span class="text-slate-400">(zmian: {{ p.b_metrics.total_touched if p.b_metrics is defined else 0 }})</span>
+                        </div>
                     </div>
                 </label>
                 {% endfor %}
             </div>
+            {% if plan.reconciliation is defined %}
+            <div class="p-2 rounded-lg bg-slate-900 border border-emerald-800/50 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-300">
+                <span class="font-sans font-semibold text-emerald-300">✓ Bilans zgodności (wybrane pary / plan ogółem):</span>
+                <span>
+                    Kopie lokalne: <strong id="sum-local-selected" class="text-sky-400">{{ plan.reconciliation.local_copies_pairs_sum }}</strong> / {{ plan.reconciliation.local_copies_plan_total }} |
+                    Kopie zdalne: <strong id="sum-remote-selected" class="text-teal-300">{{ plan.reconciliation.remote_copies_pairs_sum }}</strong> / {{ plan.reconciliation.remote_copies_plan_total }} |
+                    Nowe kopie: <strong id="sum-new-selected" class="text-emerald-400">{{ plan.reconciliation.new_copies_pairs_sum }}</strong> / {{ plan.reconciliation.new_copies_plan_total }} |
+                    Do albumu „Ważne”: <strong id="sum-imp-selected" class="text-amber-400">{{ plan.reconciliation.important_pairs_sum }}</strong> / {{ plan.reconciliation.important_plan_total }}
+                </span>
+            </div>
+            {% endif %}
         </div>
         {% elif plan.ordered_pairs %}
         <div class="bg-slate-950/60 border border-borderBg rounded-xl p-3 text-[11px] text-slate-400">
@@ -307,12 +343,23 @@
             });
 
             let totalUnbacked = 0, totalLocal = 0, totalRemote = 0, totalImportant = 0;
-            if (active.size > 0) {
-                for (const [pk, cnt] of Object.entries(unbackedByPair)) if (active.has(pk)) totalUnbacked += cnt;
-                for (const [pk, cnt] of Object.entries(localByPair)) if (active.has(pk)) totalLocal += cnt;
-                for (const [pk, cnt] of Object.entries(remoteByPair)) if (active.has(pk)) totalRemote += cnt;
-                for (const [vid, cnt] of Object.entries(importantByVol)) if (activeVols.has(Number(vid))) totalImportant += cnt;
-            }
+            cbs.forEach(cb => {
+                if (cb.checked) {
+                    totalLocal += Number(cb.dataset.local || 0);
+                    totalRemote += Number(cb.dataset.remote || 0);
+                    totalUnbacked += Number(cb.dataset.new || 0);
+                    totalImportant += Number(cb.dataset.imp || 0);
+                }
+            });
+
+            const sLoc = document.getElementById('sum-local-selected');
+            const sRem = document.getElementById('sum-remote-selected');
+            const sNew = document.getElementById('sum-new-selected');
+            const sImp = document.getElementById('sum-imp-selected');
+            if (sLoc) sLoc.textContent = totalLocal;
+            if (sRem) sRem.textContent = totalRemote;
+            if (sNew) sNew.textContent = totalUnbacked;
+            if (sImp) sImp.textContent = totalImportant;
 
             if (counter) counter.textContent = totalUnbacked;
             if (localCounter) localCounter.textContent = totalLocal;

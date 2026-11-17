@@ -699,12 +699,13 @@ class StorageAutomationService:
             )
             return candidates[0]
 
-        pair_tasks: Dict[Tuple[int, int], Dict[str, List[Dict[str, Any]]]] = defaultdict(
+        pair_tasks: Dict[Tuple[int, int], Dict[str, List[Any]]] = defaultdict(
             lambda: {
                 "backups_to_copy": [],
                 "backups_to_relocate": [],
                 "backups_remote_move": [],
                 "duplicates_to_delete": [],
+                "important_items": [],
             }
         )
         pair_metrics: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(
@@ -718,6 +719,7 @@ class StorageAutomationService:
                 "important_to_assign_count": 0,
             }
         )
+        orig_cluster_pair: Dict[str, Tuple[int, int]] = {}
         important_candidates: List[Tuple[MediaItem, WindowsVolume]] = []
         unbacked_items: List[MediaItem] = []
         unbacked_pair_map: Dict[str, str] = {}
@@ -771,6 +773,7 @@ class StorageAutomationService:
 
                 if target_vol:
                     pair_key = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
+                    orig_cluster_pair[best_orig.id] = pair_key
                     pk_str = f"{pair_key[0]}:{pair_key[1]}"
                     unbacked_pair_map[best_orig.id] = pk_str
                     unbacked_pair_keys_str[best_orig.id] = pk_str
@@ -822,6 +825,7 @@ class StorageAutomationService:
                         min(chosen_backup.volume_id, remote_target_vol.id),
                         max(chosen_backup.volume_id, remote_target_vol.id),
                     )
+                    orig_cluster_pair[best_orig.id] = pair_key
                     pk_str = f"{pair_key[0]}:{pair_key[1]}"
                     src_v = volumes.get(chosen_backup.volume_id)
                     dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
@@ -849,6 +853,7 @@ class StorageAutomationService:
                 elif not chosen_backup.is_backup_copy:
                     # Green BACKUP outside daf_backup/ stays on its device -> Kopie lokalne
                     pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                    orig_cluster_pair[best_orig.id] = pair_key
                     pk_str = f"{pair_key[0]}:{pair_key[1]}"
                     b_vol = volumes.get(chosen_backup.volume_id)
                     dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
@@ -870,20 +875,51 @@ class StorageAutomationService:
                     pair_tasks[pair_key]["backups_to_relocate"].append(reloc_obj)
 
         important_count_by_vol: Dict[int, int] = defaultdict(int)
+        important_by_pair: Dict[str, int] = defaultdict(int)
+        important_rows: List[Dict[str, Any]] = []
+
+        def _pick_pair_for_important(orig_id: str, orig_vid: int) -> Optional[Tuple[int, int]]:
+            # Reuse the pair already scheduled for this item's copy/reloc/remote task
+            existing_pk = orig_cluster_pair.get(orig_id)
+            if existing_pk and (selected_pairs_set is None or existing_pk in selected_pairs_set):
+                return existing_pk
+            cand_pks = [p for p in all_possible_pairs if orig_vid in p]
+            if not cand_pks:
+                return None
+
+            def _rank(pk: Tuple[int, int]):
+                va_o = bool(volumes.get(pk[0]) and volumes[pk[0]].is_online)
+                vb_o = bool(volumes.get(pk[1]) and volumes[pk[1]].is_online)
+                in_sel = (selected_pairs_set is None) or (pk in selected_pairs_set)
+                ops_here = (
+                    len(pair_tasks[pk]["backups_to_copy"])
+                    + len(pair_tasks[pk]["backups_to_relocate"])
+                    + len(pair_tasks[pk]["backups_remote_move"])
+                )
+                partner_id = pk[1] if pk[0] == orig_vid else pk[0]
+                return (
+                    not in_sel,
+                    not (va_o and vb_o),
+                    ops_here == 0,
+                    partner_id not in effective_target_set,
+                    -ops_here,
+                    pk,
+                )
+
+            cand_pks.sort(key=_rank)
+            return cand_pks[0]
+
         for orig_item, orig_vol in important_candidates:
             important_count_by_vol[orig_vol.id] += 1
-
-        for (va, vb) in all_possible_pairs:
-            pair_metrics[(va, vb)]["important_to_assign_count"] = (
-                important_count_by_vol[va] + important_count_by_vol[vb]
-            )
-
-        important_rows: List[Dict[str, Any]] = []
-        for orig_item, orig_vol in important_candidates:
-            eligible_pks = [
-                f"{min(orig_vol.id, vo)}:{max(orig_vol.id, vo)}"
-                for vo in volumes if vo != orig_vol.id
-            ]
+            chosen_pk = _pick_pair_for_important(orig_item.id, orig_vol.id)
+            if chosen_pk is not None:
+                pk_str = f"{chosen_pk[0]}:{chosen_pk[1]}"
+                pair_tasks[chosen_pk]["important_items"].append((orig_item, orig_vol))
+                pair_metrics[chosen_pk]["important_to_assign_count"] += 1
+                important_by_pair[pk_str] += 1
+                pks_for_row = [pk_str]
+            else:
+                pks_for_row = []
             important_rows.append(
                 {
                     "item_id": orig_item.id,
@@ -894,8 +930,8 @@ class StorageAutomationService:
                     "vol_letter": orig_vol.last_known_drive_letter,
                     "relative_path": orig_item.relative_path,
                     "target_album": f"Ważne - {orig_vol.volume_label} / {orig_item.effective_date.strftime('%Y / %m / %d')}",
-                    "pair_keys": eligible_pks,
-                    "pair_keys_str": ",".join(eligible_pks),
+                    "pair_keys": pks_for_row,
+                    "pair_keys_str": ",".join(pks_for_row),
                 }
             )
 
@@ -942,6 +978,19 @@ class StorageAutomationService:
                     f"nie ma innego wybranego dysku docelowego (zaznacz dodatkowy dysk jako docelowy, aby wykonać ich kopię)."
                 )
 
+        def _device_pair_metrics(dev_id: int, tasks_dict: Dict[str, List[Any]]) -> Dict[str, int]:
+            loc_c = sum(1 for t in tasks_dict["backups_to_relocate"] if t["vol_id"] == dev_id)
+            rem_c = sum(1 for t in tasks_dict["backups_remote_move"] if t["dst_vol_id"] == dev_id)
+            new_c = sum(1 for t in tasks_dict["backups_to_copy"] if t["dst_vol_id"] == dev_id)
+            imp_c = sum(1 for _, ov in tasks_dict["important_items"] if ov.id == dev_id)
+            return {
+                "local_copies_count": loc_c,
+                "remote_copies_count": rem_c,
+                "new_copies_count": new_c,
+                "important_to_assign_count": imp_c,
+                "total_touched": loc_c + rem_c + new_c + imp_c,
+            }
+
         ordered_pairs = []
         for (va_id, vb_id) in all_possible_pairs:
             va = volumes.get(va_id)
@@ -950,6 +999,8 @@ class StorageAutomationService:
             one_online = bool((va and va.is_online) or (vb and vb.is_online))
             tasks = pair_tasks[(va_id, vb_id)]
             metrics = pair_metrics[(va_id, vb_id)]
+            a_metrics = _device_pair_metrics(va_id, tasks)
+            b_metrics = _device_pair_metrics(vb_id, tasks)
             total_ops = (
                 len(tasks["backups_to_copy"])
                 + len(tasks["backups_to_relocate"])
@@ -968,10 +1019,24 @@ class StorageAutomationService:
                     "total_ops": total_ops,
                     "has_work": has_work,
                     "metrics": metrics,
+                    "a_metrics": a_metrics,
+                    "b_metrics": b_metrics,
                 }
             )
 
         ordered_pairs.sort(key=lambda p: (not p["has_work"], not p["both_online"], not p["one_online"], p["pair_key"]))
+        scheduled_pairs = [p for p in ordered_pairs if p["has_work"]]
+        reconciliation = {
+            "local_copies_pairs_sum": sum(p["metrics"]["local_copies_count"] for p in scheduled_pairs),
+            "local_copies_plan_total": len(local_reloc_rows),
+            "remote_copies_pairs_sum": sum(p["metrics"]["remote_copies_count"] for p in scheduled_pairs),
+            "remote_copies_plan_total": len(remote_move_rows),
+            "new_copies_pairs_sum": sum(p["metrics"]["new_copies_count"] for p in scheduled_pairs),
+            "new_copies_plan_total": unbacked_count,
+            "unassigned_new_copies": sum(unassigned_unbacked_by_vol.values()),
+            "important_pairs_sum": sum(p["metrics"]["important_to_assign_count"] for p in scheduled_pairs),
+            "important_plan_total": len(important_candidates),
+        }
 
         return {
             "volumes": volumes,
@@ -993,8 +1058,10 @@ class StorageAutomationService:
             "important_candidates": important_candidates,
             "important_rows": important_rows,
             "important_count_by_vol": dict(important_count_by_vol),
+            "important_by_pair": dict(important_by_pair),
             "ordered_pairs": ordered_pairs,
-            "scheduled_pairs": [p for p in ordered_pairs if p["has_work"]],
+            "scheduled_pairs": scheduled_pairs,
+            "reconciliation": reconciliation,
             "duplicate_rows": [],
             "unbacked_items": unbacked_items,
             "unbacked_pair_map": unbacked_pair_map,
@@ -1044,13 +1111,19 @@ class StorageAutomationService:
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
 
         # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> MM -> DD
+        # Each candidate is assigned 1-to-1 to a single scheduled pair (or directly when <2 volumes exist).
         important_assigned = 0
-        active_vols = {v for p in selected_pairs_set for v in p} if selected_pairs_set is not None else None
-        for orig_item, orig_vol in plan["important_candidates"]:
-            if active_vols is not None and orig_vol.id not in active_vols:
-                continue
-            self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
-            important_assigned += 1
+        if len(volumes) < 2:
+            for orig_item, orig_vol in plan["important_candidates"]:
+                self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
+                important_assigned += 1
+        else:
+            for pair_entry in plan["ordered_pairs"]:
+                if selected_pairs_set is not None and pair_entry["pair_key"] not in selected_pairs_set:
+                    continue
+                for orig_item, orig_vol in pair_entry["tasks"]["important_items"]:
+                    self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
+                    important_assigned += 1
         if important_assigned > 0:
             self.db.commit()
 

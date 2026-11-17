@@ -1,160 +1,17 @@
     <!-- Ukryty kontener z pełnymi statystykami par dysków dla natychmiastowego filtrowania w JS -->
     <script id="backup-pair-counts-data" type="application/json">{{ pair_counts|safe if pair_counts is defined else '{}' }}</script>
 
-    <!-- 1. Nowe kopie do utworzenia (Brakujące + Pomarańczowe -> daf_backup/ na innym dysku) -->
-    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
-        <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-300">📋 Nowe kopie do utworzenia w <code>daf_backup/</code> (<span id="unbacked-filtered-count">{{ unbacked_total }}</span> / {{ unbacked_all_total if unbacked_all_total is defined else unbacked_total }} szt.{% if unbacked_files|length < unbacked_total %} — podgląd pierwszych <span id="unbacked-shown-count">{{ unbacked_files|length }}</span>{% endif %}):</span>
-            <button type="button"
-                    onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, unbacked_only: true});"
-                    class="text-emerald-400 hover:underline text-[11px]">Pokaż te pliki w głównej galerii &rarr;</button>
+    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div class="text-slate-300">
+            Wybrane operacje do wykonania —
+            Nowe kopie: <strong id="unbacked-filtered-count" class="text-emerald-400 font-mono">{{ unbacked_total }}</strong> szt. |
+            Kopie lokalne: <strong id="local-reloc-filtered-count" class="text-sky-400 font-mono">{{ local_reloc_total|default(0) }}</strong> szt. |
+            Kopie zdalne: <strong id="remote-move-filtered-count" class="text-teal-300 font-mono">{{ remote_move_total|default(0) }}</strong> szt. |
+            Do albumu „Ważne”: <strong id="important-filtered-count" class="text-amber-400 font-mono">{{ important_total|default(0) }}</strong> szt.
         </div>
-        <div class="max-h-48 overflow-y-auto">
-            {% if unbacked_files %}
-            <table class="w-full text-left border-collapse text-[11px]">
-                <thead>
-                    <tr class="border-b border-borderBg text-slate-400">
-                        <th class="py-1 px-2">Nazwa pliku</th>
-                        <th class="py-1 px-2">Obecne urządzenie (Oryginał)</th>
-                        <th class="py-1 px-2">Ścieżka</th>
-                        <th class="py-1 px-2">Rozmiar</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-borderBg/40 font-mono">
-                    {% for uf in unbacked_files %}
-                    <tr class="unbacked-file-row" data-pair-keys="{{ plan.unbacked_pair_keys_str.get(uf.id, plan.unbacked_pair_map.get(uf.id, '')) if (plan.unbacked_pair_keys_str is defined or plan.unbacked_pair_map is defined) else '' }}" data-volume-id="{{ uf.volume_id }}">
-                        <td class="py-1 px-2 text-slate-200 truncate max-w-[180px]">{{ uf.file_name }}</td>
-                        <td class="py-1 px-2 text-amber-300">{{ uf.volume.volume_label if uf.volume else '?' }} ({{ uf.volume.last_known_drive_letter if uf.volume else '?' }})</td>
-                        <td class="py-1 px-2 text-slate-400 truncate max-w-[220px]">{{ uf.relative_path }}</td>
-                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(uf.file_size_bytes / (1024*1024)) }} MB</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            <div id="unbacked-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak nowych kopii przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
-            </div>
-            {% else %}
-            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Wszystkie pliki posiadają kopię zapasową na innym urządzeniu!</div>
-            {% endif %}
-        </div>
-    </div>
-
-    <!-- 2. Kopie lokalne (Zielone BACKUP przenoszone w ramach tego samego urządzenia do daf_backup/RRRR/MM/DD/) -->
-    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
-        <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-300">📂 Kopie lokalne do przeniesienia do kartoteki <code>daf_backup/</code> (<span id="local-reloc-filtered-count">{{ local_reloc_total|default(0) }}</span> / {{ local_reloc_all_total|default(0) }} szt.{% if local_reloc_files is defined and local_reloc_files|length < (local_reloc_total|default(0)) %} — podgląd pierwszych <span id="local-reloc-shown-count">{{ local_reloc_files|length }}</span>{% endif %}):</span>
-            <span class="text-sky-400/80 text-[11px]">Zielone BACKUP porządkowane lokalnie w ramach urządzenia (RRRR/MM/DD)</span>
-        </div>
-        <div class="max-h-44 overflow-y-auto">
-            {% if local_reloc_files %}
-            <table class="w-full text-left border-collapse text-[11px]">
-                <thead>
-                    <tr class="border-b border-borderBg text-slate-400">
-                        <th class="py-1 px-2">Nazwa pliku</th>
-                        <th class="py-1 px-2">Urządzenie</th>
-                        <th class="py-1 px-2">Obecna ścieżka</th>
-                        <th class="py-1 px-2">Docelowa ścieżka</th>
-                        <th class="py-1 px-2">Rozmiar</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-borderBg/40 font-mono">
-                    {% for lr in local_reloc_files %}
-                    <tr class="local-reloc-row" data-pair-keys="{{ lr.pair_key_str }}" data-volume-id="{{ lr.vol_id }}">
-                        <td class="py-1 px-2 text-sky-200 truncate max-w-[160px]">{{ lr.file_name }}</td>
-                        <td class="py-1 px-2 text-amber-300">{{ lr.vol_label }} ({{ lr.vol_letter }})</td>
-                        <td class="py-1 px-2 text-slate-400 truncate max-w-[180px]">{{ lr.src_relative_path }}</td>
-                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[180px]">{{ lr.dst_relative_path }}</td>
-                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(lr.file_size / (1024*1024)) }} MB</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            <div id="local-reloc-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak kopii lokalnych przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
-            </div>
-            {% else %}
-            <div class="p-3 text-center text-slate-400 font-semibold">Brak kopii zielonych poza kartoteką <code>daf_backup/</code> wymagających lokalnego przeniesienia.</div>
-            {% endif %}
-        </div>
-    </div>
-
-    <!-- 3. Kopie zdalne (Przenoszenie istniejących backupów między urządzeniami przy wyłączonej minimalizacji przeniesień) -->
-    {% if not minimize_transfers or (remote_move_all_total|default(0)) > 0 %}
-    <div class="bg-slate-900/60 border border-teal-800/60 rounded-xl p-3.5 space-y-2">
-        <div class="flex items-center justify-between">
-            <span class="font-bold text-teal-300">🚚 Kopie zdalne (konsolidacja między urządzeniami do <code>daf_backup/</code>) (<span id="remote-move-filtered-count">{{ remote_move_total|default(0) }}</span> / {{ remote_move_all_total|default(0) }} szt.{% if remote_move_files is defined and remote_move_files|length < (remote_move_total|default(0)) %} — podgląd pierwszych <span id="remote-move-shown-count">{{ remote_move_files|length }}</span>{% endif %}):</span>
-            <span class="text-teal-400/80 text-[11px]">Przenoszone na wybrane dyski docelowe backupu</span>
-        </div>
-        <div class="max-h-44 overflow-y-auto">
-            {% if remote_move_files %}
-            <table class="w-full text-left border-collapse text-[11px]">
-                <thead>
-                    <tr class="border-b border-borderBg text-slate-400">
-                        <th class="py-1 px-2">Nazwa pliku</th>
-                        <th class="py-1 px-2">Z urządzenia</th>
-                        <th class="py-1 px-2">Na urządzenie</th>
-                        <th class="py-1 px-2">Ścieżka docelowa</th>
-                        <th class="py-1 px-2">Rozmiar</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-borderBg/40 font-mono">
-                    {% for rm in remote_move_files %}
-                    <tr class="remote-move-row" data-pair-keys="{{ rm.pair_key_str }}" data-volume-id="{{ rm.dst_vol_id }}">
-                        <td class="py-1 px-2 text-teal-200 truncate max-w-[160px]">{{ rm.file_name }}</td>
-                        <td class="py-1 px-2 text-amber-300">{{ rm.src_vol_label }} ({{ rm.src_vol_letter }})</td>
-                        <td class="py-1 px-2 text-emerald-300">{{ rm.dst_vol_label }} ({{ rm.dst_vol_letter }})</td>
-                        <td class="py-1 px-2 text-slate-300 truncate max-w-[180px]">{{ rm.dst_relative_path }}</td>
-                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(rm.file_size / (1024*1024)) }} MB</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            <div id="remote-move-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak kopii zdalnych przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
-            </div>
-            {% else %}
-            <div class="p-3 text-center text-slate-400 font-semibold">Brak kopii zdalnych do przeniesienia między wybranymi urządzeniami.</div>
-            {% endif %}
-        </div>
-    </div>
-    {% endif %}
-
-    <!-- 4. Lista oryginałów dodawanych do albumu Ważne (RRRR / MM / DD) -->
-    <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
-        <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-300">⭐ Lista oryginałów dodawanych do albumu „Ważne…” (<span id="important-filtered-count">{{ important_total if important_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }}</span> / {{ important_all_total if important_all_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }} szt.{% if important_files is defined and important_files|length < important_total %} — podgląd pierwszych <span id="important-shown-count">{{ important_files|length }}</span>{% endif %}):</span>
-            <span class="text-amber-400/80 text-[11px]">Automatycznie tworzone podalbumy wg daty (RRRR / MM / DD)</span>
-        </div>
-        <div class="max-h-48 overflow-y-auto">
-            {% if important_files %}
-            <table class="w-full text-left border-collapse text-[11px]">
-                <thead>
-                    <tr class="border-b border-borderBg text-slate-400">
-                        <th class="py-1 px-2">Nazwa pliku</th>
-                        <th class="py-1 px-2">Urządzenie (Oryginał)</th>
-                        <th class="py-1 px-2">Ścieżka oryginału</th>
-                        <th class="py-1 px-2">Docelowy album</th>
-                        <th class="py-1 px-2">Rozmiar</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-borderBg/40 font-mono">
-                    {% for imp in important_files %}
-                    <tr class="important-file-row" data-pair-keys="{{ imp.pair_keys_str }}" data-volume-id="{{ imp.vol_id }}">
-                        <td class="py-1 px-2 text-amber-200 truncate max-w-[180px]">{{ imp.file_name }}</td>
-                        <td class="py-1 px-2 text-amber-300">{{ imp.vol_label }} ({{ imp.vol_letter }})</td>
-                        <td class="py-1 px-2 text-slate-400 truncate max-w-[200px]">{{ imp.relative_path }}</td>
-                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[220px]" title="{{ imp.target_album }}">{{ imp.target_album }}</td>
-                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(imp.file_size / (1024*1024)) }} MB</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            <div id="important-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak plików kwalifikowanych do albumu „Ważne…” dla aktualnie zaznaczonych par urządzeń powyżej.
-            </div>
-            {% else %}
-            <div class="p-4 text-center text-slate-400 font-semibold">Brak plików z lokalnymi duplikatami kwalifikowanych do albumu „Ważne…”.</div>
-            {% endif %}
-        </div>
+        <button type="button"
+                onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, unbacked_only: true});"
+                class="text-emerald-400 hover:underline text-[11px] font-semibold">
+            Pokaż pliki bez backupu w głównej galerii &rarr;
+        </button>
     </div>
