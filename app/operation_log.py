@@ -389,12 +389,44 @@ class ProcessManager:
             t.start()
 
     @classmethod
+    def update_cache_only(
+        cls,
+        job_id: int,
+        message: Optional[str] = None,
+        processed_count: Optional[int] = None,
+        total_count: Optional[int] = None,
+    ) -> None:
+        """Updates RAM cache for live UI inspection without writing to SQLite (safe during SQLite backup)."""
+        with cls._lock:
+            cached = cls._job_cache.setdefault(job_id, {"id": job_id})
+            if message is not None:
+                cached["last_message"] = message
+            if processed_count is not None:
+                cached["processed_count"] = processed_count
+            if total_count is not None:
+                cached["total_count"] = total_count
+
+    @classmethod
     def get_jobs_summary(cls, db: Session) -> Dict[str, Any]:
         jobs = list(
             db.scalars(
                 select(BackgroundJob).order_by(desc(BackgroundJob.updated_at), desc(BackgroundJob.id)).limit(30)
             ).all()
         )
+        with cls._lock:
+            for j in jobs:
+                c = cls._job_cache.get(j.id)
+                if c and j.status == "RUNNING":
+                    try:
+                        db.expunge(j)
+                    except Exception:
+                        pass
+                    if "processed_count" in c:
+                        j.processed_count = int(c["processed_count"] or 0)
+                    if "total_count" in c:
+                        j.total_count = int(c["total_count"] or 0)
+                    if c.get("last_message"):
+                        j.last_message = str(c["last_message"])
         running = [j for j in jobs if j.status == "RUNNING"]
         unfinished = [j for j in jobs if j.status in ("STOPPED", "PAUSED", "WAITING_FOR_DEVICE", "FAILED")]
         completed = [j for j in jobs if j.status == "COMPLETED"]

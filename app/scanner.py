@@ -629,6 +629,7 @@ class FileScannerService:
             hash_algorithm="sha256" if is_img else "partial_3x64k",
             is_primary_duplicate=not is_backup,
             is_backup_copy=is_backup,
+            duplicate_role="backup_green" if is_backup else "original",
             verified_sha256=file_hash if is_img else None,
             width=w,
             height=h,

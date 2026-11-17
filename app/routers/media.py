@@ -12,7 +12,7 @@ from sqlalchemy import desc, asc, select, or_, func, extract, and_
 from sqlalchemy.orm import Session, joinedload, aliased
 
 from app.database import get_db, THUMBNAILS_DIR
-from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, PendingFileMove
+from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding
 from app.operation_log import ProcessManager
 from app.scanner import MetadataDateResolver
 from app.storage_ops import StorageAutomationService
@@ -71,6 +71,41 @@ def get_unbacked_primary_ids_subquery():
             ~MediaItem.file_hash.in_(backed_hashes),
         )
     )
+
+
+def _build_cross_vault_backup_map(db: Session, items: List[MediaItem]) -> dict:
+    """
+    For each item, inspects all non-trashed daf_backup/ copies sharing its file_hash on a DIFFERENT volume.
+    Returns {item.id: 'Label (Letter), ...'} so ORYGINAL badges turn green when safely backed up cross-drive.
+    """
+    if not items:
+        return {}
+    hashes = list({it.file_hash for it in items if it.file_hash})
+    if not hashes:
+        return {}
+    vault_rows = db.execute(
+        select(
+            MediaItem.file_hash,
+            MediaItem.volume_id,
+            WindowsVolume.volume_label,
+            WindowsVolume.last_known_drive_letter,
+        )
+        .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
+        .where(
+            MediaItem.file_hash.in_(hashes),
+            MediaItem.is_trashed == False,
+            MediaItem.is_backup_copy == True,
+        )
+    ).all()
+    by_hash = defaultdict(list)
+    for fh, vid, vlabel, vletter in vault_rows:
+        by_hash[fh].append((vid, f"{vlabel} ({vletter})"))
+    result = {}
+    for it in items:
+        other_vols = sorted({lbl for vid, lbl in by_hash.get(it.file_hash, []) if vid != it.volume_id})
+        if other_vols:
+            result[it.id] = ", ".join(other_vols)
+    return result
 
 
 def apply_media_filters(
@@ -148,7 +183,14 @@ def apply_media_filters(
     if duplicates_only:
         dup_hashes_subq = (
             select(MediaItem.file_hash)
-            .where(MediaItem.is_trashed == False)
+            .where(
+                MediaItem.is_trashed == False,
+                MediaItem.is_backup_copy == False,
+                ~MediaItem.relative_path.ilike("daf_backup/%"),
+                ~MediaItem.relative_path.ilike("daf_backup\\%"),
+                ~MediaItem.relative_path.ilike("backup/%"),
+                ~MediaItem.relative_path.ilike("backup\\%"),
+            )
             .group_by(MediaItem.file_hash)
             .having(func.count(MediaItem.id) > 1)
         )
@@ -251,6 +293,7 @@ def build_sidebar_context(db: Session) -> dict:
     total_all = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)) or 0
     total_anomalies = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.has_date_anomaly == True)) or 0
     total_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.is_primary_duplicate == False)) or 0
+    total_redundant_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.duplicate_role == "duplicate")) or 0
     total_blurry = db.scalar(
         select(func.count(MediaItem.id)).where(
             MediaItem.is_trashed == False,
@@ -285,7 +328,6 @@ def build_sidebar_context(db: Session) -> dict:
         )
     ) or 0
     total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
-    total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
     jobs_summary = ProcessManager.get_jobs_summary(db)
 
     return {
@@ -301,6 +343,7 @@ def build_sidebar_context(db: Session) -> dict:
         "total_all": total_all,
         "total_anomalies": total_anomalies,
         "total_dups": total_dups,
+        "total_redundant_dups": total_redundant_dups,
         "total_blurry": total_blurry,
         "total_defects_all": total_defects_all,
         "defect_counts": defect_counts,
@@ -310,7 +353,6 @@ def build_sidebar_context(db: Session) -> dict:
         "total_unvectored": total_unvectored,
         "total_unanalyzed_quality": total_unanalyzed_quality,
         "total_unbacked": total_unbacked,
-        "total_pending_moves": total_pending_moves,
         "jobs_summary": jobs_summary,
     }
 
@@ -360,7 +402,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     )
 
     if duplicates_only:
-        stmt = stmt.order_by(asc(MediaItem.file_hash), desc(MediaItem.is_primary_duplicate), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
+        stmt = stmt.order_by(asc(MediaItem.file_hash), desc(MediaItem.is_primary_duplicate), asc(MediaItem.duplicate_role), asc(MediaItem.effective_date))
     elif sort_by == "date_asc":
         stmt = stmt.order_by(asc(MediaItem.effective_date))
     elif sort_by == "size_desc":
@@ -392,7 +434,6 @@ def build_search_context(request: Request, db: Session) -> dict:
     all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
     trashed_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all())
     all_volumes = list(db.scalars(select(WindowsVolume)).all())
-    total_pending_moves = db.scalar(select(func.count(PendingFileMove.id)).where(PendingFileMove.status == "PENDING")) or 0
 
     subfolders = []
     if vol_id_int and not trashed_only:
@@ -415,10 +456,20 @@ def build_search_context(request: Request, db: Session) -> dict:
                 folder_counts["."] += 1
         subfolders = sorted(folder_counts.items(), key=lambda x: x[1], reverse=True)[:25]
 
+    redundant_dup_count_filtered = 0
+    if duplicates_only:
+        redundant_dup_count_filtered = db.scalar(
+            select(func.count(count_subq.c.id)).join(MediaItem, MediaItem.id == count_subq.c.id).where(MediaItem.duplicate_role == "duplicate")
+        ) or 0
+
+    cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
+
     return {
         "timeline": dict(grouped),
         "items_flat": items,
         "total_matching": total_matching,
+        "total_redundant_dups": redundant_dup_count_filtered,
+        "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
         "total_size_mb": total_size_bytes / (1024 * 1024),
         "page": page_int,
         "page_size": page_size_int,
@@ -443,7 +494,6 @@ def build_search_context(request: Request, db: Session) -> dict:
         "all_groups": all_groups,
         "flat_album_choices": build_flat_album_choices(all_groups),
         "all_volumes": all_volumes,
-        "total_pending_moves": total_pending_moves,
         "similarity_scores": {},
     }
 
@@ -591,7 +641,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             select(MediaItem)
             .options(joinedload(MediaItem.volume), joinedload(MediaItem.group))
             .where(MediaItem.file_hash == it.file_hash, MediaItem.is_trashed == False)
-            .order_by(desc(MediaItem.is_primary_duplicate), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
+            .order_by(desc(MediaItem.is_primary_duplicate), asc(MediaItem.duplicate_role), asc(MediaItem.is_backup_copy), asc(MediaItem.effective_date))
         ).unique().all()
     )
     folder_info = MetadataDateResolver.parse_folder_date(Path(it.relative_path), rel_path=it.relative_path)
@@ -630,6 +680,8 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
         blur_val = f"{it.blur_score:.1f}" if it.blur_score is not None else "0.0"
         defect_labels.append({"tag": "do_usuniecia:rozmyte", "name": f"Rozmyte / brak ostrości (wynik: {blur_val})", "desc": "Niski wskaźnik ostrości Laplaciana", "badge_class": "bg-amber-950 text-amber-300 border-amber-700"})
 
+    cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, [it] + duplicate_copies)
+
     return render_template(
         request,
         "partials/modal_detail.html",
@@ -638,6 +690,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,
+            "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
             "folder_date_str": folder_date_str,
             "quality_tags": quality_tags,
             "semantic_tags": semantic_tags,

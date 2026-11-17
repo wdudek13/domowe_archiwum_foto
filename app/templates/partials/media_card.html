@@ -45,13 +45,17 @@
                 </span>
             {% endif %}
 
-            {% if item.is_backup_copy %}
-                <span title="Kopia zapasowa (backup)" class="bg-sky-900/90 text-sky-200 text-[10px] px-1 rounded">
-                    BKP
+            {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}
+                <span title="BACKUP na innym urządzeniu" class="bg-emerald-600 text-white text-[10px] font-bold px-1 rounded">
+                    BACKUP
                 </span>
-            {% elif not item.is_primary_duplicate %}
-                <span title="Duplikat binarny" class="bg-rose-900/90 text-rose-300 text-[10px] px-1 rounded">
-                    DUP
+            {% elif item.duplicate_role == 'backup_orange' %}
+                <span title="BACKUP na tym samym urządzeniu" class="bg-orange-600 text-white text-[10px] font-bold px-1 rounded">
+                    BACKUP
+                </span>
+            {% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}
+                <span title="Duplikat binarny (nadmiarowy)" class="bg-rose-700 text-white text-[10px] font-bold px-1 rounded">
+                    DUPLIKAT
                 </span>
             {% endif %}
         </div>

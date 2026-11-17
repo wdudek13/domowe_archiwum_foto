@@ -159,7 +159,7 @@
         </div>
         <button type="button" onclick="openBackupModal()"
                 class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
-            🛡️ Otwórz Panel Automatycznego Backupu i Deduplikacji
+            🛡️ Otwórz Panel Backupu zdjęć/filmów
         </button>
     </div>
     {% endif %}
@@ -202,18 +202,28 @@
     <!-- Pasek narzędzi Porównywania Duplikatów -->
     {% if duplicates_only %}
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div>
-            <div class="font-bold text-amber-300 text-sm">👥 Porównywanie Duplikatów Binarnych (Zgrupowane wg SHA-256)</div>
-            <div class="text-slate-300 text-[11px]">Zielony znacznik <strong>ORYGINAŁ</strong> wskazuje główną kopię (preferowaną na dysku z duplikatem do albumu <em>Ważne</em>), niebieski <strong>BACKUP</strong> to kopia w kartotece <code>daf_backup/</code>, a czerwony <strong>DUPLIKAT</strong> to kopia nadmiarowa.</div>
+        <div class="space-y-1">
+            <div class="font-bold text-amber-300 text-sm">
+                👥 Duplikaty binarne — Klastry (Nadmiarowych kopii do usunięcia: <span class="text-rose-300 font-mono">{{ total_redundant_dups or 0 }}</span> szt.)
+            </div>
+            <div class="text-slate-300 text-[11px]">
+                <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">ORYGINAŁ ✓</span> 1. kopia (ma kopię w <code>daf_backup/</code> na innym dysku) &bull;
+                <span class="bg-sky-700 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">ORYGINAŁ</span> 1. kopia (brak kopii w <code>daf_backup/</code>) &bull;
+                <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">BACKUP</span> 2. kopia na <strong>innym dysku</strong> &bull;
+                <span class="bg-orange-600 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">BACKUP</span> 2. kopia na <strong>tym samym dysku</strong> &bull;
+                <span class="bg-rose-700 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">DUPLIKAT</span> od 3. kopii wzwyż.
+                <span class="block text-slate-400 mt-0.5">Użyj przycisków <strong>Do Kosza</strong> lub <strong>Usuń trwale</strong> na pasku powyżej — każdy duplikat przed usunięciem przechodzi 100% analizę binarną i kontrolę zachowania Oryginału + Backupu (dysk po dysku).</span>
+            </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
             <button type="button"
-                    onclick="openBackupModal()"
-                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
-                🛡️ Automatyczny Backup i 100% Bezpieczne Usunięcie Duplikatów
+                    hx-post="/actions/refresh-duplicate-tags"
+                    hx-target="#global-notification"
+                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-sky-300 px-3 py-1.5 rounded-lg font-medium shadow">
+                🔄 Aktualizuj tagi klastrów
             </button>
             <button type="button"
-                    onclick="document.querySelectorAll('input[data-is-dup=\'true\']').forEach(cb => cb.checked = true); document.querySelectorAll('input[data-is-dup=\'false\']').forEach(cb => cb.checked = false); updateSelectionState();"
+                    onclick="selectAllRedundantDuplicates()"
                     class="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
                 ☑️ Zaznacz tylko nadmiarowe kopie
             </button>
@@ -424,7 +434,7 @@
                     data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
                     <td class="p-2">
                         <input type="checkbox" name="selected_ids" value="{{ item.id }}"
-                               data-is-dup="{{ 'false' if item.is_primary_duplicate else 'true' }}"
+                               data-is-dup="{{ 'true' if item.duplicate_role == 'duplicate' else 'false' }}"
                                onclick="handleCheckboxClick(event, this)" class="rounded bg-slate-900">
                     </td>
                     <td class="p-1.5">
@@ -450,11 +460,18 @@
                     <td class="p-2 font-mono text-[11px]">{{ item.effective_date.strftime('%Y-%m-%d %H:%M') }}</td>
                     <td class="p-2 font-mono text-[11px]">{{ "%.2f"|format(item.file_size_bytes / (1024*1024)) }} MB</td>
                     <td class="p-2 space-x-1">
-                        {% if item.is_backup_copy %}
-                            <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded text-[10px]">BACKUP</span>
-                        {% elif duplicates_only and item.is_primary_duplicate %}
-                            <span class="bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded text-[10px]">ORYGINAŁ</span>
-                        {% elif not item.is_primary_duplicate %}
+                        {% set vault_bkp = cross_vault_backup_by_item_id.get(item.id) if cross_vault_backup_by_item_id is defined else None %}
+                        {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}
+                            <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px]" title="BACKUP na innym urządzeniu niż Oryginał">BACKUP</span>
+                        {% elif item.duplicate_role == 'backup_orange' %}
+                            <span class="bg-orange-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px]" title="BACKUP na tym samym urządzeniu co Oryginał">BACKUP</span>
+                        {% elif duplicates_only and (item.duplicate_role == 'original' or item.is_primary_duplicate) %}
+                            {% if vault_bkp %}
+                            <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px]" title="ORYGINAŁ posiada kopię w daf_backup/ na innym urządzeniu: {{ vault_bkp }}">ORYGINAŁ ✓</span>
+                            {% else %}
+                            <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded text-[10px]" title="ORYGINAŁ — brak kopii w daf_backup/ na innym urządzeniu">ORYGINAŁ</span>
+                            {% endif %}
+                        {% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}
                             <span onclick="htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                                   class="bg-rose-700 hover:bg-rose-600 text-white font-bold px-1.5 py-0.5 rounded text-[10px] cursor-pointer">DUPLIKAT (Porównaj)</span>
                         {% endif %}
@@ -523,12 +540,21 @@
              data-rotation="{{ item.rotation_angle or 0 }}"
              data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
             <input type="checkbox" name="selected_ids" value="{{ item.id }}"
-                   data-is-dup="{{ 'false' if item.is_primary_duplicate else 'true' }}"
+                   data-is-dup="{{ 'true' if item.duplicate_role == 'duplicate' else 'false' }}"
                    onclick="handleCheckboxClick(event, this)"
                    class="absolute top-1.5 left-1.5 z-20 rounded bg-slate-900/90 border-borderBg text-indigo-600 w-3.5 h-3.5 cursor-pointer">
-            {% if item.is_backup_copy %}
-            <span class="absolute top-1 right-1 z-20 bg-sky-700 text-white text-[8px] font-bold px-1 rounded">BKP</span>
-            {% elif not item.is_primary_duplicate %}
+            {% set vault_bkp = cross_vault_backup_by_item_id.get(item.id) if cross_vault_backup_by_item_id is defined else None %}
+            {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}
+            <span class="absolute top-1 right-1 z-20 bg-emerald-600 text-white text-[8px] font-bold px-1 rounded" title="BACKUP (inny dysk)">BKP</span>
+            {% elif item.duplicate_role == 'backup_orange' %}
+            <span class="absolute top-1 right-1 z-20 bg-orange-600 text-white text-[8px] font-bold px-1 rounded" title="BACKUP (ten sam dysk)">BKP</span>
+            {% elif duplicates_only and (item.duplicate_role == 'original' or item.is_primary_duplicate) %}
+                {% if vault_bkp %}
+                <span class="absolute top-1 right-1 z-20 bg-emerald-600 text-white text-[8px] font-bold px-1 rounded" title="ORYGINAŁ ma kopię w daf_backup/: {{ vault_bkp }}">ORYG ✓</span>
+                {% else %}
+                <span class="absolute top-1 right-1 z-20 bg-sky-700 text-white text-[8px] font-bold px-1 rounded" title="ORYGINAŁ (brak kopii w daf_backup/)">ORYG</span>
+                {% endif %}
+            {% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}
             <span onclick="event.stopPropagation(); htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                   class="absolute top-1 right-1 z-20 bg-rose-700 text-white text-[8px] font-bold px-1 rounded cursor-pointer">DUP</span>
             {% elif item.embedding %}
@@ -570,7 +596,7 @@
 
             <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 gap-3">
                 {% for item in items %}
-                <div class="gallery-media-item group relative bg-cardBg rounded-xl border {% if duplicates_only and item.is_primary_duplicate %}border-emerald-600/80{% elif item.is_backup_copy %}border-sky-600/80{% elif not item.is_primary_duplicate %}border-rose-700/80{% else %}border-borderBg{% endif %} overflow-hidden shadow hover:border-indigo-500/70 flex flex-col"
+                <div class="gallery-media-item group relative bg-cardBg rounded-xl border {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}border-emerald-600/80{% elif item.duplicate_role == 'backup_orange' %}border-orange-500/80{% elif duplicates_only and (item.duplicate_role == 'original' or item.is_primary_duplicate) %}border-sky-600/80{% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}border-rose-700/80{% else %}border-borderBg{% endif %} overflow-hidden shadow hover:border-indigo-500/70 flex flex-col"
                      data-id="{{ item.id }}"
                      data-raw="/media/{{ item.id }}/raw"
                      data-type="{{ item.media_type }}"
@@ -579,7 +605,7 @@
 
                     <div class="absolute top-2 left-2 z-20">
                         <input type="checkbox" name="selected_ids" value="{{ item.id }}" data-day="{{ day }}"
-                               data-is-dup="{{ 'false' if item.is_primary_duplicate else 'true' }}"
+                               data-is-dup="{{ 'true' if item.duplicate_role == 'duplicate' else 'false' }}"
                                onclick="handleCheckboxClick(event, this)"
                                class="rounded bg-slate-900/90 border-borderBg text-indigo-600 w-4 h-4 cursor-pointer">
                     </div>
@@ -621,11 +647,18 @@
                             {% if item.has_date_anomaly %}
                                 <span title="{{ item.date_anomaly_reason }}" class="bg-amber-500 text-slate-950 font-bold px-1 rounded">!</span>
                             {% endif %}
-                            {% if item.is_backup_copy %}
-                                <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded">BACKUP</span>
-                            {% elif duplicates_only and item.is_primary_duplicate %}
-                                <span class="bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded">ORYGINAŁ</span>
-                            {% elif not item.is_primary_duplicate %}
+                            {% set vault_bkp = cross_vault_backup_by_item_id.get(item.id) if cross_vault_backup_by_item_id is defined else None %}
+                            {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}
+                                <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.5 rounded" title="BACKUP na innym urządzeniu niż Oryginał">BACKUP</span>
+                            {% elif item.duplicate_role == 'backup_orange' %}
+                                <span class="bg-orange-600 text-white font-bold px-1.5 py-0.5 rounded" title="BACKUP na tym samym urządzeniu co Oryginał">BACKUP</span>
+                            {% elif duplicates_only and (item.duplicate_role == 'original' or item.is_primary_duplicate) %}
+                                {% if vault_bkp %}
+                                <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.5 rounded" title="ORYGINAŁ posiada kopię w daf_backup/ na innym urządzeniu: {{ vault_bkp }}">ORYGINAŁ ✓</span>
+                                {% else %}
+                                <span class="bg-sky-700 text-white font-bold px-1.5 py-0.5 rounded" title="ORYGINAŁ — brak kopii w daf_backup/ na innym urządzeniu">ORYGINAŁ</span>
+                                {% endif %}
+                            {% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}
                                 <span onclick="event.stopPropagation(); htmx.ajax('GET', '/media/{{ item.id }}/detail', '#modal-container');"
                                       title="Kliknij, aby porównać wszystkie kopie tego pliku"
                                       class="bg-rose-700 hover:bg-rose-600 text-white font-bold px-1.5 py-0.5 rounded cursor-pointer">DUPLIKAT (Porównaj)</span>

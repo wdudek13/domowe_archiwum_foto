@@ -1,10 +1,10 @@
     <!-- Ukryty kontener z pełnymi statystykami par dysków dla natychmiastowego filtrowania w JS -->
     <script id="backup-pair-counts-data" type="application/json">{{ pair_counts|safe if pair_counts is defined else '{}' }}</script>
 
-    <!-- Automatycznie wykryta lista plików bez backupu dla wybranych par (Req 1g + 8c) -->
+    <!-- 1. Nowe kopie do utworzenia (Brakujące + Pomarańczowe -> daf_backup/ na innym dysku) -->
     <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
         <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-300">📋 Lista plików bez backupu na innym urządzeniu (<span id="unbacked-filtered-count">{{ unbacked_total }}</span> / {{ unbacked_all_total if unbacked_all_total is defined else unbacked_total }} szt.{% if unbacked_files|length < unbacked_total %} — podgląd pierwszych <span id="unbacked-shown-count">{{ unbacked_files|length }}</span>{% endif %}):</span>
+            <span class="font-bold text-slate-300">📋 Nowe kopie do utworzenia w <code>daf_backup/</code> (<span id="unbacked-filtered-count">{{ unbacked_total }}</span> / {{ unbacked_all_total if unbacked_all_total is defined else unbacked_total }} szt.{% if unbacked_files|length < unbacked_total %} — podgląd pierwszych <span id="unbacked-shown-count">{{ unbacked_files|length }}</span>{% endif %}):</span>
             <button type="button"
                     onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, unbacked_only: true});"
                     class="text-emerald-400 hover:underline text-[11px]">Pokaż te pliki w głównej galerii &rarr;</button>
@@ -32,60 +32,99 @@
                 </tbody>
             </table>
             <div id="unbacked-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak plików bez backupu przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
+                Brak nowych kopii przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
             </div>
             {% else %}
-            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Wszystkie zindeksowane pliki posiadają zweryfikowany backup na innym urządzeniu!</div>
+            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Wszystkie pliki posiadają kopię zapasową na innym urządzeniu!</div>
             {% endif %}
         </div>
     </div>
 
-    <!-- Lista duplikatów z wybranych urządzeń / par -->
+    <!-- 2. Kopie lokalne (Zielone BACKUP przenoszone w ramach tego samego urządzenia do daf_backup/RRRR/MM/DD/) -->
     <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
         <div class="flex items-center justify-between">
-            <span class="font-bold text-slate-300">👥 Lista duplikatów z wybranych urządzeń (<span id="duplicates-filtered-count">{{ duplicates_total if duplicates_total is defined else plan.redundant_duplicates_count }}</span> / {{ duplicates_all_total if duplicates_all_total is defined else plan.redundant_duplicates_count }} szt.{% if duplicate_files|length < duplicates_total %} — podgląd pierwszych <span id="duplicates-shown-count">{{ duplicate_files|length }}</span>{% endif %}):</span>
-            <button type="button"
-                    onclick="document.getElementById('backup-modal').classList.add('hidden'); applySidebarFilter({_reset: true, duplicates_only: true});"
-                    class="text-rose-400 hover:underline text-[11px]">Pokaż duplikaty w głównej galerii &rarr;</button>
+            <span class="font-bold text-slate-300">📂 Kopie lokalne do przeniesienia do kartoteki <code>daf_backup/</code> (<span id="local-reloc-filtered-count">{{ local_reloc_total|default(0) }}</span> / {{ local_reloc_all_total|default(0) }} szt.{% if local_reloc_files is defined and local_reloc_files|length < (local_reloc_total|default(0)) %} — podgląd pierwszych <span id="local-reloc-shown-count">{{ local_reloc_files|length }}</span>{% endif %}):</span>
+            <span class="text-sky-400/80 text-[11px]">Zielone BACKUP porządkowane lokalnie w ramach urządzenia (RRRR/MM/DD)</span>
         </div>
-        <div class="max-h-48 overflow-y-auto">
-            {% if duplicate_files %}
+        <div class="max-h-44 overflow-y-auto">
+            {% if local_reloc_files %}
             <table class="w-full text-left border-collapse text-[11px]">
                 <thead>
                     <tr class="border-b border-borderBg text-slate-400">
-                        <th class="py-1 px-2">Nazwa pliku (duplikat)</th>
-                        <th class="py-1 px-2">Urządzenie z duplikatem</th>
-                        <th class="py-1 px-2">Ścieżka duplikatu</th>
-                        <th class="py-1 px-2">Zachowany oryginał</th>
+                        <th class="py-1 px-2">Nazwa pliku</th>
+                        <th class="py-1 px-2">Urządzenie</th>
+                        <th class="py-1 px-2">Obecna ścieżka</th>
+                        <th class="py-1 px-2">Docelowa ścieżka</th>
                         <th class="py-1 px-2">Rozmiar</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-borderBg/40 font-mono">
-                    {% for df in duplicate_files %}
-                    <tr class="duplicate-file-row" data-pair-keys="{{ df.pair_keys_str if df.pair_keys_str is defined else df.pair_key_str }}" data-volume-id="{{ df.dup_vol_id }}">
-                        <td class="py-1 px-2 text-rose-200 truncate max-w-[160px]">{{ df.file_name }}</td>
-                        <td class="py-1 px-2 text-amber-300">{{ df.dup_vol_label }} ({{ df.dup_vol_letter }})</td>
-                        <td class="py-1 px-2 text-slate-400 truncate max-w-[180px]">{{ df.dup_relative_path }}</td>
-                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[180px]" title="{{ df.ref_vol_label }}: {{ df.ref_relative_path }}">{{ df.ref_vol_label }}: {{ df.ref_relative_path }}</td>
-                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(df.file_size / (1024*1024)) }} MB</td>
+                    {% for lr in local_reloc_files %}
+                    <tr class="local-reloc-row" data-pair-keys="{{ lr.pair_key_str }}" data-volume-id="{{ lr.vol_id }}">
+                        <td class="py-1 px-2 text-sky-200 truncate max-w-[160px]">{{ lr.file_name }}</td>
+                        <td class="py-1 px-2 text-amber-300">{{ lr.vol_label }} ({{ lr.vol_letter }})</td>
+                        <td class="py-1 px-2 text-slate-400 truncate max-w-[180px]">{{ lr.src_relative_path }}</td>
+                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[180px]">{{ lr.dst_relative_path }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(lr.file_size / (1024*1024)) }} MB</td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
-            <div id="duplicates-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
-                Brak duplikatów przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
+            <div id="local-reloc-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
+                Brak kopii lokalnych przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
             </div>
             {% else %}
-            <div class="p-4 text-center text-emerald-400 font-semibold">✓ Brak nadmiarowych duplikatów wymagających usunięcia na indeksowanych urządzeniach.</div>
+            <div class="p-3 text-center text-slate-400 font-semibold">Brak kopii zielonych poza kartoteką <code>daf_backup/</code> wymagających lokalnego przeniesienia.</div>
             {% endif %}
         </div>
     </div>
 
-    <!-- Lista oryginałów kwalifikowanych do albumu Ważne z wybranych urządzeń / par (Rule 2b & 2d) -->
+    <!-- 3. Kopie zdalne (Przenoszenie istniejących backupów między urządzeniami przy wyłączonej minimalizacji przeniesień) -->
+    {% if not minimize_transfers or (remote_move_all_total|default(0)) > 0 %}
+    <div class="bg-slate-900/60 border border-teal-800/60 rounded-xl p-3.5 space-y-2">
+        <div class="flex items-center justify-between">
+            <span class="font-bold text-teal-300">🚚 Kopie zdalne (konsolidacja między urządzeniami do <code>daf_backup/</code>) (<span id="remote-move-filtered-count">{{ remote_move_total|default(0) }}</span> / {{ remote_move_all_total|default(0) }} szt.{% if remote_move_files is defined and remote_move_files|length < (remote_move_total|default(0)) %} — podgląd pierwszych <span id="remote-move-shown-count">{{ remote_move_files|length }}</span>{% endif %}):</span>
+            <span class="text-teal-400/80 text-[11px]">Przenoszone na wybrane dyski docelowe backupu</span>
+        </div>
+        <div class="max-h-44 overflow-y-auto">
+            {% if remote_move_files %}
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg text-slate-400">
+                        <th class="py-1 px-2">Nazwa pliku</th>
+                        <th class="py-1 px-2">Z urządzenia</th>
+                        <th class="py-1 px-2">Na urządzenie</th>
+                        <th class="py-1 px-2">Ścieżka docelowa</th>
+                        <th class="py-1 px-2">Rozmiar</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for rm in remote_move_files %}
+                    <tr class="remote-move-row" data-pair-keys="{{ rm.pair_key_str }}" data-volume-id="{{ rm.dst_vol_id }}">
+                        <td class="py-1 px-2 text-teal-200 truncate max-w-[160px]">{{ rm.file_name }}</td>
+                        <td class="py-1 px-2 text-amber-300">{{ rm.src_vol_label }} ({{ rm.src_vol_letter }})</td>
+                        <td class="py-1 px-2 text-emerald-300">{{ rm.dst_vol_label }} ({{ rm.dst_vol_letter }})</td>
+                        <td class="py-1 px-2 text-slate-300 truncate max-w-[180px]">{{ rm.dst_relative_path }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(rm.file_size / (1024*1024)) }} MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <div id="remote-move-empty-pair-msg" class="hidden p-3 text-center text-slate-400 text-[11px]">
+                Brak kopii zdalnych przypisanych do aktualnie zaznaczonych par urządzeń powyżej.
+            </div>
+            {% else %}
+            <div class="p-3 text-center text-slate-400 font-semibold">Brak kopii zdalnych do przeniesienia między wybranymi urządzeniami.</div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- 4. Lista oryginałów dodawanych do albumu Ważne (RRRR / MM / DD) -->
     <div class="bg-slate-900/60 border border-borderBg rounded-xl p-3.5 space-y-2">
         <div class="flex items-center justify-between">
             <span class="font-bold text-slate-300">⭐ Lista oryginałów dodawanych do albumu „Ważne…” (<span id="important-filtered-count">{{ important_total if important_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }}</span> / {{ important_all_total if important_all_total is defined else (plan.important_candidates|length if plan.important_candidates is defined else 0) }} szt.{% if important_files is defined and important_files|length < important_total %} — podgląd pierwszych <span id="important-shown-count">{{ important_files|length }}</span>{% endif %}):</span>
-            <span class="text-amber-400/80 text-[11px]">Automatycznie tworzone podalbumy wg daty (RRRR / RRRR-MM)</span>
+            <span class="text-amber-400/80 text-[11px]">Automatycznie tworzone podalbumy wg daty (RRRR / MM / DD)</span>
         </div>
         <div class="max-h-48 overflow-y-auto">
             {% if important_files %}

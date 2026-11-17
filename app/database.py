@@ -85,6 +85,67 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
                 cur.execute("ALTER TABLE media_items ADD COLUMN rotation_angle INTEGER DEFAULT 0 NOT NULL;")
             if "is_backup_copy" not in m_cols:
                 cur.execute("ALTER TABLE media_items ADD COLUMN is_backup_copy BOOLEAN DEFAULT 0 NOT NULL;")
+            if "duplicate_role" not in m_cols:
+                cur.execute("ALTER TABLE media_items ADD COLUMN duplicate_role VARCHAR(32) DEFAULT 'original' NOT NULL;")
+                cur.execute("CREATE INDEX IF NOT EXISTS ix_media_items_duplicate_role ON media_items (duplicate_role);")
+                needed_cols = {"file_hash", "volume_id", "is_primary_duplicate", "is_backup_copy", "effective_date", "relative_path", "is_trashed"}
+                if needed_cols.issubset(m_cols):
+                    cur.execute(
+                        """
+                        WITH vol_counts AS (
+                            SELECT
+                                id, file_hash, volume_id, is_backup_copy, effective_date, relative_path,
+                                SUM(CASE WHEN is_backup_copy = 0 THEN 1 ELSE 0 END) OVER (PARTITION BY file_hash, volume_id) AS same_vol_cnt
+                            FROM media_items
+                            WHERE is_trashed = 0
+                        ),
+                        orig_ranked AS (
+                            SELECT
+                                id, file_hash, volume_id, is_backup_copy, effective_date, relative_path,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY file_hash
+                                    ORDER BY is_backup_copy ASC, same_vol_cnt DESC, effective_date ASC, relative_path ASC, id ASC
+                                ) AS orig_rn,
+                                FIRST_VALUE(volume_id) OVER (
+                                    PARTITION BY file_hash
+                                    ORDER BY is_backup_copy ASC, same_vol_cnt DESC, effective_date ASC, relative_path ASC, id ASC
+                                ) AS orig_vol_id
+                            FROM vol_counts
+                        ),
+                        role_ranked AS (
+                            SELECT
+                                id, volume_id, orig_vol_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY file_hash
+                                    ORDER BY
+                                        (CASE WHEN orig_rn = 1 THEN 0 WHEN volume_id != orig_vol_id THEN 1 ELSE 2 END) ASC,
+                                        is_backup_copy DESC,
+                                        effective_date ASC,
+                                        relative_path ASC,
+                                        id ASC
+                                ) AS final_rn
+                            FROM orig_ranked
+                        ),
+                        computed AS (
+                            SELECT
+                                id,
+                                CASE WHEN final_rn = 1 THEN 1 ELSE 0 END AS new_primary,
+                                CASE
+                                    WHEN final_rn = 1 THEN 'original'
+                                    WHEN final_rn = 2 AND volume_id != orig_vol_id THEN 'backup_green'
+                                    WHEN final_rn = 2 THEN 'backup_orange'
+                                    ELSE 'duplicate'
+                                END AS new_role
+                            FROM role_ranked
+                        )
+                        UPDATE media_items
+                        SET
+                            is_primary_duplicate = computed.new_primary,
+                            duplicate_role = computed.new_role
+                        FROM computed
+                        WHERE media_items.id = computed.id;
+                        """
+                    )
             if "verified_sha256" not in m_cols:
                 cur.execute("ALTER TABLE media_items ADD COLUMN verified_sha256 VARCHAR(64);")
 

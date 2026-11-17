@@ -27,7 +27,6 @@ from app.models import (
     MediaItem,
     MediaTag,
     MediaEmbedding,
-    PendingFileMove,
     BackgroundJob,
     OperationLogEntry,
 )
@@ -507,18 +506,39 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             )
             self.assertEqual(r_exec_bkp.status_code, 200)
 
-            # After execution, 0 files lack backup on another device!
+            # After backup execution, 0 files lack backup on another device; backup does NOT delete duplicates!
             db.expire_all()
             unbacked_after = svc.detect_files_without_backup()
             self.assertEqual(len(unbacked_after), 0)
-
-            # Verify that redundant duplicate on Drive B was deleted and Original on Drive B kept
-            self.assertFalse(p1_b_dup.exists(), "Redundant duplicate on Drive B must be physically removed")
+            self.assertTrue(p1_b_dup.exists(), "Backup must not delete duplicates automatically")
             self.assertTrue(p1_b_orig.exists(), "Original on Drive B must remain untouched in its place")
 
-            # Verify Album 'Ważne - Dysk_B' -> '2023' -> '2023-06' hierarchy was created
+            # Now remove redundant duplicate via /actions/redundant-duplicate-ids + /actions/delete-permanently
+            r_dup_ids = self.client.get("/actions/redundant-duplicate-ids?duplicates_only=true")
+            self.assertEqual(r_dup_ids.status_code, 200)
+            dup_ids_list = r_dup_ids.json()["ids"]
+            self.assertTrue(len(dup_ids_list) >= 1)
+            r_del_dups = self.client.post(
+                "/actions/delete-permanently",
+                data={
+                    "scope": "selected",
+                    "duplicates_only": "true",
+                    "selected_ids_json": json.dumps(dup_ids_list),
+                },
+            )
+            self.assertEqual(r_del_dups.status_code, 200)
+            self.assertFalse(p1_b_dup.exists(), "Redundant duplicate on Drive B must be safely removed from Duplikaty binarne")
+            self.assertTrue(p1_b_orig.exists(), "Original on Drive B must remain untouched")
+
+            # Verify Album 'Ważne - Dysk_B' -> '2023' -> '06' -> '15' (rok/miesiac/dzien) hierarchy was created
             important_root = db.scalar(select(MediaGroup).where(MediaGroup.name == "Ważne - Dysk_B"))
             self.assertIsNotNone(important_root)
+            imp_yr = db.scalar(select(MediaGroup).where(MediaGroup.name == "2023", MediaGroup.parent_id == important_root.id))
+            self.assertIsNotNone(imp_yr)
+            imp_mo = db.scalar(select(MediaGroup).where(MediaGroup.name == "06", MediaGroup.parent_id == imp_yr.id))
+            self.assertIsNotNone(imp_mo)
+            imp_day = db.scalar(select(MediaGroup).where(MediaGroup.name == "15", MediaGroup.parent_id == imp_mo.id))
+            self.assertIsNotNone(imp_day)
 
             # Test insufficient disk space warning in execute_backup_and_deduplication
             p3_a = create_synthetic_jpeg(self.drive_a / "IMG_20230801_120000.jpg", color=(90, 90, 10))
@@ -824,9 +844,9 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertIn("Przeliczono źródła dat", r_recalc.text)
 
     # =========================================================================
-    # 5. OFFLINE MODE, TODO QUEUE, PAIRWISE EXECUTION & AUTOMATIC ROLLBACK
+    # 5. ONLINE FILE MOVES & REMOVAL OF OBSOLETE TODO FEATURE
     # =========================================================================
-    def test_offline_todo_moves_pairwise_execution_and_rollback(self):
+    def test_online_file_moves_and_no_todo_endpoints(self):
         with self.TestingSessionLocal() as db:
             vol_a = WindowsVolume(
                 volume_serial_number="VSN-OFF-A",
@@ -853,20 +873,21 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             db.refresh(vol_c)
             vol_a_id, vol_b_id, vol_c_id = vol_a.id, vol_b.id, vol_c.id
 
-            f_a = create_synthetic_jpeg(self.drive_a / "offline_move_test.jpg")
+            f_a = create_synthetic_jpeg(self.drive_a / "online_move_test.jpg")
             it_a = FileScannerService.process_file(f_a, vol_a)
             db.add(it_a)
             db.commit()
             it_a_id = it_a.id
 
-            # Test direct online physical move via target_volume_id
+            # Online move via target_volume_id succeeds physically
             r_direct = self.client.post(
                 "/actions/move-files",
                 data={"scope": "selected", "selected_ids": [it_a_id], "target_volume_id": str(vol_b_id), "target_subfolder": "DirectSub"},
             )
             self.assertEqual(r_direct.status_code, 200)
+            self.assertTrue((self.drive_b / "DirectSub" / "online_move_test.jpg").exists())
 
-            # Move file to offline volume C -> logically moved in DB immediately and added to pending_file_moves (Rule 4b)
+            # Attempting move to an offline target volume skips without modifying DB location
             r_mv = self.client.post(
                 "/actions/move-files",
                 data={
@@ -877,110 +898,29 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 },
             )
             self.assertEqual(r_mv.status_code, 200)
+            self.assertIn("Pominięto", r_mv.text)
             db.expire_all()
-            it_logical = db.get(MediaItem, it_a_id)
-            self.assertEqual(it_logical.volume_id, vol_c_id)
-            self.assertEqual(it_logical.relative_path, "Planowane_2025/offline_move_test.jpg")
-
-            # Re-targeting an already pending TODO move updates its target
-            self.client.post(
-                "/actions/move-files",
-                data={
-                    "scope": "selected",
-                    "selected_ids": [it_a_id],
-                    "target_volume_id": str(vol_c_id),
-                    "target_subfolder": "Planowane_Zmienione",
-                },
-            )
-
-            # View TODO panel (Rule 4c)
-            r_panel = self.client.get("/actions/todo-panel")
-            self.assertEqual(r_panel.status_code, 200)
-            self.assertIn("Planowane_Zmienione/offline_move_test.jpg", r_panel.text)
-
-            # Test cancellation / rollback (Rule 4d): restores previous location in DB and deletes TODO entry
-            r_rb = self.client.post("/actions/todo-rollback")
-            self.assertEqual(r_rb.status_code, 200)
-            db.expire_all()
-            it_restored = db.get(MediaItem, it_a_id)
-            self.assertEqual(it_restored.volume_id, vol_b_id)
-            self.assertEqual(db.query(PendingFileMove).count(), 0)
-
-            # Empty TODO execution returns status="empty"
-            self.assertEqual(self.client.post("/actions/todo-execute").status_code, 200)
-
-            # Schedule again, then bring Drive C online and execute pairwise move (Rule 4e)
-            self.client.post(
-                "/actions/move-files",
-                data={
-                    "scope": "selected",
-                    "selected_ids": [it_a_id],
-                    "target_volume_id": str(vol_c_id),
-                    "target_subfolder": "Zrealizowane",
-                },
-            )
-            self.drive_c_offline.mkdir(parents=True, exist_ok=True)
-            r_exec = self.client.post("/actions/todo-execute")
-            self.assertEqual(r_exec.status_code, 200)
-            self.assertTrue((self.drive_c_offline / "Zrealizowane" / "offline_move_test.jpg").exists())
-            db.expire_all()
-            self.assertEqual(db.query(PendingFileMove).count(), 0)
-
-            # Test automatic rollback on physical failure (Rule 4d):
-            self.client.post(
-                "/actions/move-files",
-                data={
-                    "scope": "selected",
-                    "selected_ids": [it_a_id],
-                    "target_volume_id": str(vol_a_id),
-                    "target_subfolder": "Powrot",
-                    "force_offline_todo": "true",
-                },
-            )
-            (self.drive_c_offline / "Zrealizowane" / "offline_move_test.jpg").unlink()
-            r_fail_exec = self.client.post("/actions/todo-execute")
-            self.assertEqual(r_fail_exec.status_code, 200)
-            self.assertIn("Przywrócono poprzednie lokalizacje", r_fail_exec.text)
-            db.expire_all()
-            self.assertEqual(db.get(MediaItem, it_a_id).volume_id, vol_c_id)
-            self.assertEqual(db.query(PendingFileMove).count(), 0)
+            it_stay = db.get(MediaItem, it_a_id)
+            self.assertEqual(it_stay.volume_id, vol_b_id)
 
             # Test destination_path branches in /actions/move-files (empty, online, offline drive)
             self.assertIn("Wybierz dysk", self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id]}).text)
-            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": str(self.drive_a / "NowyFolder")})
-            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": "Z:\\OfflineUnregistered"})
+            r_dest_ok = self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": str(self.drive_a / "NowyFolder")})
+            self.assertEqual(r_dest_ok.status_code, 200)
+            self.assertTrue((self.drive_a / "NowyFolder" / "online_move_test.jpg").exists())
+            r_dest_off = self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_a_id], "destination_path": "Z:\\OfflineUnregistered"})
+            self.assertEqual(r_dest_off.status_code, 200)
+            self.assertIn("Offline", r_dest_off.text)
 
-            # Test moving an offline-queued file back to its original physical location (clears pending TODO)
-            vol_z = WindowsVolume(volume_serial_number="VSN-Z", volume_label="Dysk_Z", last_known_drive_letter="Z:\\", is_online=False)
-            db.add(vol_z)
-            db.commit()
-            db.refresh(vol_z)
-            f_b = create_synthetic_jpeg(self.drive_b / "return_test.jpg")
-            it_b = FileScannerService.process_file(f_b, vol_b)
-            db.add(it_b)
-            db.commit()
-            it_b_id = it_b.id
-            self.client.post("/actions/move-files", data={"scope": "selected", "selected_ids": [it_b_id], "destination_path": "Z:\\SubOffline"})
-            # Move back to original location on vol_b with force_offline_todo=True -> removes TODO
-            self.client.post(
-                "/actions/move-files",
-                data={"scope": "selected", "selected_ids": [it_b_id], "target_volume_id": str(vol_b_id), "target_subfolder": "", "force_offline_todo": "true"},
-            )
-
-            # Test physical rollback of already-moved files when 2nd file in pairwise batch fails due to space
-            f_b2 = create_synthetic_jpeg(self.drive_b / "batch_1.jpg")
-            f_b3 = create_synthetic_jpeg(self.drive_b / "batch_2.jpg")
-            it_b2 = FileScannerService.process_file(f_b2, vol_b)
-            it_b3 = FileScannerService.process_file(f_b3, vol_b)
-            db.add_all([it_b2, it_b3])
-            db.commit()
-            self.client.post(
-                "/actions/move-files",
-                data={"scope": "selected", "selected_ids": [it_b2.id, it_b3.id], "target_volume_id": str(vol_a_id), "target_subfolder": "BatchDest", "force_offline_todo": "true"},
-            )
-            with patch.object(StorageAutomationService, "check_volume_free_space", side_effect=[(True, 999999999), (False, 0)]):
-                self.client.post("/actions/todo-execute")
-            self.assertTrue(f_b2.exists(), "First file must be physically rolled back when second file fails!")
+            # Verify TODO UI and endpoints are completely removed
+            r_home = self.client.get("/")
+            self.assertEqual(r_home.status_code, 200)
+            self.assertNotIn("Lista TODO (Offline)", r_home.text)
+            self.assertEqual(self.client.get("/actions/todo-panel").status_code, 404)
+            self.assertEqual(self.client.post("/actions/todo-execute").status_code, 404)
+            self.assertEqual(self.client.post("/actions/todo-rollback").status_code, 404)
+            self.assertEqual(self.client.post("/actions/prepare-offline-report").status_code, 404)
+            self.assertEqual(self.client.get("/actions/download-offline-report").status_code, 404)
 
     # =========================================================================
     # 6. STATUS, BACKGROUND PROCESS CONTROL, GRANULAR AI, SCAN ENDPOINT & LOGS
@@ -2438,15 +2378,11 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIn("Domowe Archiwum Foto", r_docs.text)
 
     # =========================================================================
-    # 9. OFFLINE DISK SPACE PERSISTENCE & PRE-EXECUTION TEXT REPORT
+    # 9. OFFLINE DISK SPACE PERSISTENCE
     # =========================================================================
     def test_offline_space_persistence_and_local_text_report(self):
         with self.TestingSessionLocal() as db:
             svc = StorageAutomationService(db)
-            empty_rep = svc.generate_offline_procedure_report()
-            self.assertIn("Brak zarejestrowanych urządzeń", empty_rep["report_text"])
-            self.assertIn("Lista TODO jest pusta", empty_rep["report_text"])
-
             vol_a = WindowsVolume(
                 volume_serial_number="VSN-REP-A",
                 volume_label="Archiwum_Offline_A",
@@ -2582,19 +2518,6 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             db.add_all([it_orig, it_dup_src, it_dup_extra, it_reloc_orig, it_reloc_copy])
             db.commit()
 
-            todo = PendingFileMove(
-                media_id=it_orig.id,
-                source_volume_id=vol_a.id,
-                source_relative_path="2022/wakacje_offline.jpg",
-                source_file_name="wakacje_offline.jpg",
-                target_volume_id=vol_b.id,
-                target_relative_path="Nowe/wakacje_offline.jpg",
-                target_file_name="wakacje_offline.jpg",
-                status="PENDING",
-            )
-            db.add(todo)
-            db.commit()
-
             # Check sidebar and backup panel display cached offline free space
             r_sb = self.client.get("/media/sidebar")
             self.assertEqual(r_sb.status_code, 200)
@@ -2604,32 +2527,6 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             r_bp = self.client.get("/actions/backup-panel")
             self.assertEqual(r_bp.status_code, 200)
             self.assertIn("120.00 GB", r_bp.text)
-
-            # Prepare offline report for backup panel and todo panel and verify saved .txt file on local disk
-            r_prep_bkp = self.client.post(
-                "/actions/prepare-offline-report",
-                data={"preferred_target_volume_id": str(vol_b.id), "target_panel": "backup"},
-            )
-            self.assertEqual(r_prep_bkp.status_code, 200)
-            self.assertIn("Zapisano raport procedury Offline", r_prep_bkp.text)
-            self.assertIn("[KOPIOWANIE BACKUPU]", r_prep_bkp.text)
-            self.assertIn("[PRZENIESIENIE DO daf_backup/]", r_prep_bkp.text)
-            self.assertIn("[USUNIĘCIE DUPLIKATU]", r_prep_bkp.text)
-            self.assertIn("[PRZENIESIENIE TODO", r_prep_bkp.text)
-
-            latest_txt = self.reports_dir / "raport_procedura_offline_ostatni.txt"
-            self.assertTrue(latest_txt.exists())
-            content = latest_txt.read_text(encoding="utf-8")
-            self.assertIn("Archiwum_Offline_A", content)
-            self.assertIn("wakacje_offline.jpg", content)
-
-            r_prep_todo = self.client.post("/actions/prepare-offline-report", data={"target_panel": "todo"})
-            self.assertEqual(r_prep_todo.status_code, 200)
-            self.assertIn("Zapisano raport zmian Offline", r_prep_todo.text)
-
-            r_dl = self.client.get("/actions/download-offline-report")
-            self.assertEqual(r_dl.status_code, 200)
-            self.assertIn("RAPORT PROCEDURY BACKUPU", r_dl.text)
 
     # =========================================================================
     # 12. QUALITY DEFECT TAGS, ON-DEMAND DUP/UNBACKED, PAIR MODES & UNINDEX JOB
@@ -3012,7 +2909,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 "/actions/analyze-all",
                 data={"analysis_type": "duplicates_fast", "scope": "all_drives", "run_sync": "true"},
             )
-            self.assertIn("Szybka analiza duplikatów", r_df.text)
+            self.assertIn("ORYGINAŁ, BACKUP zielony/pomarańczowy, DUPLIKAT", r_df.text)
 
             r_de = self.client.post(
                 "/actions/analyze-all",
@@ -3089,7 +2986,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 j_dd_stop = ProcessManager.create_job("ai_analysis", "DD Stop", [a1_id])
                 actions_module._run_background_ai_batch(j_dd_stop, [a1_id], analysis_type="date_discrepancy")
 
-            # 6) Backup & Deduplication: parse_pair_keys, pair selection, backup_only vs dedup_only modes
+            # 6) Backup modal has NO duplicates UI/list, supports target volume selection, minimize_transfers, and YYYY/MM/DD
             self.assertIsNone(StorageAutomationService.parse_pair_keys(None))
             self.assertEqual(StorageAutomationService.parse_pair_keys([]), set())
             self.assertEqual(StorageAutomationService.parse_pair_keys([f"{vb_id}:{va_id}"]), {(min(va_id, vb_id), max(va_id, vb_id))})
@@ -3098,53 +2995,53 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             r_bp = self.client.get("/actions/backup-panel")
             self.assertEqual(r_bp.status_code, 200)
             self.assertIn("filterUnbackedBySelectedPairs", r_bp.text)
-            self.assertIn("Zakres operacji", r_bp.text)
-            self.assertIn("Lista duplikatów z wybranych urządzeń", r_bp.text)
-            self.assertIn("duplicate-file-row", r_bp.text)
-            self.assertIn("kopia_wakacje.jpg", r_bp.text)
+            self.assertIn("Brakujące backupy", r_bp.text)
+            self.assertIn("Backupy zielone", r_bp.text)
+            self.assertIn("Backupy pomarańczowe", r_bp.text)
+            self.assertIn("Zminimalizuj przeniesienia", r_bp.text)
+            self.assertIn("Zrób backup", r_bp.text)
+            self.assertNotIn("Lista duplikatów z wybranych urządzeń", r_bp.text)
+            self.assertNotIn("duplicate-file-row", r_bp.text)
 
-            r_off_mode = self.client.post(
-                "/actions/prepare-offline-report",
-                data={
-                    "preferred_target_volume_id": str(vb_id),
-                    "operation_mode": "backup_only",
-                    "pairs_submitted": "1",
-                    "selected_pairs": [pair_ab],
-                    "target_panel": "backup",
-                },
-            )
-            self.assertEqual(r_off_mode.status_code, 200)
-            self.assertIn("Tylko Backup", r_off_mode.text)
-
-            # Execute backup_only ONLY on pair {A, B}: backup created on B, A's duplicate still preserved, C untouched
+            # Execute backup ONLY on pair {A, B}: backup created on B in YYYY/MM/DD, A's duplicate still preserved, C untouched
             r_exec_bkp = self.client.post(
                 "/actions/execute-backup",
                 data={
                     "preferred_target_volume_id": str(vb_id),
-                    "operation_mode": "backup_only",
+                    "target_vols_submitted": "1",
+                    "target_volume_ids": [str(vb_id)],
                     "pairs_submitted": "1",
                     "selected_pairs": [pair_ab],
                 },
             )
             self.assertEqual(r_exec_bkp.status_code, 200)
             self.assertTrue(img_a_dup.exists())
-            self.assertTrue(any((drv_b / "daf_backup").rglob("2023-06-15_wakacje.jpg")))
+            self.assertTrue(any((drv_b / "daf_backup" / "2023" / "06" / "15").rglob("2023-06-15_wakacje.jpg")))
             with self.TestingSessionLocal() as db:
                 svc_chk = StorageAutomationService(db)
                 unbacked_after_ab = svc_chk.detect_files_without_backup(recluster=True)
                 self.assertTrue(any(u.volume_id == vc_id for u in unbacked_after_ab))
 
-            # Now execute dedup_only ONLY on pair {A, B}: redundant same-device duplicate deleted cleanly
-            r_exec_dedup = self.client.post(
-                "/actions/execute-backup",
+            # Now test Duplikaty binarne view + cross-page selection + safe duplicate removal of redundant 3rd copy
+            r_dup_view = self.client.get("/media/search?duplicates_only=true")
+            self.assertEqual(r_dup_view.status_code, 200)
+            self.assertNotIn("Automatyczny Backup i 100% Bezpieczne Usunięcie Duplikatów", r_dup_view.text)
+            self.assertIn("Zaznacz tylko nadmiarowe kopie", r_dup_view.text)
+            self.assertIn("ORYGINAŁ", r_dup_view.text)
+            self.assertIn("DUPLIKAT", r_dup_view.text)
+
+            r_red = self.client.get("/actions/redundant-duplicate-ids?duplicates_only=true")
+            red_ids = r_red.json()["ids"]
+            self.assertTrue(len(red_ids) >= 1)
+            r_del_red = self.client.post(
+                "/actions/delete-permanently",
                 data={
-                    "preferred_target_volume_id": str(vb_id),
-                    "operation_mode": "dedup_only",
-                    "pairs_submitted": "1",
-                    "selected_pairs": [pair_ab],
+                    "scope": "selected",
+                    "duplicates_only": "true",
+                    "selected_ids_json": json.dumps(red_ids),
                 },
             )
-            self.assertEqual(r_exec_dedup.status_code, 200)
+            self.assertEqual(r_del_red.status_code, 200)
             self.assertFalse(img_a_dup.exists())
             self.assertTrue(img_a1.exists())
 
@@ -3632,24 +3529,20 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertIn((min(va_id, vc_id), max(va_id, vc_id)), pair_keys)
             self.assertIn((min(vb_id, vc_id), max(vb_id, vc_id)), pair_keys)
 
-            # Check pair metrics
-            p_bc = next(p for p in plan["ordered_pairs"] if p["pair_key"] == (min(vb_id, vc_id), max(vb_id, vc_id)))
-            self.assertGreaterEqual(p_bc["metrics"]["duplicates_to_delete_count"], 1)
-
+            # Check pair metrics (Kopie lokalne / Kopie zdalne / Nowe kopie / Do albumu Ważne)
+            p_ac_key_str = f"{min(va_id, vc_id)}:{max(va_id, vc_id)}"
             p_ab = next(p for p in plan["ordered_pairs"] if p["pair_key"] == (min(va_id, vb_id), max(va_id, vb_id)))
             self.assertGreaterEqual(p_ab["metrics"]["important_to_assign_count"], 1)
 
-            # Step 2: Build plan restricted to Pair (va, vc)
-            p_ac_key_str = f"{min(va_id, vc_id)}:{max(va_id, vc_id)}"
-            plan_ac = svc.build_backup_and_dedup_plan(selected_pair_keys=[p_ac_key_str])
+            # Step 2: Build plan restricted to Pair (va, vc) targeting vc_id
+            plan_ac = svc.build_backup_and_dedup_plan(
+                selected_pair_keys=[p_ac_key_str],
+                target_volume_ids=[vc_id],
+            )
             p_ac_entry = next(p for p in plan_ac["ordered_pairs"] if p["pair_key_str"] == p_ac_key_str)
             self.assertGreaterEqual(p_ac_entry["metrics"]["important_to_assign_count"], 1)
-            # The unbacked file on Vol A must have copy task scheduled to Vol C
             copy_tasks_ac = p_ac_entry["tasks"]["backups_to_copy"]
             self.assertTrue(any(t["orig_item_id"] == item_a.id and t["dst_vol_id"] == vc_id for t in copy_tasks_ac))
-            # The same-device duplicate on Vol A must be scheduled in Pair (va, vc)
-            dup_tasks_ac = p_ac_entry["tasks"]["duplicates_to_delete"]
-            self.assertTrue(any(t["dup_item_id"] == item_dup2.id for t in dup_tasks_ac))
 
         # Step 3: Test GET /actions/backup-panel with selected_pairs
         r_all = self.client.get("/actions/backup-panel")
@@ -3657,7 +3550,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIn("backup-pair-counts-data", r_all.text)
         self.assertIn("Lista oryginałów dodawanych do albumu „Ważne…”", r_all.text)
 
-        r_filtered = self.client.get(f"/actions/backup-panel?selected_pairs={p_ac_key_str}")
+        r_filtered = self.client.get(f"/actions/backup-panel?target_volume_id={vc_id}&selected_pairs={p_ac_key_str}")
         self.assertEqual(r_filtered.status_code, 200)
         self.assertIn("unbacked_on_a.jpg", r_filtered.text)
         self.assertIn("same_dup1.jpg", r_filtered.text)
@@ -3665,7 +3558,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         # Step 3b: Test POST /actions/backup-panel-tables with selected pairs and empty pairs
         r_tables = self.client.post(
             "/actions/backup-panel-tables",
-            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true"},
+            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "preferred_target_volume_id": str(vc_id)},
         )
         self.assertEqual(r_tables.status_code, 200)
         self.assertIn("unbacked_on_a.jpg", r_tables.text)
@@ -3706,18 +3599,15 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertEqual(len(sampled_d), 10)
         self.assertEqual(_balanced_sample_duplicates([], max_total=10), [])
 
-        # Step 4: Test prepare offline report with selected pair
-        r_report = self.client.post(
-            "/actions/prepare-offline-report",
-            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "operation_mode": "both"},
-        )
-        self.assertEqual(r_report.status_code, 200)
-        self.assertIn("Zapisano raport procedury Offline", r_report.text)
-
-        # Step 5: Test execute backup restricted to pair (va, vc)
+        # Step 4: Execute backup restricted to pair (va, vc) targeting vc_id
         r_exec = self.client.post(
             "/actions/execute-backup",
-            data={"selected_pairs": [p_ac_key_str], "pairs_submitted": "true", "operation_mode": "both"},
+            data={
+                "selected_pairs": [p_ac_key_str],
+                "pairs_submitted": "true",
+                "target_vols_submitted": "1",
+                "target_volume_ids": [str(vc_id)],
+            },
         )
         self.assertEqual(r_exec.status_code, 200)
         self.assertIn("Raport wykonania Backupu", r_exec.text)
@@ -3739,15 +3629,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         )
         self.assertEqual(r_new_drive.status_code, 200)
 
-        # Step 7: Test downloading offline report when file is missing
-        latest_file = self.reports_dir / "raport_procedura_offline_ostatni.txt"
-        if latest_file.exists():
-            latest_file.unlink()
-        r_dl = self.client.get("/actions/download-offline-report")
-        self.assertEqual(r_dl.status_code, 200)
-        self.assertTrue(latest_file.exists())
-
-        # Step 8: Test cluster where all copies have is_backup_copy=True and relocation candidate
+        # Step 7: Test cluster where all copies have is_backup_copy=True and relocation candidate
         with self.TestingSessionLocal() as db:
             all_bkp1 = MediaItem(
                 id=str(uuid.uuid4()),
@@ -3818,22 +3700,459 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             p_ab = next(p for p in plan_reloc["ordered_pairs"] if p["pair_key"] == p_ab_key)
             self.assertGreaterEqual(p_ab["metrics"]["backups_to_relocate_count"], 1)
 
-            # Test backup filename collision (while dest_path.exists())
-            sub_m = item_a.effective_date.strftime("%Y/%Y-%m")
-            col_target = drive_c / "daf_backup" / sub_m / item_a.file_name
+            # Test backup filename collision (while dest_path.exists()) in YYYY/MM/DD structure
+            sub_d = item_a.effective_date.strftime("%Y/%m/%d")
+            col_target = drive_c / "daf_backup" / sub_d / item_a.file_name
             col_target.parent.mkdir(parents=True, exist_ok=True)
             col_target.write_bytes(b"existing_file")
 
             res_bkp_only = svc.execute_backup_and_deduplication(
-                operation_mode="backup_only",
                 selected_pair_keys=[p_ac_key_str],
+                target_volume_ids=[vc_id],
             )
             self.assertIn("backups_created", res_bkp_only)
-            res_dedup_only = svc.execute_backup_and_deduplication(
-                operation_mode="dedup_only",
-                selected_pair_keys=[p_ac_key_str],
+
+    # =========================================================================
+    # 15. CLUSTER ROLES (GREEN/ORANGE BACKUP), SAFE DUP REMOVAL, BACKUP TARGETS & MOVE BACKUPS
+    # =========================================================================
+    def test_new_duplicate_tags_backup_target_selection_and_move_backups(self):
+        drive_c = self.root / "DriveC_Dedicated"
+        drive_c.mkdir(parents=True, exist_ok=True)
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-NEW-A",
+                volume_label="Dysk_Zrodlo_A",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=10 * 1024**3,
             )
-            self.assertIn("duplicates_deleted", res_dedup_only)
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-NEW-B",
+                volume_label="Dysk_B",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=15 * 1024**3,
+            )
+            vol_c = WindowsVolume(
+                volume_serial_number="VSN-NEW-C",
+                volume_label="Dysk_Dedykowany_Backup_C",
+                last_known_drive_letter=str(drive_c),
+                is_online=True,
+                total_space_bytes=500 * 1024**3,
+                free_space_bytes=450 * 1024**3,
+            )
+            db.add_all([vol_a, vol_b, vol_c])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_c)
+            va_id, vb_id, vc_id = vol_a.id, vol_b.id, vol_c.id
+
+            # Cluster 1 (1 item): Missing backup -> ORYGINAL
+            p_missing = create_synthetic_jpeg(self.drive_a / "only_one.jpg", color=(10, 20, 30))
+
+            # Cluster 2 (2 items, same device A): ORYGINAL + pomaranczowy BACKUP
+            p_orange_1 = create_synthetic_jpeg(self.drive_a / "orange_1.jpg", color=(40, 50, 60))
+            p_orange_2 = self.drive_a / "orange_2.jpg"
+            p_orange_2.write_bytes(p_orange_1.read_bytes())
+
+            # Cluster 3 (2 items, cross device A and B outside daf_backup): ORYGINAL + zielony BACKUP
+            p_green_1 = create_synthetic_jpeg(self.drive_a / "green_1.jpg", color=(70, 80, 90))
+            p_green_2 = self.drive_b / "loose_bkp" / "green_2.jpg"
+            p_green_2.parent.mkdir(parents=True, exist_ok=True)
+            p_green_2.write_bytes(p_green_1.read_bytes())
+
+            # Cluster 4 (3 items on A: A1, A2, A3): ORYGINAL + pomaranczowy BACKUP + czerwony DUPLIKAT
+            p_trip_1 = create_synthetic_jpeg(self.drive_a / "trip_1.jpg", color=(110, 120, 130))
+            p_trip_2 = self.drive_a / "trip_2.jpg"
+            p_trip_3 = self.drive_a / "trip_3.jpg"
+            p_trip_2.write_bytes(p_trip_1.read_bytes())
+            p_trip_3.write_bytes(p_trip_1.read_bytes())
+
+            it_missing = FileScannerService.process_file(p_missing, vol_a)
+            it_or1 = FileScannerService.process_file(p_orange_1, vol_a)
+            it_or2 = FileScannerService.process_file(p_orange_2, vol_a)
+            it_gr1 = FileScannerService.process_file(p_green_1, vol_a)
+            it_gr2 = FileScannerService.process_file(p_green_2, vol_b)
+            it_tr1 = FileScannerService.process_file(p_trip_1, vol_a)
+            it_tr2 = FileScannerService.process_file(p_trip_2, vol_a)
+            it_tr3 = FileScannerService.process_file(p_trip_3, vol_a)
+            db.add_all([it_missing, it_or1, it_or2, it_gr1, it_gr2, it_tr1, it_tr2, it_tr3])
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            svc.flag_duplicate_clusters()
+            db.expire_all()
+
+            # Verify cluster 1..4 roles
+            self.assertEqual(db.get(MediaItem, it_missing.id).duplicate_role, "original")
+            self.assertEqual(db.get(MediaItem, it_or1.id).duplicate_role, "original")
+            self.assertEqual(db.get(MediaItem, it_or2.id).duplicate_role, "backup_orange")
+            self.assertEqual(db.get(MediaItem, it_gr1.id).duplicate_role, "original")
+            self.assertEqual(db.get(MediaItem, it_gr2.id).duplicate_role, "backup_green")
+            self.assertEqual(db.get(MediaItem, it_tr1.id).duplicate_role, "original")
+            self.assertEqual(db.get(MediaItem, it_tr2.id).duplicate_role, "backup_orange")
+            self.assertEqual(db.get(MediaItem, it_tr3.id).duplicate_role, "duplicate")
+
+            # Stats sum invariant: missing(1) + green(1) + orange(2) == total_unique(4)
+            # Mock disk_usage per drive path so Drive C's 450 GB capacity beats Drive B's 15 GB cleanly
+            def _mock_usage(path_arg):
+                s = str(path_arg)
+                if "DriveC_Dedicated" in s:
+                    return shutil._ntuple_diskusage(500 * 1024**3, 50 * 1024**3, 450 * 1024**3)
+                if "DriveB" in s:
+                    return shutil._ntuple_diskusage(50 * 1024**3, 35 * 1024**3, 15 * 1024**3)
+                return shutil._ntuple_diskusage(50 * 1024**3, 40 * 1024**3, 10 * 1024**3)
+
+            with patch("app.storage_ops.shutil.disk_usage", side_effect=_mock_usage):
+                plan_default = svc.build_backup_and_dedup_plan()
+                st = plan_default["stats"]
+                self.assertEqual(st["missing_backups"] + st["green_backups"] + st["orange_backups"], st["total_unique"])
+                self.assertEqual(st["total_unique"], 4)
+                # Default target drive automatically picks empty/dedicated largest Drive C!
+                self.assertEqual(plan_default["default_target_volume_ids"], [vc_id])
+
+                # When minimize_transfers=False, green BACKUP on B (non-target) is scheduled for remote move onto Drive C!
+                plan_consol = svc.build_backup_and_dedup_plan(minimize_transfers=False)
+                self.assertTrue(any(r["backup_item_id"] == it_gr2.id and r["dst_vol_id"] == vc_id for r in plan_consol["remote_move_rows"]))
+
+            # Test Refresh Duplicate Tags endpoint
+            r_ref = self.client.post("/actions/refresh-duplicate-tags")
+            self.assertEqual(r_ref.status_code, 200)
+            self.assertIn("ORYGINAŁ, BACKUP (zielony/pomarańczowy), DUPLIKAT", r_ref.text)
+
+            # Safety Gate: Trying to delete Original or sole Backup (or when duplicates_only=True) must be BLOCKED
+            r_blk = self.client.post(
+                "/actions/move-to-trash",
+                data={"scope": "selected", "duplicates_only": "true", "selected_ids": [it_or2.id]},
+            )
+            self.assertEqual(r_blk.status_code, 200)
+            self.assertIn("Zablokowano", r_blk.text)
+            self.assertTrue(p_orange_2.exists())
+
+            # Test Safe Duplicate Removal on 3rd copy (to Kosz) when Volume A is online, and Offline prompt when Volume is offline
+            r_ok_tr = self.client.post(
+                "/actions/move-to-trash",
+                data={"scope": "selected", "duplicates_only": "true", "selected_ids": [it_tr3.id]},
+            )
+            self.assertEqual(r_ok_tr.status_code, 200)
+            self.assertFalse(p_trip_3.exists())
+
+            # Simulate an offline volume holding a duplicate -> must prompt user to connect the offline disk
+            vol_a_db = db.get(WindowsVolume, va_id)
+            p_trip_3_offline = self.drive_a / "trip_4_off.jpg"
+            p_trip_3_offline.write_bytes(p_trip_1.read_bytes())
+            it_tr4 = FileScannerService.process_file(p_trip_3_offline, vol_a_db)
+            db.add(it_tr4)
+            db.commit()
+            svc.flag_duplicate_clusters()
+            vol_a_db.is_online = False
+            vol_a_db.last_known_drive_letter = "Z:\\OfflineMissing\\"
+            db.commit()
+
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"VSN-NEW-B": (str(self.drive_b), "Dysk_B"), "VSN-NEW-C": (str(drive_c), "Dysk_Dedykowany_Backup_C")}):
+                r_off_dup = self.client.post(
+                    "/actions/delete-permanently",
+                    data={"scope": "selected", "duplicates_only": "true", "selected_ids": [it_tr4.id]},
+                )
+                self.assertEqual(r_off_dup.status_code, 200)
+                self.assertIn("Podłącz kolejny dysk", r_off_dup.text)
+                self.assertIn("Kontynuuj na podłączonym dysku", r_off_dup.text)
+
+            # Restore Volume A online & run backup onto Drive C (minimize_transfers=True -> green_2 relocated on B, new copies go to C)
+            vol_a_db.is_online = True
+            vol_a_db.last_known_drive_letter = str(self.drive_a)
+            db.commit()
+
+            r_exec_c = self.client.post(
+                "/actions/execute-backup",
+                data={
+                    "target_vols_submitted": "1",
+                    "target_volume_ids": [str(vc_id)],
+                    "minimize_submitted": "1",
+                    "minimize_transfers": "true",
+                },
+            )
+            self.assertEqual(r_exec_c.status_code, 200)
+            self.assertTrue(any((drive_c / "daf_backup").rglob("only_one.jpg")))
+            self.assertTrue(any((self.drive_b / "daf_backup").rglob("green_2.jpg")))
+
+            # Test duplicate verification fail block & collision rehash during execute_safe_duplicate_removal
+            db.expire_all()
+            with patch.object(FastHasher, "verify_files_identical_100_percent", return_value=(False, "SimDupMismatch", None)):
+                res_vf_dup = svc.execute_safe_duplicate_removal(
+                    [it_tr4.id], delete_mode="trash", force_duplicate_verification=True,
+                    trash_dir=self.root / "kosz", thumbnails_dir=self.thumbs_dir,
+                )
+                self.assertEqual(res_vf_dup["blocked_verify"], 1, res_vf_dup)
+
+            # Reset it_tr4 hash and safely delete it while Drive A is online
+            it_tr4_re = db.get(MediaItem, it_tr4.id)
+            it_tr4_re.file_hash = db.get(MediaItem, it_tr1.id).file_hash
+            db.commit()
+            svc.flag_duplicate_clusters()
+            res_ok_perm = svc.execute_safe_duplicate_removal(
+                [it_tr4.id], delete_mode="permanent", force_duplicate_verification=True,
+                trash_dir=self.root / "kosz", thumbnails_dir=self.thumbs_dir,
+            )
+            self.assertEqual(res_ok_perm["processed_count"], 1)
+
+            # Test execute_safe_duplicate_removal with empty item_ids
+            res_empty_rem = svc.execute_safe_duplicate_removal(["nonexistent-id"])
+            self.assertEqual(res_empty_rem["processed_count"], 0)
+
+            # Test POST /actions/backup-panel recalculation with minimize_transfers=False and recalc_pairs=true
+            r_recalc = self.client.post(
+                "/actions/backup-panel",
+                data={
+                    "target_vols_submitted": "1",
+                    "target_volume_ids": [str(vc_id)],
+                    "minimize_submitted": "1",
+                    "recalc_pairs": "true",
+                },
+            )
+            self.assertEqual(r_recalc.status_code, 200)
+
+            # Test New Feature 2c: Move Backups Between Devices (Move green_2 from B -> C, blocked if target holds Original!)
+            r_mv_panel = self.client.post(
+                "/actions/move-backups-panel",
+                data={"source_volume_id": str(vb_id), "target_volume_id": str(vc_id)},
+            )
+            self.assertEqual(r_mv_panel.status_code, 200)
+            self.assertIn("green_2.jpg", r_mv_panel.text)
+
+            # Trying to move backups from B -> A (which holds green_1 Original!) MUST block green_2 due to same-device rule!
+            r_mv_blocked = self.client.post(
+                "/actions/move-backups-panel",
+                data={"source_volume_id": str(vb_id), "target_volume_id": str(va_id)},
+            )
+            self.assertEqual(r_mv_blocked.status_code, 200)
+            self.assertIn("Pominięto (zasada różnych dysków)", r_mv_blocked.text)
+
+            # Edge cases for execute_move_backups: same drive, empty movable, offline drive
+            self.assertEqual(svc.execute_move_backups(vb_id, vb_id)["status"], "error")
+            self.assertEqual(svc.execute_move_backups(vb_id, va_id)["status"], "empty")
+            vol_c_db = db.get(WindowsVolume, vc_id)
+            vol_c_db.is_online = False
+            vol_c_db.last_known_drive_letter = "Z:\\OfflineC\\"
+            db.commit()
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"VSN-NEW-A": (str(self.drive_a), "Dysk_Zrodlo_A"), "VSN-NEW-B": (str(self.drive_b), "Dysk_B")}):
+                self.assertEqual(svc.execute_move_backups(vb_id, vc_id)["status"], "offline")
+            vol_c_db.is_online = True
+            vol_c_db.last_known_drive_letter = str(drive_c)
+            db.commit()
+
+            # Executing move B -> C succeeds with 100% verification!
+            r_mv_exec = self.client.post(
+                "/actions/execute-move-backups",
+                data={"source_volume_id": str(vb_id), "target_volume_id": str(vc_id)},
+            )
+            self.assertEqual(r_mv_exec.status_code, 200)
+            self.assertIn("Przeniesiono backupów", r_mv_exec.text)
+            self.assertTrue(any((drive_c / "daf_backup").rglob("green_2.jpg")))
+            self.assertFalse(any((self.drive_b / "daf_backup").rglob("green_2.jpg")))
+
+            # Now test remote backup consolidation (minimize_transfers=False) via /actions/execute-backup
+            p_rem_orig = create_synthetic_jpeg(self.drive_a / "remote_consol.jpg", color=(150, 60, 20))
+            p_rem_bkp = self.drive_b / "daf_backup" / "2024" / "01" / "01" / "remote_consol.jpg"
+            p_rem_bkp.parent.mkdir(parents=True, exist_ok=True)
+            p_rem_bkp.write_bytes(p_rem_orig.read_bytes())
+            it_rem_o = FileScannerService.process_file(p_rem_orig, vol_a_db)
+            it_rem_b = FileScannerService.process_file(p_rem_bkp, db.get(WindowsVolume, vb_id))
+            db.add_all([it_rem_o, it_rem_b])
+            db.commit()
+
+            r_exec_consol = self.client.post(
+                "/actions/execute-backup",
+                data={
+                    "target_vols_submitted": "1",
+                    "target_volume_ids": [str(vc_id)],
+                    "minimize_submitted": "1",
+                },
+            )
+            self.assertEqual(r_exec_consol.status_code, 200)
+            self.assertTrue(any((drive_c / "daf_backup").rglob("remote_consol.jpg")))
+            self.assertFalse(p_rem_bkp.exists())
+
+            # Also verify duplicate view in all 3 modes (table, compact, grid) + detail modal
+            self.assertEqual(self.client.get("/media/search?duplicates_only=true&view_mode=table").status_code, 200)
+            self.assertEqual(self.client.get("/media/search?duplicates_only=true&view_mode=compact").status_code, 200)
+            self.assertEqual(self.client.get(f"/media/{it_tr1.id}/detail").status_code, 200)
+
+    def test_followup_features_green_original_device_stats_active_pairs_and_async_dup_delete(self):
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from app.routers import actions as actions_router
+
+        drive_c = self.root / "DriveC"
+        drive_c.mkdir(parents=True, exist_ok=True)
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-FU-A",
+                volume_label="DiskA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-FU-B",
+                volume_label="DiskB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=30 * 1024**3,
+            )
+            vol_c = WindowsVolume(
+                volume_serial_number="VSN-FU-C",
+                volume_label="DiskC",
+                last_known_drive_letter=str(drive_c),
+                is_online=True,
+                total_space_bytes=500 * 1024**3,
+                free_space_bytes=450 * 1024**3,
+            )
+            db.add_all([vol_a, vol_b, vol_c])
+            db.commit()
+            for v in (vol_a, vol_b, vol_c):
+                db.refresh(v)
+
+            # Photo 1: Original on A + Vault copy in B/daf_backup/ + Redundant duplicate on A -> Green ORYGINAL!
+            p1_o = create_synthetic_jpeg(self.drive_a / "vault_backed.jpg", color=(25, 180, 90))
+            p1_v = self.drive_b / "daf_backup" / "2024" / "05" / "10" / "vault_backed.jpg"
+            p1_v.parent.mkdir(parents=True, exist_ok=True)
+            p1_v.write_bytes(p1_o.read_bytes())
+            p1_d = self.drive_a / "vault_backed_extra.jpg"
+            p1_d.write_bytes(p1_o.read_bytes())
+
+            # Photo 2: Original on A + Redundant same-disk copy (no daf_backup/) -> Blue ORYGINAL + Orange BACKUP!
+            p2_o = create_synthetic_jpeg(self.drive_a / "no_vault.jpg", color=(210, 40, 40))
+            p2_b = self.drive_a / "no_vault_copy.jpg"
+            p2_b.write_bytes(p2_o.read_bytes())
+
+            # Photo 3: Original on A + Green copy outside daf_backup/ on B (for per-vol reloc_green counter)
+            p3_o = create_synthetic_jpeg(self.drive_a / "outside_bkp.jpg", color=(60, 70, 200))
+            p3_b = self.drive_b / "outside_bkp_copy.jpg"
+            p3_b.write_bytes(p3_o.read_bytes())
+
+            items = [
+                FileScannerService.process_file(p1_o, vol_a),
+                FileScannerService.process_file(p1_v, vol_b),
+                FileScannerService.process_file(p1_d, vol_a),
+                FileScannerService.process_file(p2_o, vol_a),
+                FileScannerService.process_file(p2_b, vol_a),
+                FileScannerService.process_file(p3_o, vol_a),
+                FileScannerService.process_file(p3_b, vol_b),
+            ]
+            db.add_all(items)
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            svc.flag_duplicate_clusters()
+
+            # Req 1: daf_backup/ hidden from gallery, but ORYGINAL turns green for p1_o and stays blue for p2_o
+            for vmode in ("grid", "table", "compact"):
+                r_dup = self.client.get(f"/media/search?duplicates_only=true&view_mode={vmode}")
+                self.assertEqual(r_dup.status_code, 200)
+                self.assertNotIn("daf_backup/2024/05/10/vault_backed.jpg", r_dup.text)
+                self.assertIn("bg-emerald-600", r_dup.text)
+                self.assertIn("bg-sky-700", r_dup.text)
+                self.assertIn("DiskB", r_dup.text)
+            r_det = self.client.get(f"/media/{items[0].id}/detail")
+            self.assertEqual(r_det.status_code, 200)
+            self.assertIn("ORYGINAŁ ✓", r_det.text)
+
+            # Req 3: Per-volume backup counts (valid in daf_backup/, reloc_green, reloc_orange)
+            plan = svc.build_backup_and_dedup_plan(target_volume_ids=[vol_c.id], minimize_transfers=True)
+            vsum_a = plan["volume_space_summary"][vol_a.id]
+            vsum_b = plan["volume_space_summary"][vol_b.id]
+            self.assertEqual(vsum_a["bkp_reloc_orange_count"], 1)
+            self.assertEqual(vsum_b["bkp_valid_in_vault_count"], 1)
+            self.assertEqual(vsum_b["bkp_reloc_green_count"], 1)
+
+            # Req 4 & 5: Backup panel shows only scheduled active pairs, shows per-drive backup breakdown,
+            # and omits the "Przygotuj procedurę Offline" button. When A<->C has work, B<->C has 0 work -> hidden!
+            def _mock_disk_usage(path_str):
+                s = str(path_str)
+                if "DriveC" in s:
+                    return SimpleNamespace(total=500 * 1024**3, used=50 * 1024**3, free=450 * 1024**3)
+                if "DriveB" in s:
+                    return SimpleNamespace(total=100 * 1024**3, used=70 * 1024**3, free=30 * 1024**3)
+                return SimpleNamespace(total=100 * 1024**3, used=60 * 1024**3, free=40 * 1024**3)
+
+            with patch("app.storage_ops.shutil.disk_usage", side_effect=_mock_disk_usage), \
+                 patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={
+                     "VSN-FU-A": (str(self.drive_a), "DiskA"),
+                     "VSN-FU-B": (str(self.drive_b), "DiskB"),
+                     "VSN-FU-C": (str(drive_c), "DiskC"),
+                 }):
+                r_bp = self.client.get("/actions/backup-panel")
+                self.assertEqual(r_bp.status_code, 200)
+                self.assertIn("Prawidłowe (w <code>daf_backup/</code>):", r_bp.text)
+                self.assertIn("zielone:", r_bp.text)
+                self.assertIn("pomarańczowe:", r_bp.text)
+                self.assertNotIn("Przygotuj procedurę Offline i zapisz raport (.txt)", r_bp.text)
+                # DiskB <-> DiskC has 0 ops and 0 important albums -> must NOT appear in Harmonogram!
+                self.assertNotIn("DiskB", [p["vol_a"].volume_label for p in plan["scheduled_pairs"] if p["vol_b"].id == vol_c.id])
+                self.assertNotIn(f'value="{vol_b.id}:{vol_c.id}"', r_bp.text)
+
+                # Req 2 (Bug): Async permanent duplicate deletion returns live polling progress bar & finishes cleanly
+                it_dup_extra = db.get(MediaItem, items[2].id)
+                self.assertEqual(it_dup_extra.duplicate_role, "duplicate")
+                r_async_del = self.client.post(
+                    "/actions/delete-permanently",
+                    headers={"HX-Request": "true"},
+                    data={"scope": "selected", "selected_ids": [it_dup_extra.id], "duplicates_only": "true"},
+                )
+                self.assertEqual(r_async_del.status_code, 200)
+                self.assertTrue(
+                    ("/actions/dup-delete-status" in r_async_del.text) or ("Trwale usunięto z dysku" in r_async_del.text)
+                )
+                for _ in range(100):
+                    if not actions_router.DUP_DELETE_STATE["running"]:
+                        break
+                    time.sleep(0.05)
+                r_poll = self.client.get("/actions/dup-delete-status")
+                self.assertEqual(r_poll.status_code, 200)
+                self.assertIn("Trwale usunięto z dysku", r_poll.text)
+                self.assertFalse(p1_d.exists())
+                self.assertTrue(p1_o.exists())
+                self.assertTrue(p1_v.exists())
+
+                # Test stop endpoint works without error
+                r_stop = self.client.post("/actions/dup-delete-stop")
+                self.assertEqual(r_stop.status_code, 200)
+
+                # Verify huge (>1.2MB / >33k IDs) selected_ids_json does NOT hit 400 Bad Request or SQLite 32766 limit
+                # and verify live status panel includes Etap banner when DUP_DELETE_STATE is running
+                p1_d2 = self.drive_a / "vault_backed_extra2.jpg"
+                p1_d2.write_bytes(p1_o.read_bytes())
+                it_extra2 = FileScannerService.process_file(p1_d2, vol_a)
+                db.add(it_extra2)
+                db.commit()
+                svc.flag_duplicate_clusters()
+                huge_ids = [it_extra2.id] + [f"00000000-0000-0000-0000-{i:012d}" for i in range(36000)]
+                r_huge = self.client.post(
+                    "/actions/delete-permanently",
+                    headers={"HX-Request": "true"},
+                    data={
+                        "scope": "selected",
+                        "selected_ids_json": json.dumps(huge_ids),
+                        "duplicates_only": "true",
+                    },
+                )
+                self.assertEqual(r_huge.status_code, 200)
+                r_st_panel = self.client.get("/actions/status-panel")
+                self.assertEqual(r_st_panel.status_code, 200)
+                self.assertIn("status-panel-root", r_st_panel.text)
+                for _ in range(100):
+                    if not actions_router.DUP_DELETE_STATE["running"]:
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(p1_d2.exists())
 
 
 if __name__ == "__main__":

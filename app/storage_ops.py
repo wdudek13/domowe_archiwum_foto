@@ -4,13 +4,13 @@ import logging
 from pathlib import Path
 import re
 import shutil
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sqlalchemy import select, text, update, delete, func
 from sqlalchemy.orm import Session, joinedload
 
 from app.backup import BackupManager
 import app.database as db_module
-from app.models import MediaItem, WindowsVolume, MediaGroup, PendingFileMove
+from app.models import MediaItem, WindowsVolume, MediaGroup
 from app.operation_log import OperationLogger
 from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 
@@ -100,12 +100,15 @@ class StorageAutomationService:
 
     def flag_duplicate_clusters(self) -> int:
         """
-        Marks primary vs duplicate records across all items in SQLite.
-        Rule 1d & 2d:
-        - Copies in 'backup/' folder are marked is_backup_copy = 1.
-        - Primary original (is_primary_duplicate = 1) prefers non-backup copies on a volume that already
-          has multiple non-backup copies (so the original on that volume is eligible for the 'Ważne' album),
-          breaking ties by oldest effective_date and id.
+        Marks primary vs backup vs duplicate roles across all non-trashed items in SQLite.
+        Cluster rules:
+        - Copies in 'daf_backup/' (or legacy 'backup/') are flagged is_backup_copy = 1.
+        - 1st item in cluster: duplicate_role = 'original', is_primary_duplicate = 1.
+          Prefers non-backup copies on a volume that already has multiple non-backup copies
+          (eligible for album 'Ważne'), breaking ties by oldest effective_date, relative_path, id.
+        - 2nd item in cluster: duplicate_role = 'backup_green' (on different device than Original,
+          preferring copies already in daf_backup/) OR 'backup_orange' (on same device as Original).
+        - 3rd+ item in cluster: duplicate_role = 'duplicate', is_primary_duplicate = 0.
         """
         mark_backup_sql = text("""
             UPDATE media_items
@@ -122,6 +125,7 @@ class StorageAutomationService:
                 SELECT
                     id,
                     file_hash,
+                    volume_id,
                     is_backup_copy,
                     effective_date,
                     relative_path,
@@ -129,24 +133,62 @@ class StorageAutomationService:
                 FROM media_items
                 WHERE is_trashed = 0
             ),
-            ranked AS (
+            orig_ranked AS (
                 SELECT
                     id,
+                    file_hash,
+                    volume_id,
+                    is_backup_copy,
+                    effective_date,
+                    relative_path,
                     ROW_NUMBER() OVER (
                         PARTITION BY file_hash
                         ORDER BY is_backup_copy ASC, same_vol_cnt DESC, effective_date ASC, relative_path ASC, id ASC
-                    ) AS rn
+                    ) AS orig_rn,
+                    FIRST_VALUE(volume_id) OVER (
+                        PARTITION BY file_hash
+                        ORDER BY is_backup_copy ASC, same_vol_cnt DESC, effective_date ASC, relative_path ASC, id ASC
+                    ) AS orig_vol_id
                 FROM vol_counts
+            ),
+            role_ranked AS (
+                SELECT
+                    id,
+                    volume_id,
+                    orig_vol_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY file_hash
+                        ORDER BY
+                            (CASE WHEN orig_rn = 1 THEN 0 WHEN volume_id != orig_vol_id THEN 1 ELSE 2 END) ASC,
+                            is_backup_copy DESC,
+                            effective_date ASC,
+                            relative_path ASC,
+                            id ASC
+                    ) AS final_rn
+                FROM orig_ranked
+            ),
+            computed AS (
+                SELECT
+                    id,
+                    CASE WHEN final_rn = 1 THEN 1 ELSE 0 END AS new_primary,
+                    CASE
+                        WHEN final_rn = 1 THEN 'original'
+                        WHEN final_rn = 2 AND volume_id != orig_vol_id THEN 'backup_green'
+                        WHEN final_rn = 2 THEN 'backup_orange'
+                        ELSE 'duplicate'
+                    END AS new_role
+                FROM role_ranked
             )
             UPDATE media_items
-            SET is_primary_duplicate = CASE
-                WHEN id IN (SELECT id FROM ranked WHERE rn = 1) THEN 1
-                ELSE 0
-            END
-            WHERE is_trashed = 0;
+            SET
+                is_primary_duplicate = computed.new_primary,
+                duplicate_role = computed.new_role
+            FROM computed
+            WHERE media_items.id = computed.id;
         """)
         self.db.execute(rank_sql)
         self.db.commit()
+        self.db.expire_all()
         dup_count = (
             self.db.scalar(
                 select(func.count(MediaItem.id)).where(
@@ -343,12 +385,13 @@ class StorageAutomationService:
 
     def ensure_important_album_hierarchy(self, item: MediaItem, vol_label: str) -> MediaGroup:
         """
-        Ensures album 'Ważne - <vol_label>' -> '<YYYY>' -> '<YYYY-MM>' exists
-        and assigns item.group_id to the month subalbum (Requirement 2b & 2d).
+        Ensures album 'Ważne - <vol_label>' -> '<YYYY>' -> '<MM>' -> '<DD>' exists
+        and assigns item.group_id to the day subalbum (Requirement 2b).
         """
         root_name = f"Ważne - {vol_label}"
         yr_name = str(item.effective_date.year)
-        mo_name = item.effective_date.strftime("%Y-%m")
+        mo_name = item.effective_date.strftime("%m")
+        day_name = item.effective_date.strftime("%d")
 
         root_grp = self.db.scalar(
             select(MediaGroup).where(MediaGroup.name == root_name, MediaGroup.parent_id.is_(None), MediaGroup.is_trashed == False)
@@ -374,8 +417,16 @@ class StorageAutomationService:
             self.db.add(mo_grp)
             self.db.flush()
 
-        item.group_id = mo_grp.id
-        return mo_grp
+        day_grp = self.db.scalar(
+            select(MediaGroup).where(MediaGroup.name == day_name, MediaGroup.parent_id == mo_grp.id, MediaGroup.is_trashed == False)
+        )
+        if not day_grp:
+            day_grp = MediaGroup(name=day_name, parent_id=mo_grp.id)
+            self.db.add(day_grp)
+            self.db.flush()
+
+        item.group_id = day_grp.id
+        return day_grp
 
     def detect_files_without_backup(self, recluster: bool = True) -> List[MediaItem]:
         """
@@ -428,18 +479,25 @@ class StorageAutomationService:
         self,
         preferred_target_volume_id: Optional[int] = None,
         selected_pair_keys: Optional[List[str]] = None,
+        target_volume_ids: Optional[List[int]] = None,
+        minimize_transfers: bool = True,
+        include_dedup: bool = False,
     ) -> Dict[str, Any]:
         """
-        Analyzes the entire database to build a pairwise device execution plan and offline capacity balance for:
-        1) Assigning Originals with same-device duplicates to 'Ważne - <device>' -> YYYY -> YYYY-MM (Rule 2b, 2d).
-        2) Creating missing backups in 'backup/' folder on a DIFFERENT device than Original (Rule 1a, 1d, 1g).
-        3) Removing all extra duplicate copies after 100% multi-layer verification so only [1 Original + 1 Backup] remain (Rule 1e, 1f).
-        4) Grouping all file operations by unordered volume pairs {V_a, V_b} so each connected pair is processed bidirectionally once (Rule 1h).
+        Analyzes the database to build the Backup plan and capacity projection:
+        1) Computes exact cluster stats: missing + green_backups + orange_backups == total_unique.
+        2) Selects default target backup devices with minimal originals and sufficient capacity.
+        3) Plans:
+           - Kopie lokalne (green BACKUP moved into daf_backup/YYYY/MM/DD on the same device),
+           - Kopie zdalne (when minimize_transfers=False, consolidating backups onto minimal backup drives),
+           - Nowe kopie (missing & orange backups copied from Original to target daf_backup/YYYY/MM/DD),
+           - Do albumu 'Ważne - <device>' -> YYYY -> MM -> DD (Originals with same-device copies).
         """
         self.refresh_volumes_online_status()
         self.flag_duplicate_clusters()
 
         volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        groups_by_id = {g.id: g for g in self.db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all()}
         all_items = list(
             self.db.scalars(
                 select(MediaItem)
@@ -460,19 +518,164 @@ class StorageAutomationService:
 
         selected_pairs_set: Optional[Set[Tuple[int, int]]] = self.parse_pair_keys(selected_pair_keys)
 
-        reclaimed_bytes_by_vol: Dict[int, int] = defaultdict(int)
+        def is_in_important_album(item: MediaItem, vol_label: str) -> bool:
+            if not item.group_id or item.group_id not in groups_by_id:
+                return False
+            parts: List[str] = []
+            curr = groups_by_id.get(item.group_id)
+            depth = 0
+            while curr and depth < 6:
+                parts.append(curr.name)
+                curr = groups_by_id.get(curr.parent_id) if curr.parent_id else None
+                depth += 1
+            parts.reverse()
+            expected = [
+                f"Ważne - {vol_label}",
+                str(item.effective_date.year),
+                item.effective_date.strftime("%m"),
+                item.effective_date.strftime("%d"),
+            ]
+            return parts == expected
+
+        # Pre-pass: inspect every cluster for stats, originals per volume, and backup state
+        total_unique_count = len(by_hash)
+        missing_backup_count = 0
+        green_backup_count = 0
+        green_in_vault_count = 0
+        green_outside_vault_count = 0
+        orange_backup_count = 0
+        orig_count_by_vol: Dict[int, int] = defaultdict(int)
+        backup_count_by_vol: Dict[int, int] = defaultdict(int)
+        backup_bytes_by_vol: Dict[int, int] = defaultdict(int)
+        bkp_valid_in_vault_by_vol: Dict[int, int] = defaultdict(int)
+        bkp_reloc_green_by_vol: Dict[int, int] = defaultdict(int)
+        bkp_reloc_orange_by_vol: Dict[int, int] = defaultdict(int)
+        needed_bytes_from_vol: Dict[int, int] = defaultdict(int)
+
+        cluster_infos: List[Dict[str, Any]] = []
+        for fhash, cluster in by_hash.items():
+            best_orig = next((x for x in cluster if x.duplicate_role == "original"), None)
+            if best_orig is None:
+                best_orig = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
+            orig_count_by_vol[best_orig.volume_id] += 1
+
+            same_vol_non_bkp_cnt = sum(
+                1 for x in cluster if x.volume_id == best_orig.volume_id and not x.is_backup_copy
+            )
+
+            other_vol_copies = [x for x in cluster if x.volume_id != best_orig.volume_id and x.id != best_orig.id]
+            same_vol_other_copies = [x for x in cluster if x.volume_id == best_orig.volume_id and x.id != best_orig.id]
+
+            for x in cluster:
+                if x.id == best_orig.id:
+                    continue
+                if x.is_backup_copy or x.duplicate_role in ("backup_green", "backup_orange"):
+                    backup_count_by_vol[x.volume_id] += 1
+                    backup_bytes_by_vol[x.volume_id] += int(x.file_size_bytes or 0)
+                    if x.is_backup_copy and x.volume_id != best_orig.volume_id:
+                        bkp_valid_in_vault_by_vol[x.volume_id] += 1
+                    elif x.volume_id != best_orig.volume_id:
+                        bkp_reloc_green_by_vol[x.volume_id] += 1
+                    else:
+                        bkp_reloc_orange_by_vol[x.volume_id] += 1
+
+            if other_vol_copies:
+                green_backup_count += 1
+                if any(x.is_backup_copy for x in other_vol_copies):
+                    green_in_vault_count += 1
+                else:
+                    green_outside_vault_count += 1
+            elif same_vol_other_copies:
+                orange_backup_count += 1
+                needed_bytes_from_vol[best_orig.volume_id] += int(best_orig.file_size_bytes or 0)
+            else:
+                missing_backup_count += 1
+                needed_bytes_from_vol[best_orig.volume_id] += int(best_orig.file_size_bytes or 0)
+
+            cluster_infos.append(
+                {
+                    "hash": fhash,
+                    "cluster": cluster,
+                    "orig": best_orig,
+                    "same_vol_non_bkp_cnt": same_vol_non_bkp_cnt,
+                    "other_vol_copies": other_vol_copies,
+                    "has_green": bool(other_vol_copies),
+                }
+            )
+
+        # Default target backup drive selection: minimal originals & sufficient capacity
+        ranked_target_vols = sorted(
+            volumes.values(),
+            key=lambda v: (
+                orig_count_by_vol.get(v.id, 0),
+                -int(v.free_space_bytes or 0),
+                not v.is_online,
+                v.id,
+            ),
+        )
+        default_target_ids: List[int] = []
+        if ranked_target_vols:
+            if len(ranked_target_vols) == 1:
+                default_target_ids = [ranked_target_vols[0].id]
+            else:
+                chosen_set: Set[int] = set()
+                for cand_v in ranked_target_vols:
+                    chosen_set.add(cand_v.id)
+                    default_target_ids.append(cand_v.id)
+                    # Required bytes from drives outside chosen_set
+                    req_outside = sum(
+                        needed_bytes_from_vol.get(vid, 0)
+                        for vid in volumes if vid not in chosen_set
+                    )
+                    if not minimize_transfers:
+                        req_outside += sum(
+                            int(cinfo["orig"].file_size_bytes or 0)
+                            for cinfo in cluster_infos
+                            if cinfo["has_green"] and all(x.volume_id not in chosen_set for x in cinfo["other_vol_copies"])
+                        )
+                    known_chosen_cap = any(
+                        (int(volumes[cid].total_space_bytes or 0) > 0 or int(volumes[cid].free_space_bytes or 0) > 0)
+                        for cid in chosen_set
+                    )
+                    avail_chosen = sum(
+                        max(0, int(volumes[cid].free_space_bytes or 0) - self.MIN_FREE_SPACE_BUFFER_BYTES)
+                        for cid in chosen_set
+                    )
+                    # Stop adding more drives once chosen capacity suffices and (dedicated drive or covers external originals)
+                    if (not known_chosen_cap or avail_chosen >= req_outside):
+                        break
+
+        if target_volume_ids is not None:
+            effective_target_ids = [vid for vid in target_volume_ids if vid in volumes]
+        elif preferred_target_volume_id and preferred_target_volume_id in volumes:
+            effective_target_ids = [preferred_target_volume_id]
+        else:
+            effective_target_ids = list(default_target_ids)
+        effective_target_set: Set[int] = set(effective_target_ids)
+
+        freed_bytes_by_vol: Dict[int, int] = defaultdict(int)
         required_bytes_by_vol: Dict[int, int] = defaultdict(int)
 
-        def pick_backup_volume(src_vol_id: int) -> Optional[WindowsVolume]:
+        def vol_has_known_cap(vid: int) -> bool:
+            v = volumes.get(vid)
+            return bool(v and (int(v.total_space_bytes or 0) > 0 or int(v.free_space_bytes or 0) > 0))
+
+        def vol_avail_free(vid: int) -> int:
+            v = volumes.get(vid)
+            if not v:
+                return 0
+            return int(v.free_space_bytes or 0) + freed_bytes_by_vol.get(vid, 0) - required_bytes_by_vol.get(vid, 0)
+
+        def pick_backup_volume(src_vol_id: int, file_size: int, respect_pair_selection: bool = False) -> Optional[WindowsVolume]:
             candidates: List[WindowsVolume] = []
-            for cand in volumes.values():
-                if cand.id == src_vol_id:
+            for vid in effective_target_ids:
+                if vid == src_vol_id:
                     continue
-                if selected_pairs_set is not None:
-                    pk = (min(src_vol_id, cand.id), max(src_vol_id, cand.id))
+                if respect_pair_selection and selected_pairs_set is not None:
+                    pk = (min(src_vol_id, vid), max(src_vol_id, vid))
                     if pk not in selected_pairs_set:
                         continue
-                candidates.append(cand)
+                candidates.append(volumes[vid])
 
             if not candidates:
                 return None
@@ -480,20 +683,35 @@ class StorageAutomationService:
             if preferred_target_volume_id and any(c.id == preferred_target_volume_id for c in candidates):
                 return volumes[preferred_target_volume_id]
 
+            def fits(v: WindowsVolume) -> bool:
+                if not vol_has_known_cap(v.id):
+                    return True
+                return (vol_avail_free(v.id) - file_size) >= self.MIN_FREE_SPACE_BUFFER_BYTES
+
             candidates.sort(
                 key=lambda c: (
+                    not fits(c),
+                    orig_count_by_vol.get(c.id, 0),
                     not c.is_online,
-                    -(int(c.free_space_bytes or 0) + reclaimed_bytes_by_vol.get(c.id, 0) - required_bytes_by_vol.get(c.id, 0)),
+                    -vol_avail_free(c.id),
                     c.id,
                 )
             )
             return candidates[0]
 
         pair_tasks: Dict[Tuple[int, int], Dict[str, List[Dict[str, Any]]]] = defaultdict(
-            lambda: {"backups_to_copy": [], "backups_to_relocate": [], "duplicates_to_delete": []}
+            lambda: {
+                "backups_to_copy": [],
+                "backups_to_relocate": [],
+                "backups_remote_move": [],
+                "duplicates_to_delete": [],
+            }
         )
         pair_metrics: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(
             lambda: {
+                "local_copies_count": 0,
+                "remote_copies_count": 0,
+                "new_copies_count": 0,
                 "backups_to_copy_count": 0,
                 "backups_to_relocate_count": 0,
                 "duplicates_to_delete_count": 0,
@@ -504,151 +722,152 @@ class StorageAutomationService:
         unbacked_items: List[MediaItem] = []
         unbacked_pair_map: Dict[str, str] = {}
         unbacked_pair_keys_str: Dict[str, str] = {}
+        local_reloc_rows: List[Dict[str, Any]] = []
+        remote_move_rows: List[Dict[str, Any]] = []
+        unassigned_unbacked_by_vol: Dict[int, int] = defaultdict(int)
         unbacked_count = 0
         unbacked_count_by_vol: Dict[int, int] = defaultdict(int)
+        unbacked_count_by_pair: Dict[str, int] = defaultdict(int)
+        local_reloc_by_pair: Dict[str, int] = defaultdict(int)
+        remote_move_by_pair: Dict[str, int] = defaultdict(int)
         cross_dup_by_pair: Dict[str, int] = defaultdict(int)
         same_vol_dup_by_vol: Dict[int, int] = defaultdict(int)
-        redundant_duplicates_count = 0
+        redundant_duplicates_count = sum(1 for it in all_items if it.duplicate_role == "duplicate")
         single_device_warning = len(volumes) < 2
 
-        for fhash, cluster in by_hash.items():
-            non_backup_by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
-            for it in cluster:
-                if not it.is_backup_copy:
-                    non_backup_by_vol[it.volume_id].append(it)
-
-            best_orig: Optional[MediaItem] = None
-            best_vol_dup_cnt = -1
-            for vid, v_items in non_backup_by_vol.items():
-                if len(v_items) > best_vol_dup_cnt:
-                    best_vol_dup_cnt = len(v_items)
-                    best_orig = v_items[0]
-            if best_orig is None:
-                best_orig = cluster[0]
-
+        for cinfo in cluster_infos:
+            cluster = cinfo["cluster"]
+            best_orig: MediaItem = cinfo["orig"]
             orig_vol = volumes.get(best_orig.volume_id)
-            if best_vol_dup_cnt >= 2 and orig_vol:
+            fsize = int(best_orig.file_size_bytes or 0)
+
+            if cinfo["same_vol_non_bkp_cnt"] >= 2 and orig_vol and not is_in_important_album(best_orig, orig_vol.volume_label or ""):
                 important_candidates.append((best_orig, orig_vol))
 
-            other_vol_copies = [x for x in cluster if x.volume_id != best_orig.volume_id and x.id != best_orig.id]
-            chosen_backup: Optional[MediaItem] = None
-            if other_vol_copies:
-                other_vol_copies.sort(
-                    key=lambda x: (not x.is_backup_copy, not volumes[x.volume_id].is_online if x.volume_id in volumes else True, x.id)
-                )
-                chosen_backup = other_vol_copies[0]
+            other_vol_copies = sorted(
+                cinfo["other_vol_copies"],
+                key=lambda x: (
+                    not x.is_backup_copy,
+                    x.volume_id not in effective_target_set,
+                    not volumes[x.volume_id].is_online if x.volume_id in volumes else True,
+                    x.id,
+                ),
+            )
+            chosen_backup: Optional[MediaItem] = other_vol_copies[0] if other_vol_copies else None
 
-            # Compute pair_metrics for all possible pairs
-            for (va, vb) in all_possible_pairs:
-                if chosen_backup is None:
-                    if best_orig.volume_id == va or best_orig.volume_id == vb:
-                        pair_metrics[(va, vb)]["backups_to_copy_count"] += 1
-                else:
-                    pair_k = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
-                    if (va, vb) == pair_k and not chosen_backup.is_backup_copy:
-                        pair_metrics[(va, vb)]["backups_to_relocate_count"] += 1
-
-                for item in cluster:
-                    if item.id == best_orig.id:
-                        continue
-                    if chosen_backup and item.id == chosen_backup.id:
-                        continue
-                    if item.volume_id != best_orig.volume_id:
-                        p_k = (min(best_orig.volume_id, item.volume_id), max(best_orig.volume_id, item.volume_id))
-                        if (va, vb) == p_k:
-                            pair_metrics[(va, vb)]["duplicates_to_delete_count"] += 1
-                    else:
-                        if best_orig.volume_id in (va, vb):
-                            pair_metrics[(va, vb)]["duplicates_to_delete_count"] += 1
-
-            target_vol: Optional[WindowsVolume] = None
             if chosen_backup is None:
                 unbacked_count += 1
                 unbacked_items.append(best_orig)
                 unbacked_count_by_vol[best_orig.volume_id] += 1
-                eligible_pks = [
-                    f"{min(best_orig.volume_id, vo)}:{max(best_orig.volume_id, vo)}"
-                    for vo in volumes if vo != best_orig.volume_id
-                ]
-                pks_str = ",".join(eligible_pks)
-                unbacked_pair_map[best_orig.id] = pks_str
-                unbacked_pair_keys_str[best_orig.id] = pks_str
 
-                target_vol = pick_backup_volume(best_orig.volume_id)
+                # Pick target backup drive (first honoring selected_pairs_set if set, else overall)
+                target_vol = pick_backup_volume(best_orig.volume_id, fsize, respect_pair_selection=False)
+                if selected_pairs_set is not None and target_vol is not None:
+                    pk_check = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
+                    if pk_check not in selected_pairs_set:
+                        alt_vol = pick_backup_volume(best_orig.volume_id, fsize, respect_pair_selection=True)
+                        if alt_vol is not None:
+                            target_vol = alt_vol
+
                 if target_vol:
                     pair_key = (min(best_orig.volume_id, target_vol.id), max(best_orig.volume_id, target_vol.id))
-                    dst_rel = f"{self.BACKUP_DIR_NAME}/{best_orig.effective_date.strftime('%Y/%Y-%m')}/{best_orig.file_name}"
-                    required_bytes_by_vol[target_vol.id] += int(best_orig.file_size_bytes or 0)
+                    pk_str = f"{pair_key[0]}:{pair_key[1]}"
+                    unbacked_pair_map[best_orig.id] = pk_str
+                    unbacked_pair_keys_str[best_orig.id] = pk_str
+                    unbacked_count_by_pair[pk_str] += 1
+                    pair_metrics[pair_key]["new_copies_count"] += 1
+                    pair_metrics[pair_key]["backups_to_copy_count"] += 1
+
+                    dst_rel = f"{self.BACKUP_DIR_NAME}/{best_orig.effective_date.strftime('%Y/%m/%d')}/{best_orig.file_name}"
+                    if selected_pairs_set is None or pair_key in selected_pairs_set:
+                        required_bytes_by_vol[target_vol.id] += fsize
                     pair_tasks[pair_key]["backups_to_copy"].append(
                         {
                             "orig_item_id": best_orig.id,
                             "src_vol_id": best_orig.volume_id,
                             "dst_vol_id": target_vol.id,
-                            "file_size": best_orig.file_size_bytes,
+                            "file_size": fsize,
                             "file_name": best_orig.file_name,
                             "src_relative_path": best_orig.relative_path,
                             "dst_relative_path": dst_rel,
                             "file_hash": best_orig.file_hash,
                         }
                     )
-            else:
-                pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
-                if (selected_pairs_set is None or pair_key in selected_pairs_set) and not chosen_backup.is_backup_copy:
-                    dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%Y-%m')}/{chosen_backup.file_name}"
-                    pair_tasks[pair_key]["backups_to_relocate"].append(
-                        {
-                            "backup_item_id": chosen_backup.id,
-                            "vol_id": chosen_backup.volume_id,
-                            "file_name": chosen_backup.file_name,
-                            "file_size": chosen_backup.file_size_bytes,
-                            "src_relative_path": chosen_backup.relative_path,
-                            "dst_relative_path": dst_rel,
-                        }
-                    )
-
-            for item in cluster:
-                if item.id == best_orig.id:
-                    continue
-                if chosen_backup and item.id == chosen_backup.id:
-                    continue
-                redundant_duplicates_count += 1
-                ref_vol_id = best_orig.volume_id
-                if item.volume_id != ref_vol_id:
-                    pair_key = (min(ref_vol_id, item.volume_id), max(ref_vol_id, item.volume_id))
-                    cross_dup_by_pair[f"{pair_key[0]}:{pair_key[1]}"] += 1
                 else:
-                    same_vol_dup_by_vol[item.volume_id] += 1
-                    partner_vid = None
-                    if target_vol and target_vol.id != ref_vol_id:
-                        partner_vid = target_vol.id
-                    elif chosen_backup and chosen_backup.volume_id != ref_vol_id:
-                        partner_vid = chosen_backup.volume_id
-                    else:
-                        cand_list = selected_pairs_set if selected_pairs_set is not None else all_possible_pairs
-                        for cand_p in cand_list:
-                            if ref_vol_id in cand_p:
-                                partner_vid = cand_p[1] if cand_p[0] == ref_vol_id else cand_p[0]
-                                break
-                    if partner_vid is not None:
-                        pair_key = (min(ref_vol_id, partner_vid), max(ref_vol_id, partner_vid))
-                    else:
-                        pair_key = (ref_vol_id, item.volume_id)
+                    unassigned_unbacked_by_vol[best_orig.volume_id] += 1
+            else:
+                # Cluster already has a Green BACKUP on another device (chosen_backup)
+                should_consolidate_remotely = (not minimize_transfers) and (chosen_backup.volume_id not in effective_target_set)
+                remote_target_vol = None
+                if should_consolidate_remotely:
+                    # Pick a target volume != best_orig.volume_id (also != chosen_backup.volume_id)
+                    cands_rem = [
+                        volumes[vid] for vid in effective_target_ids
+                        if vid != best_orig.volume_id and vid != chosen_backup.volume_id
+                    ]
+                    if cands_rem:
+                        cands_rem.sort(
+                            key=lambda c: (
+                                vol_has_known_cap(c.id) and ((vol_avail_free(c.id) - fsize) < self.MIN_FREE_SPACE_BUFFER_BYTES),
+                                orig_count_by_vol.get(c.id, 0),
+                                not c.is_online,
+                                -vol_avail_free(c.id),
+                                c.id,
+                            )
+                        )
+                        remote_target_vol = cands_rem[0]
 
-                if selected_pairs_set is None or pair_key in selected_pairs_set:
-                    reclaimed_bytes_by_vol[item.volume_id] += int(item.file_size_bytes or 0)
-                    pair_tasks[pair_key]["duplicates_to_delete"].append(
-                        {
-                            "dup_item_id": item.id,
-                            "dup_vol_id": item.volume_id,
-                            "ref_item_id": best_orig.id,
-                            "ref_vol_id": best_orig.volume_id,
-                            "backup_item_id": chosen_backup.id if chosen_backup else None,
-                            "file_name": item.file_name,
-                            "file_size": item.file_size_bytes,
-                            "dup_relative_path": item.relative_path,
-                            "ref_relative_path": best_orig.relative_path,
-                        }
+                if remote_target_vol is not None:
+                    pair_key = (
+                        min(chosen_backup.volume_id, remote_target_vol.id),
+                        max(chosen_backup.volume_id, remote_target_vol.id),
                     )
+                    pk_str = f"{pair_key[0]}:{pair_key[1]}"
+                    src_v = volumes.get(chosen_backup.volume_id)
+                    dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
+                    pair_metrics[pair_key]["remote_copies_count"] += 1
+                    remote_move_by_pair[pk_str] += 1
+                    if selected_pairs_set is None or pair_key in selected_pairs_set:
+                        freed_bytes_by_vol[chosen_backup.volume_id] += int(chosen_backup.file_size_bytes or 0)
+                        required_bytes_by_vol[remote_target_vol.id] += int(chosen_backup.file_size_bytes or 0)
+                    task_obj = {
+                        "backup_item_id": chosen_backup.id,
+                        "src_vol_id": chosen_backup.volume_id,
+                        "dst_vol_id": remote_target_vol.id,
+                        "src_vol_label": src_v.volume_label if src_v else "?",
+                        "src_vol_letter": src_v.last_known_drive_letter if src_v else "?",
+                        "dst_vol_label": remote_target_vol.volume_label,
+                        "dst_vol_letter": remote_target_vol.last_known_drive_letter,
+                        "file_name": chosen_backup.file_name,
+                        "file_size": int(chosen_backup.file_size_bytes or 0),
+                        "src_relative_path": chosen_backup.relative_path,
+                        "dst_relative_path": dst_rel,
+                        "pair_key_str": pk_str,
+                    }
+                    remote_move_rows.append(task_obj)
+                    pair_tasks[pair_key]["backups_remote_move"].append(task_obj)
+                elif not chosen_backup.is_backup_copy:
+                    # Green BACKUP outside daf_backup/ stays on its device -> Kopie lokalne
+                    pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                    pk_str = f"{pair_key[0]}:{pair_key[1]}"
+                    b_vol = volumes.get(chosen_backup.volume_id)
+                    dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
+                    pair_metrics[pair_key]["local_copies_count"] += 1
+                    pair_metrics[pair_key]["backups_to_relocate_count"] += 1
+                    local_reloc_by_pair[pk_str] += 1
+                    reloc_obj = {
+                        "backup_item_id": chosen_backup.id,
+                        "vol_id": chosen_backup.volume_id,
+                        "vol_label": b_vol.volume_label if b_vol else "?",
+                        "vol_letter": b_vol.last_known_drive_letter if b_vol else "?",
+                        "file_name": chosen_backup.file_name,
+                        "file_size": int(chosen_backup.file_size_bytes or 0),
+                        "src_relative_path": chosen_backup.relative_path,
+                        "dst_relative_path": dst_rel,
+                        "pair_key_str": pk_str,
+                    }
+                    local_reloc_rows.append(reloc_obj)
+                    pair_tasks[pair_key]["backups_to_relocate"].append(reloc_obj)
 
         important_count_by_vol: Dict[int, int] = defaultdict(int)
         for orig_item, orig_vol in important_candidates:
@@ -674,20 +893,22 @@ class StorageAutomationService:
                     "vol_label": orig_vol.volume_label,
                     "vol_letter": orig_vol.last_known_drive_letter,
                     "relative_path": orig_item.relative_path,
-                    "target_album": f"Ważne - {orig_vol.volume_label} / {orig_item.effective_date.strftime('%Y / %Y-%m')}",
+                    "target_album": f"Ważne - {orig_vol.volume_label} / {orig_item.effective_date.strftime('%Y / %m / %d')}",
                     "pair_keys": eligible_pks,
                     "pair_keys_str": ",".join(eligible_pks),
                 }
             )
 
         volume_space_summary: Dict[int, Dict[str, Any]] = {}
+        space_problems: List[str] = []
         for vid, v in volumes.items():
             known_free = int(v.free_space_bytes or 0)
             known_total = int(v.total_space_bytes or 0)
             has_known = known_total > 0 or known_free > 0
-            reclaimed = reclaimed_bytes_by_vol.get(vid, 0)
+            reclaimed = freed_bytes_by_vol.get(vid, 0)
             required = required_bytes_by_vol.get(vid, 0)
             projected = known_free + reclaimed - required
+            space_ok = (not has_known) or (projected >= self.MIN_FREE_SPACE_BUFFER_BYTES) or (required == 0)
             volume_space_summary[vid] = {
                 "volume": v,
                 "known_free_bytes": known_free,
@@ -696,8 +917,30 @@ class StorageAutomationService:
                 "reclaimed_bytes": reclaimed,
                 "required_bytes": required,
                 "projected_free_bytes": projected,
-                "space_ok": (not has_known) or (projected >= self.MIN_FREE_SPACE_BUFFER_BYTES),
+                "space_ok": space_ok,
+                "orig_count": orig_count_by_vol.get(vid, 0),
+                "backup_count": backup_count_by_vol.get(vid, 0),
+                "backup_bytes": backup_bytes_by_vol.get(vid, 0),
+                "bkp_valid_in_vault_count": bkp_valid_in_vault_by_vol.get(vid, 0),
+                "bkp_reloc_green_count": bkp_reloc_green_by_vol.get(vid, 0),
+                "bkp_reloc_orange_count": bkp_reloc_orange_by_vol.get(vid, 0),
             }
+            if not space_ok and required > 0:
+                deficit_mb = max(0.0, (self.MIN_FREE_SPACE_BUFFER_BYTES - projected) / (1024 * 1024))
+                space_problems.append(
+                    f"Brak miejsca na dysku docelowym {v.volume_label} ({v.last_known_drive_letter}): "
+                    f"wymagane {required / (1024*1024):.1f} MB, zabraknie ok. {deficit_mb:.1f} MB."
+                )
+
+        if not effective_target_ids and len(volumes) >= 2:
+            space_problems.append("Nie wybrano żadnego urządzenia docelowego do backupu — zaznacz co najmniej jeden dysk powyżej.")
+        for src_vid, cnt in unassigned_unbacked_by_vol.items():
+            sv = volumes.get(src_vid)
+            if sv and cnt > 0 and effective_target_ids:
+                space_problems.append(
+                    f"{cnt} plików bez backupu z dysku {sv.volume_label} ({sv.last_known_drive_letter}) "
+                    f"nie ma innego wybranego dysku docelowego (zaznacz dodatkowy dysk jako docelowy, aby wykonać ich kopię)."
+                )
 
         ordered_pairs = []
         for (va_id, vb_id) in all_possible_pairs:
@@ -710,8 +953,9 @@ class StorageAutomationService:
             total_ops = (
                 len(tasks["backups_to_copy"])
                 + len(tasks["backups_to_relocate"])
-                + len(tasks["duplicates_to_delete"])
+                + len(tasks["backups_remote_move"])
             )
+            has_work = (total_ops + metrics["important_to_assign_count"]) > 0
             ordered_pairs.append(
                 {
                     "pair_key": (va_id, vb_id),
@@ -722,68 +966,48 @@ class StorageAutomationService:
                     "one_online": one_online,
                     "tasks": tasks,
                     "total_ops": total_ops,
+                    "has_work": has_work,
                     "metrics": metrics,
                 }
             )
 
-        ordered_pairs.sort(key=lambda p: (not p["both_online"], not p["one_online"], p["pair_key"]))
-
-        duplicate_rows: List[Dict[str, Any]] = []
-        for fhash, cluster in by_hash.items():
-            if len(cluster) <= 1:
-                continue
-            primary = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
-            other_vol_copies = [x for x in cluster if x.volume_id != primary.volume_id and x.id != primary.id]
-            chosen_backup = other_vol_copies[0] if other_vol_copies else None
-
-            for item in cluster:
-                if item.id == primary.id:
-                    continue
-                if chosen_backup and item.id == chosen_backup.id:
-                    continue
-                dup_v = volumes.get(item.volume_id)
-                ref_v = volumes.get(primary.volume_id)
-                if item.volume_id != primary.volume_id:
-                    p_keys = [f"{min(primary.volume_id, item.volume_id)}:{max(primary.volume_id, item.volume_id)}"]
-                    p_key_str = p_keys[0]
-                else:
-                    p_keys = [f"{min(item.volume_id, vo)}:{max(item.volume_id, vo)}" for vo in volumes if vo != item.volume_id]
-                    p_key_str = p_keys[0] if p_keys else f"{item.volume_id}:0"
-
-                duplicate_rows.append(
-                    {
-                        "pair_key_str": p_key_str,
-                        "pair_keys": p_keys,
-                        "pair_keys_str": ",".join(p_keys),
-                        "dup_item_id": item.id,
-                        "file_name": item.file_name,
-                        "file_size": int(item.file_size_bytes or 0),
-                        "dup_vol_id": item.volume_id,
-                        "dup_vol_label": dup_v.volume_label if dup_v else "?",
-                        "dup_vol_letter": dup_v.last_known_drive_letter if dup_v else "?",
-                        "dup_relative_path": item.relative_path,
-                        "ref_vol_id": primary.volume_id,
-                        "ref_vol_label": ref_v.volume_label if ref_v else "?",
-                        "ref_vol_letter": ref_v.last_known_drive_letter if ref_v else "?",
-                        "ref_relative_path": primary.relative_path,
-                    }
-                )
+        ordered_pairs.sort(key=lambda p: (not p["has_work"], not p["both_online"], not p["one_online"], p["pair_key"]))
 
         return {
             "volumes": volumes,
             "volume_space_summary": volume_space_summary,
+            "space_problems": space_problems,
+            "default_target_volume_ids": default_target_ids,
+            "effective_target_volume_ids": effective_target_ids,
+            "minimize_transfers": bool(minimize_transfers),
+            "stats": {
+                "total_unique": total_unique_count,
+                "missing_backups": missing_backup_count,
+                "green_backups": green_backup_count,
+                "green_in_vault": green_in_vault_count,
+                "green_outside_vault": green_outside_vault_count,
+                "orange_backups": orange_backup_count,
+                "total_files": len(all_items),
+                "redundant_duplicates": redundant_duplicates_count,
+            },
             "important_candidates": important_candidates,
             "important_rows": important_rows,
             "important_count_by_vol": dict(important_count_by_vol),
             "ordered_pairs": ordered_pairs,
-            "duplicate_rows": duplicate_rows,
+            "scheduled_pairs": [p for p in ordered_pairs if p["has_work"]],
+            "duplicate_rows": [],
             "unbacked_items": unbacked_items,
             "unbacked_pair_map": unbacked_pair_map,
             "unbacked_pair_keys_str": unbacked_pair_keys_str,
+            "local_reloc_rows": local_reloc_rows,
+            "remote_move_rows": remote_move_rows,
             "unbacked_count": unbacked_count,
             "redundant_duplicates_count": redundant_duplicates_count,
             "single_device_warning": single_device_warning,
             "unbacked_count_by_vol": dict(unbacked_count_by_vol),
+            "unbacked_count_by_pair": dict(unbacked_count_by_pair),
+            "local_reloc_by_pair": dict(local_reloc_by_pair),
+            "remote_move_by_pair": dict(remote_move_by_pair),
             "cross_dup_by_pair": dict(cross_dup_by_pair),
             "same_vol_dup_by_vol": dict(same_vol_dup_by_vol),
         }
@@ -792,31 +1016,34 @@ class StorageAutomationService:
         self,
         preferred_target_volume_id: Optional[int] = None,
         job_id: Optional[int] = None,
-        operation_mode: str = "both",
+        operation_mode: str = "backup_only",
         selected_pair_keys: Optional[List[str]] = None,
+        target_volume_ids: Optional[List[int]] = None,
+        minimize_transfers: bool = True,
     ) -> Dict[str, Any]:
         """
-        Executes the automated backup and 100%-verified deduplication workflow:
-        - Supports operation_mode: 'both', 'backup_only', or 'dedup_only'.
-        - Supports filtering execution strictly to user-selected volume pairs (selected_pair_keys).
-        - Processes currently ONLINE selected volume pairs {V_a, V_b} bidirectionally (A->B and B->A).
-        - Verifies 100% identity (size, SHA-256, BLAKE2b, MD5, byte-by-byte stream, image decode) before deleting any duplicate.
+        Executes the automated Backup workflow for selected volume pairs and target drives:
+        1) Assigns Originals with same-device duplicates to 'Ważne - <device>' -> YYYY -> MM -> DD.
+        2) Local relocations (Kopie lokalne): moves green BACKUPs into daf_backup/YYYY/MM/DD on the same drive.
+        3) Remote moves (Kopie zdalne): moves green BACKUPs onto chosen minimal backup drives (100% verified).
+        4) New copies (Nowe kopie): copies unbacked / orange Originals to target daf_backup/YYYY/MM/DD (100% verified).
+        Prompts user to connect offline drives for any remaining pending pairs.
         """
         from app.operation_log import ProcessManager
+        import uuid
 
-        norm_mode = operation_mode if operation_mode in ("both", "backup_only", "dedup_only") else "both"
-        do_backup = norm_mode in ("both", "backup_only")
-        do_dedup = norm_mode in ("both", "dedup_only")
         selected_pairs_set = self.parse_pair_keys(selected_pair_keys)
 
-        self.backup_mgr.create_backup("pre_auto_backup_dedup")
+        self.backup_mgr.create_backup("pre_auto_backup")
         plan = self.build_backup_and_dedup_plan(
             preferred_target_volume_id=preferred_target_volume_id,
             selected_pair_keys=selected_pair_keys,
+            target_volume_ids=target_volume_ids,
+            minimize_transfers=minimize_transfers,
         )
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
 
-        # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> YYYY-MM (Rule 2b, 2d)
+        # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> MM -> DD
         important_assigned = 0
         active_vols = {v for p in selected_pairs_set for v in p} if selected_pairs_set is not None else None
         for orig_item, orig_vol in plan["important_candidates"]:
@@ -829,7 +1056,7 @@ class StorageAutomationService:
 
         backups_created = 0
         backups_relocated = 0
-        duplicates_deleted = 0
+        backups_remote_moved = 0
         verification_blocks = 0
         skipped_unselected_pairs = 0
         space_warnings: List[str] = []
@@ -848,195 +1075,192 @@ class StorageAutomationService:
             vb: Optional[WindowsVolume] = pair_entry["vol_b"]
             tasks = pair_entry["tasks"]
 
+            # Local relocations on an online volume can succeed even if the partner volume is offline
+            local_done_in_pair = 0
+            for reloc_task in tasks["backups_to_relocate"]:
+                bkp_item = self.db.get(MediaItem, reloc_task["backup_item_id"])
+                bkp_vol = volumes.get(reloc_task["vol_id"])
+                if not bkp_item or not bkp_vol or not bkp_vol.is_online:
+                    continue
+                vol_root = Path(bkp_vol.last_known_drive_letter)
+                curr_path = vol_root / bkp_item.relative_path
+                if not curr_path.exists():
+                    continue
+                sub_day = bkp_item.effective_date.strftime("%Y/%m/%d")
+                target_bkp_dir = vol_root / self.BACKUP_DIR_NAME / sub_day
+                target_bkp_dir.mkdir(parents=True, exist_ok=True)
+                target_bkp_path = target_bkp_dir / bkp_item.file_name
+                if curr_path.resolve() != target_bkp_path.resolve():
+                    c = 1
+                    while target_bkp_path.exists():
+                        target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
+                        c += 1
+                    shutil.move(str(curr_path), str(target_bkp_path))
+                    bkp_item.file_name = target_bkp_path.name
+                    bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
+                bkp_item.is_backup_copy = True
+                bkp_item.is_primary_duplicate = False
+                bkp_item.duplicate_role = "backup_green"
+                backups_relocated += 1
+                local_done_in_pair += 1
+
+            has_cross_work = bool(tasks["backups_to_copy"] or tasks["backups_remote_move"])
             if not (va and vb and va.is_online and vb.is_online):
-                pending_offline_pairs.append(pair_entry)
+                if has_cross_work or (len(tasks["backups_to_relocate"]) > local_done_in_pair):
+                    pending_offline_pairs.append(pair_entry)
+                if local_done_in_pair > 0:
+                    self.db.commit()
                 continue
 
-            # Map newly created backup items by original item ID so same-pass deduplication knows backup is ready
-            created_backup_by_orig: Dict[str, MediaItem] = {}
-
-            # 2A: Bidirectional backup copying (Va -> Vb\backup and Vb -> Va\backup)
-            if do_backup:
-                for copy_task in tasks["backups_to_copy"]:
-                    if job_id and ProcessManager.is_stop_requested(job_id):
-                        break
-                    orig_item = self.db.get(MediaItem, copy_task["orig_item_id"])
-                    src_vol = volumes.get(copy_task["src_vol_id"])
-                    dst_vol = volumes.get(copy_task["dst_vol_id"])
-                    if not orig_item or not src_vol or not dst_vol:
-                        continue
-
-                    src_path = Path(src_vol.last_known_drive_letter) / orig_item.relative_path
-                    if not src_path.exists():
-                        continue
-
-                    has_space, free_bytes = self.check_volume_free_space(
-                        dst_vol.last_known_drive_letter, orig_item.file_size_bytes
+            # Cross-device Remote Moves (Kopie zdalne) with 100% verification
+            for rmove in tasks["backups_remote_move"]:
+                if job_id and ProcessManager.is_stop_requested(job_id):
+                    break
+                bkp_item = self.db.get(MediaItem, rmove["backup_item_id"])
+                src_vol = volumes.get(rmove["src_vol_id"])
+                dst_vol = volumes.get(rmove["dst_vol_id"])
+                if not bkp_item or not src_vol or not dst_vol or not src_vol.is_online or not dst_vol.is_online:
+                    continue
+                src_path = Path(src_vol.last_known_drive_letter) / bkp_item.relative_path
+                if not src_path.exists():
+                    continue
+                has_space, free_bytes = self.check_volume_free_space(
+                    dst_vol.last_known_drive_letter, bkp_item.file_size_bytes
+                )
+                if not has_space:
+                    space_warnings.append(
+                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_vol.last_known_drive_letter}): "
+                        f"wymagane {bkp_item.file_size_bytes / (1024*1024):.1f} MB, wolne {free_bytes / (1024*1024):.1f} MB."
                     )
-                    if not has_space:
-                        space_warnings.append(
-                            f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_vol.last_known_drive_letter}): "
-                            f"wymagane {orig_item.file_size_bytes / (1024*1024):.1f} MB, wolne {free_bytes / (1024*1024):.1f} MB."
-                        )
-                        continue
-
-                    dst_root = Path(dst_vol.last_known_drive_letter)
-                    sub_month = orig_item.effective_date.strftime("%Y/%Y-%m")
-                    backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_month
-                    backup_dir.mkdir(parents=True, exist_ok=True)
-                    dest_path = backup_dir / orig_item.file_name
-                    c = 1
-                    while dest_path.exists():
-                        dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
-                        c += 1
-
-                    shutil.copy2(str(src_path), str(dest_path))
-
-                    verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
-                    if not verified:
-                        try:
-                            dest_path.unlink()
-                        except OSError as exc:
-                            logger.debug("Cleanup failed backup copy %s: %s", dest_path, exc)
-                        verification_blocks += 1
-                        OperationLogger.log(
-                            "BACKUP_VERIFY_FAIL",
-                            f"Weryfikacja 100% nie powiodła się dla backupu {orig_item.file_name}: {reason}",
-                            status="ERROR",
-                            db=self.db,
-                            commit=False,
-                        )
-                        continue
-
-                    rel_backup = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
-                    orig_item.verified_sha256 = full_sha
-                    import uuid
-                    new_bkp = MediaItem(
-                        id=str(uuid.uuid4()),
-                        volume_id=dst_vol.id,
-                        relative_path=rel_backup,
-                        file_name=dest_path.name,
-                        file_size_bytes=orig_item.file_size_bytes,
-                        media_type=orig_item.media_type,
-                        mime_type=orig_item.mime_type,
-                        file_hash=orig_item.file_hash,
-                        hash_algorithm=orig_item.hash_algorithm,
-                        is_primary_duplicate=False,
-                        is_backup_copy=True,
-                        verified_sha256=full_sha,
-                        width=orig_item.width,
-                        height=orig_item.height,
-                        duration_seconds=orig_item.duration_seconds,
-                        rotation_angle=orig_item.rotation_angle,
-                        exif_date=orig_item.exif_date,
-                        filename_date=orig_item.filename_date,
-                        fs_ctime=orig_item.fs_ctime,
-                        fs_mtime=orig_item.fs_mtime,
-                        effective_date=orig_item.effective_date,
-                        has_date_anomaly=orig_item.has_date_anomaly,
-                        date_anomaly_reason=orig_item.date_anomaly_reason,
-                        is_corrupted=False,
-                        is_blurry=orig_item.is_blurry,
-                        blur_score=orig_item.blur_score,
-                        thumbnail_relative_path=orig_item.thumbnail_relative_path,
-                        group_id=None,
-                        is_trashed=False,
-                    )
-                    self.db.add(new_bkp)
-                    self.db.flush()
-                    created_backup_by_orig[orig_item.id] = new_bkp
-                    backups_created += 1
-                    if job_id:
-                        ProcessManager.update_progress(
-                            job_id, processed_delta=1, message=f"Utworzono backup: {orig_item.file_name}", db=self.db
-                        )
-
-                # 2B: Relocate existing cross-device copy into 'backup/' folder so backup is always in 'backup' (Rule 1d)
-                for reloc_task in tasks["backups_to_relocate"]:
-                    bkp_item = self.db.get(MediaItem, reloc_task["backup_item_id"])
-                    bkp_vol = volumes.get(reloc_task["vol_id"])
-                    if not bkp_item or not bkp_vol or not bkp_vol.is_online:
-                        continue
-                    vol_root = Path(bkp_vol.last_known_drive_letter)
-                    curr_path = vol_root / bkp_item.relative_path
-                    if not curr_path.exists():
-                        continue
-                    sub_month = bkp_item.effective_date.strftime("%Y/%Y-%m")
-                    target_bkp_dir = vol_root / self.BACKUP_DIR_NAME / sub_month
-                    target_bkp_dir.mkdir(parents=True, exist_ok=True)
-                    target_bkp_path = target_bkp_dir / bkp_item.file_name
-                    if curr_path.resolve() != target_bkp_path.resolve():
-                        c = 1
-                        while target_bkp_path.exists():
-                            target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
-                            c += 1
-                        shutil.move(str(curr_path), str(target_bkp_path))
-                        bkp_item.file_name = target_bkp_path.name
-                        bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
-                    bkp_item.is_backup_copy = True
-                    bkp_item.is_primary_duplicate = False
-                    backups_relocated += 1
-
-            # 2C: 100%-Verified Removal of Redundant Duplicates (leaving only 1 Original + 1 Backup)
-            if do_dedup:
-                for dup_task in tasks["duplicates_to_delete"]:
-                    if job_id and ProcessManager.is_stop_requested(job_id):
-                        break
-                    dup_item = self.db.get(MediaItem, dup_task["dup_item_id"])
-                    ref_item = self.db.get(MediaItem, dup_task["ref_item_id"])
-                    if not dup_item or not ref_item:
-                        continue
-
-                    dup_vol = volumes.get(dup_item.volume_id)
-                    ref_vol = volumes.get(ref_item.volume_id)
-                    if not dup_vol or not ref_vol or not dup_vol.is_online or not ref_vol.is_online:
-                        continue
-
-                    dup_path = Path(dup_vol.last_known_drive_letter) / dup_item.relative_path
-                    ref_path = Path(ref_vol.last_known_drive_letter) / ref_item.relative_path
-
-                    bkp_id = dup_task.get("backup_item_id")
-                    bkp_obj = self.db.get(MediaItem, bkp_id) if bkp_id else created_backup_by_orig.get(ref_item.id)
-                    if len(volumes) >= 2 and bkp_obj is None:
-                        continue
-
-                    if not dup_path.exists():
-                        if ref_path.exists() and ref_path.stat().st_size == ref_item.file_size_bytes:
-                            self.db.delete(dup_item)
-                            duplicates_deleted += 1
-                        continue
-
-                    is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, dup_path)
-                    if not is_identical:
-                        verification_blocks += 1
-                        OperationLogger.log(
-                            "DEDUP_SAFETY_BLOCK",
-                            f"Zablokowano usunięcie {dup_path} (brak 100% zgodności z oryginałem {ref_path}): {verify_msg}",
-                            status="WARN",
-                            db=self.db,
-                            commit=False,
-                        )
-                        continue
-
-                    if bkp_obj:
-                        bkp_vol = volumes.get(bkp_obj.volume_id)
-                        if bkp_vol and bkp_vol.is_online:
-                            bkp_disk_p = Path(bkp_vol.last_known_drive_letter) / bkp_obj.relative_path
-                            if not bkp_disk_p.exists() or bkp_disk_p.resolve() == dup_path.resolve():
-                                verification_blocks += 1
-                                continue
-
+                    continue
+                dst_root = Path(dst_vol.last_known_drive_letter)
+                sub_day = bkp_item.effective_date.strftime("%Y/%m/%d")
+                backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_day
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = backup_dir / bkp_item.file_name
+                c = 1
+                while dest_path.exists():
+                    dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
+                    c += 1
+                shutil.copy2(str(src_path), str(dest_path))
+                verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+                if not verified:
                     try:
-                        dup_path.unlink()
-                        ref_item.verified_sha256 = full_sha
-                        self.db.delete(dup_item)
-                        duplicates_deleted += 1
-                        if job_id:
-                            ProcessManager.update_progress(
-                                job_id, processed_delta=1, message=f"Usunięto zweryfikowany duplikat: {dup_item.file_name}", db=self.db
-                            )
+                        dest_path.unlink()
                     except OSError as exc:
-                        logger.warning("Could not delete verified duplicate %s: %s", dup_path, exc)
+                        logger.debug("Cleanup failed remote backup move %s: %s", dest_path, exc)
+                    verification_blocks += 1
+                    continue
+                try:
+                    src_path.unlink()
+                except OSError as exc:
+                    logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
+                bkp_item.volume_id = dst_vol.id
+                bkp_item.file_name = dest_path.name
+                bkp_item.relative_path = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
+                bkp_item.is_backup_copy = True
+                bkp_item.is_primary_duplicate = False
+                bkp_item.duplicate_role = "backup_green"
+                bkp_item.verified_sha256 = full_sha
+                backups_remote_moved += 1
+                if job_id:
+                    ProcessManager.update_progress(
+                        job_id, processed_delta=1, message=f"Przeniesiono backup: {bkp_item.file_name}", db=self.db
+                    )
+
+            # New Backup Copying (Nowe kopie) with 100% verification
+            for copy_task in tasks["backups_to_copy"]:
+                if job_id and ProcessManager.is_stop_requested(job_id):
+                    break
+                orig_item = self.db.get(MediaItem, copy_task["orig_item_id"])
+                src_vol = volumes.get(copy_task["src_vol_id"])
+                dst_vol = volumes.get(copy_task["dst_vol_id"])
+                if not orig_item or not src_vol or not dst_vol:
+                    continue
+
+                src_path = Path(src_vol.last_known_drive_letter) / orig_item.relative_path
+                if not src_path.exists():
+                    continue
+
+                has_space, free_bytes = self.check_volume_free_space(
+                    dst_vol.last_known_drive_letter, orig_item.file_size_bytes
+                )
+                if not has_space:
+                    space_warnings.append(
+                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_vol.last_known_drive_letter}): "
+                        f"wymagane {orig_item.file_size_bytes / (1024*1024):.1f} MB, wolne {free_bytes / (1024*1024):.1f} MB."
+                    )
+                    continue
+
+                dst_root = Path(dst_vol.last_known_drive_letter)
+                sub_day = orig_item.effective_date.strftime("%Y/%m/%d")
+                backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_day
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                dest_path = backup_dir / orig_item.file_name
+                c = 1
+                while dest_path.exists():
+                    dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
+                    c += 1
+
+                shutil.copy2(str(src_path), str(dest_path))
+
+                verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+                if not verified:
+                    try:
+                        dest_path.unlink()
+                    except OSError as exc:
+                        logger.debug("Cleanup failed backup copy %s: %s", dest_path, exc)
+                    verification_blocks += 1
+                    OperationLogger.log(
+                        "BACKUP_VERIFY_FAIL",
+                        f"Weryfikacja 100% nie powiodła się dla backupu {orig_item.file_name}: {reason}",
+                        status="ERROR",
+                        db=self.db,
+                        commit=False,
+                    )
+                    continue
+
+                rel_backup = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
+                orig_item.verified_sha256 = full_sha
+                new_bkp = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=dst_vol.id,
+                    relative_path=rel_backup,
+                    file_name=dest_path.name,
+                    file_size_bytes=orig_item.file_size_bytes,
+                    media_type=orig_item.media_type,
+                    mime_type=orig_item.mime_type,
+                    file_hash=orig_item.file_hash,
+                    hash_algorithm=orig_item.hash_algorithm,
+                    is_primary_duplicate=False,
+                    is_backup_copy=True,
+                    duplicate_role="backup_green",
+                    verified_sha256=full_sha,
+                    width=orig_item.width,
+                    height=orig_item.height,
+                    duration_seconds=orig_item.duration_seconds,
+                    rotation_angle=orig_item.rotation_angle,
+                    exif_date=orig_item.exif_date,
+                    filename_date=orig_item.filename_date,
+                    fs_ctime=orig_item.fs_ctime,
+                    fs_mtime=orig_item.fs_mtime,
+                    effective_date=orig_item.effective_date,
+                    has_date_anomaly=orig_item.has_date_anomaly,
+                    date_anomaly_reason=orig_item.date_anomaly_reason,
+                    is_corrupted=False,
+                    is_blurry=orig_item.is_blurry,
+                    blur_score=orig_item.blur_score,
+                    thumbnail_relative_path=orig_item.thumbnail_relative_path,
+                    group_id=None,
+                    is_trashed=False,
+                )
+                self.db.add(new_bkp)
+                self.db.flush()
+                backups_created += 1
+                if job_id:
+                    ProcessManager.update_progress(
+                        job_id, processed_delta=1, message=f"Utworzono backup: {orig_item.file_name}", db=self.db
+                    )
 
             self.db.commit()
             pair_label = (
@@ -1060,33 +1284,26 @@ class StorageAutomationService:
                 "vol_a_online": bool(va and va.is_online),
                 "vol_b_online": bool(vb and vb.is_online),
                 "backups_to_copy": len(nxt["tasks"]["backups_to_copy"]),
-                "duplicates_to_delete": len(nxt["tasks"]["duplicates_to_delete"]),
+                "remote_moves": len(nxt["tasks"]["backups_remote_move"]),
+                "local_relocs": len(nxt["tasks"]["backups_to_relocate"]),
                 "remaining_pairs_count": len(pending_offline_pairs),
             }
 
-        mode_labels = {
-            "both": "Backup + Deduplikacja (oba)",
-            "backup_only": "Tylko Backup",
-            "dedup_only": "Tylko Deduplikacja",
-        }
         summary_msg = (
-            f"Tryb: {mode_labels[norm_mode]} | "
-            f"Backup utworzony: {backups_created} | Przeniesiono do '{self.BACKUP_DIR_NAME}/': {backups_relocated} | "
-            f"Usunięto duplikatów (100% weryfikacji): {duplicates_deleted} | "
-            f"Dodano do albumu 'Ważne': {important_assigned}"
+            f"Nowe kopie (backupy): {backups_created} | Kopie lokalne do '{self.BACKUP_DIR_NAME}/': {backups_relocated} | "
+            f"Kopie zdalne: {backups_remote_moved} | Dodano do albumu 'Ważne': {important_assigned}"
         )
         if skipped_unselected_pairs > 0:
             summary_msg += f" | Pominięto niewybrane pary dysków: {skipped_unselected_pairs}"
 
         OperationLogger.log(
-            "BACKUP_DEDUP",
+            "BACKUP_EXEC",
             summary_msg,
             status="OK" if not pending_offline_pairs else "PARTIAL",
             details={
-                "operation_mode": norm_mode,
                 "backups_created": backups_created,
                 "backups_relocated": backups_relocated,
-                "duplicates_deleted": duplicates_deleted,
+                "backups_remote_moved": backups_remote_moved,
                 "important_assigned": important_assigned,
                 "verification_blocks": verification_blocks,
                 "completed_pairs": completed_pairs,
@@ -1097,10 +1314,11 @@ class StorageAutomationService:
         )
 
         return {
-            "operation_mode": norm_mode,
+            "operation_mode": "backup_only",
             "backups_created": backups_created,
             "backups_relocated": backups_relocated,
-            "duplicates_deleted": duplicates_deleted,
+            "backups_remote_moved": backups_remote_moved,
+            "duplicates_deleted": 0,
             "important_assigned": important_assigned,
             "verification_blocks": verification_blocks,
             "space_warnings": space_warnings,
@@ -1113,18 +1331,581 @@ class StorageAutomationService:
             "summary": summary_msg,
         }
 
+    def execute_safe_duplicate_removal(
+        self,
+        item_ids: List[str],
+        delete_mode: str = "trash",
+        force_duplicate_verification: bool = False,
+        job_id: Optional[int] = None,
+        trash_dir: Optional[Path] = None,
+        thumbnails_dir: Optional[Path] = None,
+        progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Safely moves to trash or permanently deletes items disk-by-disk (ONLINE drives first).
+        For any duplicate (or when force_duplicate_verification=True):
+        - Performs 100% exact multi-layer binary verification against a surviving copy on an online drive.
+        - Ensures BOTH Original AND Backup survive in the cluster (>= 2 copies remain) before deleting.
+        - Queues offline-drive items so the user is prompted to connect the next drive one by one.
+        """
+        from app.operation_log import ProcessManager
+
+        eff_trash_dir = trash_dir or (db_module.DATA_DIR / "kosz")
+        eff_thumbs_dir = thumbnails_dir or db_module.THUMBNAILS_DIR
+        if delete_mode == "trash":
+            eff_trash_dir.mkdir(parents=True, exist_ok=True)
+
+        if progress_cb:
+            progress_cb(0, len(item_ids), "Weryfikacja dysków i aktualizacja klastrów duplikatów...", "")
+        if job_id:
+            ProcessManager.update_progress(
+                job_id,
+                processed_count=0,
+                total_count=len(item_ids),
+                message="Weryfikacja dysków i aktualizacja klastrów duplikatów...",
+            )
+
+        self.refresh_volumes_online_status()
+        self.flag_duplicate_clusters()
+
+        target_items: List[MediaItem] = []
+        for idx in range(0, len(item_ids), 5000):
+            chunk_ids = item_ids[idx : idx + 5000]
+            target_items.extend(
+                self.db.scalars(
+                    select(MediaItem).where(MediaItem.id.in_(chunk_ids), MediaItem.is_trashed == False)
+                ).all()
+            )
+        if not target_items:
+            return {
+                "processed_count": 0,
+                "physical_count": 0,
+                "blocked_safety": 0,
+                "blocked_verify": 0,
+                "missing_on_disk": 0,
+                "offline_items": [],
+                "offline_drives": [],
+                "next_offline_prompt": None,
+                "processed_drives": [],
+                "stopped_by_user": False,
+            }
+
+        total_candidates = len(target_items)
+        step_idx = 0
+        stopped_by_user = False
+
+        def _report_step(drive_text: str, msg_text: str) -> None:
+            if progress_cb:
+                progress_cb(step_idx, total_candidates, msg_text, drive_text)
+            if job_id:
+                ProcessManager.update_progress(
+                    job_id,
+                    processed_count=step_idx,
+                    total_count=total_candidates,
+                    message=msg_text,
+                )
+
+        if progress_cb:
+            progress_cb(0, total_candidates, f"Przygotowanie usuwania ({total_candidates} plików)...", "")
+        if job_id:
+            ProcessManager.update_progress(
+                job_id,
+                processed_count=0,
+                total_count=total_candidates,
+                message=f"Przygotowanie usuwania ({total_candidates} plików)...",
+            )
+
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        touched_hashes = list({it.file_hash for it in target_items})
+        cluster_members: List[MediaItem] = []
+        for idx in range(0, len(touched_hashes), 5000):
+            h_chunk = touched_hashes[idx : idx + 5000]
+            cluster_members.extend(
+                self.db.scalars(
+                    select(MediaItem)
+                    .where(MediaItem.file_hash.in_(h_chunk), MediaItem.is_trashed == False)
+                ).all()
+            )
+        cluster_members.sort(key=lambda m: (m.effective_date, m.id))
+        by_hash: Dict[str, List[MediaItem]] = defaultdict(list)
+        for m in cluster_members:
+            by_hash[m.file_hash].append(m)
+
+        # Group items by volume_id and process ONLINE volumes first (disk-by-disk)
+        items_by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
+        for it in target_items:
+            items_by_vol[it.volume_id].append(it)
+
+        sorted_vids = sorted(
+            items_by_vol.keys(),
+            key=lambda vid: (not (volumes.get(vid) and volumes[vid].is_online), vid),
+        )
+
+        removed_ids: Set[str] = set()
+        processed_count = 0
+        physical_count = 0
+        blocked_safety = 0
+        blocked_verify = 0
+        missing_on_disk = 0
+        offline_items: List[MediaItem] = []
+        offline_vol_order: List[int] = []
+        processed_drives: List[str] = []
+
+        def _mark_offline(it_obj: MediaItem, needed_vid: int):
+            offline_items.append(it_obj)
+            if needed_vid not in offline_vol_order:
+                offline_vol_order.append(needed_vid)
+
+        for vid in sorted_vids:
+            if stopped_by_user:
+                break
+            vol = volumes.get(vid)
+            vol_items = items_by_vol[vid]
+            drive_label = f"{vol.volume_label} ({vol.last_known_drive_letter})" if vol else f"#{vid}"
+
+            if not vol or not vol.is_online:
+                for it in vol_items:
+                    if job_id and ProcessManager.is_stop_requested(job_id):
+                        stopped_by_user = True
+                        break
+                    step_idx += 1
+                    needs_dup_check = force_duplicate_verification or (it.duplicate_role in ("duplicate", "backup_green", "backup_orange"))
+                    if needs_dup_check:
+                        _mark_offline(it, vid)
+                    else:
+                        # Non-duplicate logical trash/delete for offline volume preserves existing behavior
+                        if delete_mode == "trash":
+                            it.is_trashed = True
+                        else:
+                            self.db.delete(it)
+                        removed_ids.add(it.id)
+                        processed_count += 1
+                    _report_step(drive_label, f"[{step_idx}/{total_candidates}] {drive_label} (offline): {it.file_name}")
+                continue
+
+            drive_processed_cnt = 0
+            for cand in vol_items:
+                if job_id and ProcessManager.is_stop_requested(job_id):
+                    stopped_by_user = True
+                    break
+
+                step_idx += 1
+                _report_step(drive_label, f"[{step_idx}/{total_candidates}] Weryfikacja 100%: {cand.file_name} ({drive_label})")
+
+                cluster = by_hash.get(cand.file_hash, [])
+                needs_dup_check = force_duplicate_verification or (cand.duplicate_role == "duplicate")
+
+                if needs_dup_check:
+                    surviving = [
+                        x for x in cluster
+                        if x.id != cand.id and x.id not in removed_ids and not x.is_trashed
+                    ]
+                    # Safety gate 1: Must keep BOTH Original AND Backup (>= 2 copies survive) & never delete the Original
+                    if cand.duplicate_role == "original" or len(surviving) < 2:
+                        blocked_safety += 1
+                        continue
+
+                    orig = next((x for x in surviving if x.duplicate_role == "original"), surviving[0])
+                    bkp = next(
+                        (x for x in surviving if x.id != orig.id and x.volume_id != orig.volume_id),
+                        next((x for x in surviving if x.id != orig.id), None),
+                    )
+                    if orig is None or bkp is None:
+                        blocked_safety += 1
+                        continue
+
+                    cand_path = Path(vol.last_known_drive_letter) / cand.relative_path
+                    if not cand_path.exists():
+                        missing_on_disk += 1
+                        continue
+
+                    # Safety gate 2: Need an ONLINE surviving reference file to perform 100% binary verification
+                    ref_candidates = [orig, bkp] + [x for x in surviving if x.id not in (orig.id, bkp.id)]
+                    ref_item: Optional[MediaItem] = None
+                    ref_path: Optional[Path] = None
+                    for rc in ref_candidates:
+                        rv = volumes.get(rc.volume_id)
+                        if rv and rv.is_online:
+                            rp = Path(rv.last_known_drive_letter) / rc.relative_path
+                            if rp.exists() and rp.resolve() != cand_path.resolve():
+                                ref_item = rc
+                                ref_path = rp
+                                break
+
+                    if ref_item is None or ref_path is None:
+                        # Reference drive (Original/Backup) is offline -> prompt user to connect it
+                        needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
+                        _mark_offline(cand, needed_vid)
+                        continue
+
+                    # If backup is currently online, verify its file actually exists on disk before trusting it
+                    bkp_v = volumes.get(bkp.volume_id)
+                    if bkp_v and bkp_v.is_online:
+                        bkp_p = Path(bkp_v.last_known_drive_letter) / bkp.relative_path
+                        if not bkp_p.exists() and len(surviving) == 2:
+                            blocked_safety += 1
+                            continue
+
+                    is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, cand_path)
+                    if not is_identical:
+                        blocked_verify += 1
+                        OperationLogger.log(
+                            "DUP_VERIFY_BLOCK",
+                            f"Zablokowano usunięcie {cand_path} (brak 100% zgodności z {ref_path}): {verify_msg}",
+                            status="WARN",
+                            db=self.db,
+                            commit=False,
+                        )
+                        try:
+                            true_sha, _, _ = FastHasher.compute_multi_hashes(cand_path)
+                            cand.file_hash = true_sha
+                            cand.hash_algorithm = "sha256_verified"
+                        except Exception as exc:
+                            logger.debug("Rehash collision separate skipped for %s: %s", cand_path, exc)
+                        continue
+
+                    ref_item.verified_sha256 = full_sha
+                    orig.verified_sha256 = full_sha
+
+                    if delete_mode == "trash":
+                        dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
+                        shutil.move(str(cand_path), str(dest_p))
+                        cand.is_trashed = True
+                        physical_count += 1
+                    else:
+                        cand_path.unlink()
+                        physical_count += 1
+                        thumb_shared = any(
+                            x.thumbnail_relative_path == cand.thumbnail_relative_path
+                            for x in cluster if x.id != cand.id and x.id not in removed_ids
+                        )
+                        if not thumb_shared and cand.thumbnail_relative_path:
+                            tp = eff_thumbs_dir / cand.thumbnail_relative_path
+                            if tp.exists():
+                                try:
+                                    tp.unlink()
+                                except OSError as exc:
+                                    logger.debug("Thumb unlink warning %s: %s", tp, exc)
+                        self.db.delete(cand)
+
+                    removed_ids.add(cand.id)
+                    processed_count += 1
+                    drive_processed_cnt += 1
+                else:
+                    # Standard non-duplicate removal
+                    src_p = Path(vol.last_known_drive_letter) / cand.relative_path
+                    if delete_mode == "trash":
+                        if src_p.exists():
+                            dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
+                            try:
+                                shutil.move(str(src_p), str(dest_p))
+                                physical_count += 1
+                            except Exception as exc:
+                                logger.debug("Move to trash physical warning: %s", exc)
+                        cand.is_trashed = True
+                    else:
+                        if src_p.exists():
+                            try:
+                                src_p.unlink()
+                                physical_count += 1
+                            except OSError as exc:
+                                logger.debug("Permanent delete unlink warning: %s", exc)
+                        trash_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
+                        if trash_p.exists():
+                            try:
+                                trash_p.unlink()
+                                physical_count += 1
+                            except OSError as exc:
+                                logger.debug("Permanent delete trash unlink warning: %s", exc)
+                        if cand.thumbnail_relative_path:
+                            thumb_p = eff_thumbs_dir / cand.thumbnail_relative_path
+                            if thumb_p.exists():
+                                try:
+                                    thumb_p.unlink()
+                                except OSError as exc:
+                                    logger.debug("Permanent delete thumb unlink warning: %s", exc)
+                        self.db.delete(cand)
+
+                    removed_ids.add(cand.id)
+                    processed_count += 1
+                    drive_processed_cnt += 1
+
+                if processed_count > 0 and processed_count % 50 == 0:
+                    self.db.commit()
+
+            if drive_processed_cnt > 0:
+                processed_drives.append(f"{vol.volume_label} ({vol.last_known_drive_letter}): {drive_processed_cnt} szt.")
+
+        self.db.commit()
+        if removed_ids or blocked_verify > 0:
+            if progress_cb:
+                progress_cb(step_idx, total_candidates, "Aktualizacja tagów klastrów duplikatów...", "")
+            if job_id:
+                ProcessManager.update_progress(
+                    job_id,
+                    processed_count=step_idx,
+                    total_count=total_candidates,
+                    message="Aktualizacja tagów klastrów duplikatów...",
+                )
+            self.flag_duplicate_clusters()
+
+        offline_drives_info: List[Dict[str, Any]] = []
+        for ovid in offline_vol_order:
+            ov = volumes.get(ovid)
+            cnt = sum(1 for x in offline_items if x.volume_id == ovid)
+            if cnt == 0:
+                # Items needing this volume as reference
+                cnt = len(offline_items)
+            offline_drives_info.append(
+                {
+                    "volume_id": ovid,
+                    "vol_label": ov.volume_label if ov else f"#{ovid}",
+                    "drive_letter": ov.last_known_drive_letter if ov else "?",
+                    "vsn": ov.volume_serial_number if ov else "?",
+                    "count": cnt,
+                }
+            )
+
+        next_offline_prompt = offline_drives_info[0] if offline_drives_info else None
+        return {
+            "processed_count": processed_count,
+            "physical_count": physical_count,
+            "blocked_safety": blocked_safety,
+            "blocked_verify": blocked_verify,
+            "missing_on_disk": missing_on_disk,
+            "offline_items": offline_items,
+            "offline_ids": [x.id for x in offline_items],
+            "offline_drives": offline_drives_info,
+            "next_offline_prompt": next_offline_prompt,
+            "processed_drives": processed_drives,
+            "stopped_by_user": stopped_by_user,
+        }
+
+    def analyze_move_backups(
+        self,
+        source_volume_id: Optional[int] = None,
+        target_volume_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Analyzes backups across all volumes and evaluates how many backup files can be safely
+        moved from source_volume_id -> target_volume_id while guaranteeing that each Original
+        stays on a DIFFERENT physical device than its backup.
+        """
+        self.refresh_volumes_online_status()
+        self.flag_duplicate_clusters()
+
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume).order_by(WindowsVolume.id.asc())).all()}
+        vol_space = self.get_volume_space_map(list(volumes.values()))
+
+        all_items = list(
+            self.db.scalars(
+                select(MediaItem).where(MediaItem.is_trashed == False).order_by(MediaItem.effective_date.asc(), MediaItem.id.asc())
+            ).all()
+        )
+        by_hash: Dict[str, List[MediaItem]] = defaultdict(list)
+        bkp_stats_by_vol: Dict[int, Dict[str, int]] = {
+            vid: {"count": 0, "bytes": 0} for vid in volumes
+        }
+        for it in all_items:
+            by_hash[it.file_hash].append(it)
+            if it.is_backup_copy or it.duplicate_role in ("backup_green", "backup_orange"):
+                if it.volume_id in bkp_stats_by_vol:
+                    bkp_stats_by_vol[it.volume_id]["count"] += 1
+                    bkp_stats_by_vol[it.volume_id]["bytes"] += int(it.file_size_bytes or 0)
+
+        movable_rows: List[Dict[str, Any]] = []
+        movable_bytes = 0
+        blocked_same_device_count = 0
+        blocked_same_device_bytes = 0
+        already_on_target_count = 0
+        src_vol = volumes.get(source_volume_id) if source_volume_id else None
+        dst_vol = volumes.get(target_volume_id) if target_volume_id else None
+
+        if src_vol and dst_vol and src_vol.id != dst_vol.id:
+            src_backups = [
+                it for it in all_items
+                if it.volume_id == src_vol.id and (it.is_backup_copy or it.duplicate_role in ("backup_green", "backup_orange"))
+            ]
+            for bkp in src_backups:
+                cluster = by_hash.get(bkp.file_hash, [])
+                fsize = int(bkp.file_size_bytes or 0)
+                # Ensure Original / non-backup copy is NOT on dst_vol (otherwise Original & Backup would share one disk!)
+                has_orig_on_target = any(
+                    x.id != bkp.id and x.volume_id == dst_vol.id and (x.duplicate_role == "original" or not x.is_backup_copy)
+                    for x in cluster
+                )
+                has_other_device_orig = any(
+                    x.id != bkp.id and x.volume_id != dst_vol.id and not x.is_backup_copy
+                    for x in cluster
+                )
+                if has_orig_on_target or not has_other_device_orig:
+                    blocked_same_device_count += 1
+                    blocked_same_device_bytes += fsize
+                    continue
+
+                if any(x.id != bkp.id and x.volume_id == dst_vol.id and x.is_backup_copy for x in cluster):
+                    already_on_target_count += 1
+                    continue
+
+                orig = next((x for x in cluster if x.id != bkp.id and x.volume_id != dst_vol.id), cluster[0])
+                orig_vol = volumes.get(orig.volume_id)
+                dst_rel = f"{self.BACKUP_DIR_NAME}/{bkp.effective_date.strftime('%Y/%m/%d')}/{bkp.file_name}"
+                movable_bytes += fsize
+                movable_rows.append(
+                    {
+                        "item_id": bkp.id,
+                        "file_name": bkp.file_name,
+                        "file_size": fsize,
+                        "src_relative_path": bkp.relative_path,
+                        "dst_relative_path": dst_rel,
+                        "orig_vol_label": orig_vol.volume_label if orig_vol else "?",
+                        "orig_vol_letter": orig_vol.last_known_drive_letter if orig_vol else "?",
+                    }
+                )
+
+        dst_sp = vol_space.get(dst_vol.id) if dst_vol else None
+        src_sp = vol_space.get(src_vol.id) if src_vol else None
+        dst_free_before = int(dst_sp["free_bytes"]) if dst_sp else 0
+        dst_free_after = dst_free_before - movable_bytes
+        src_free_before = int(src_sp["free_bytes"]) if src_sp else 0
+        src_free_after = src_free_before + movable_bytes
+        space_ok = (dst_sp is None) or (dst_free_after >= self.MIN_FREE_SPACE_BUFFER_BYTES) or (movable_bytes == 0)
+
+        return {
+            "volumes": list(volumes.values()),
+            "volumes_map": volumes,
+            "vol_space": vol_space,
+            "bkp_stats_by_vol": bkp_stats_by_vol,
+            "source_volume_id": source_volume_id,
+            "target_volume_id": target_volume_id,
+            "src_vol": src_vol,
+            "dst_vol": dst_vol,
+            "movable_rows": movable_rows,
+            "movable_count": len(movable_rows),
+            "movable_bytes": movable_bytes,
+            "blocked_same_device_count": blocked_same_device_count,
+            "blocked_same_device_bytes": blocked_same_device_bytes,
+            "already_on_target_count": already_on_target_count,
+            "src_free_before": src_free_before,
+            "src_free_after": src_free_after,
+            "dst_free_before": dst_free_before,
+            "dst_free_after": dst_free_after,
+            "space_ok": space_ok,
+        }
+
+    def execute_move_backups(
+        self,
+        source_volume_id: int,
+        target_volume_id: int,
+    ) -> Dict[str, Any]:
+        """Moves verified backup files physically from source_volume_id to target_volume_id/daf_backup/YYYY/MM/DD."""
+        analysis = self.analyze_move_backups(source_volume_id, target_volume_id)
+        src_vol: Optional[WindowsVolume] = analysis["src_vol"]
+        dst_vol: Optional[WindowsVolume] = analysis["dst_vol"]
+
+        if not src_vol or not dst_vol or src_vol.id == dst_vol.id:
+            return {"status": "error", "message": "Wybierz dwa różne urządzenia (źródłowe i docelowe).", "moved_count": 0}
+
+        if not src_vol.is_online or not dst_vol.is_online:
+            offline_names = [
+                f"{v.volume_label} ({v.last_known_drive_letter})"
+                for v in (src_vol, dst_vol) if not v.is_online
+            ]
+            return {
+                "status": "offline",
+                "message": f"Podłącz dyski offline przed przeniesieniem backupów: {', '.join(offline_names)}.",
+                "moved_count": 0,
+            }
+
+        movable_rows = analysis["movable_rows"]
+        if not movable_rows:
+            return {"status": "empty", "message": "Brak backupów możliwych do przeniesienia między wybraną parą dysków.", "moved_count": 0}
+
+        self.backup_mgr.create_backup("pre_move_backups")
+        src_root = Path(src_vol.last_known_drive_letter)
+        dst_root = Path(dst_vol.last_known_drive_letter)
+
+        moved_count = 0
+        moved_bytes = 0
+        verification_blocks = 0
+        space_stopped = False
+
+        for row in movable_rows:
+            item = self.db.get(MediaItem, row["item_id"])
+            if not item:
+                continue
+            src_path = src_root / item.relative_path
+            if not src_path.exists():
+                continue
+
+            has_space, _ = self.check_volume_free_space(dst_vol.last_known_drive_letter, item.file_size_bytes)
+            if not has_space:
+                space_stopped = True
+                break
+
+            sub_day = item.effective_date.strftime("%Y/%m/%d")
+            target_dir = dst_root / self.BACKUP_DIR_NAME / sub_day
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = target_dir / item.file_name
+            c = 1
+            while dest_path.exists():
+                dest_path = target_dir / f"{src_path.stem}_{c}{src_path.suffix}"
+                c += 1
+
+            shutil.copy2(str(src_path), str(dest_path))
+            verified, _, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+            if not verified:
+                try:
+                    dest_path.unlink()
+                except OSError as exc:
+                    logger.debug("Cleanup failed backup transfer %s: %s", dest_path, exc)
+                verification_blocks += 1
+                continue
+
+            try:
+                src_path.unlink()
+            except OSError as exc:
+                logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
+
+            item.volume_id = dst_vol.id
+            item.file_name = dest_path.name
+            item.relative_path = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
+            item.is_backup_copy = True
+            item.is_primary_duplicate = False
+            item.duplicate_role = "backup_green"
+            item.verified_sha256 = full_sha
+            moved_count += 1
+            moved_bytes += int(item.file_size_bytes or 0)
+
+        self.db.commit()
+        self.flag_duplicate_clusters()
+
+        msg = (
+            f"Przeniesiono backupów z {src_vol.volume_label} -> {dst_vol.volume_label}: "
+            f"{moved_count} plików ({moved_bytes / (1024*1024):.2f} MB)."
+        )
+        if space_stopped:
+            msg += " Zatrzymano z powodu zapełnienia dysku docelowego."
+        if verification_blocks > 0:
+            msg += f" Zablokowanych przez weryfikację: {verification_blocks}."
+        OperationLogger.log("MOVE_BACKUPS", msg, status="OK" if not space_stopped else "WARN", db=self.db)
+        return {
+            "status": "ok" if not space_stopped else "partial_space",
+            "message": msg,
+            "moved_count": moved_count,
+            "moved_bytes": moved_bytes,
+            "verification_blocks": verification_blocks,
+        }
+
     def schedule_or_execute_moves(
         self,
         items: List[MediaItem],
         target_volume_id: int,
         target_subfolder: str = "",
-        force_offline_todo: bool = False,
     ) -> Dict[str, Any]:
         """
-        Moves files between devices or directories.
-        Requirement 4b: If source or target device is offline (or force_offline_todo=True),
-        records the move in pending_file_moves (TODO list) and immediately updates the logical
-        location (volume_id, relative_path) in media_items so the user sees the file in its new logical place.
+        Physically moves files between online devices or directories.
+        Skips items whose source or target device is currently offline.
         """
         self.refresh_volumes_online_status()
         target_vol = self.db.get(WindowsVolume, target_volume_id)
@@ -1133,299 +1914,59 @@ class StorageAutomationService:
 
         clean_sub = target_subfolder.strip().strip("/\\")
         moved_physically = 0
-        queued_offline = 0
+        skipped_offline = 0
 
-        if target_vol.is_online and not force_offline_todo:
-            self.backup_mgr.create_backup("pre_move_or_todo")
+        if target_vol.is_online:
+            self.backup_mgr.create_backup("pre_move_files")
 
         for it in items:
             src_vol = self.db.get(WindowsVolume, it.volume_id)
-            existing_todo = self.db.scalar(
-                select(PendingFileMove).where(
-                    PendingFileMove.media_id == it.id,
-                    PendingFileMove.status == "PENDING",
-                )
-            )
-
-            true_src_vol_id = existing_todo.source_volume_id if existing_todo else it.volume_id
-            true_src_rel = existing_todo.source_relative_path if existing_todo else it.relative_path
-            true_src_name = existing_todo.source_file_name if existing_todo else it.file_name
-            true_src_vol = self.db.get(WindowsVolume, true_src_vol_id)
-
-            new_rel = f"{clean_sub}/{it.file_name}" if clean_sub else it.file_name
-            new_rel = Path(new_rel).as_posix()
-
             can_move_physically = (
-                not force_offline_todo
-                and true_src_vol is not None
-                and true_src_vol.is_online
+                src_vol is not None
+                and src_vol.is_online
                 and target_vol.is_online
-                and (Path(true_src_vol.last_known_drive_letter) / true_src_rel).exists()
+                and (Path(src_vol.last_known_drive_letter) / it.relative_path).exists()
             )
+            if not can_move_physically:
+                skipped_offline += 1
+                continue
 
-            if can_move_physically:
-                src_file = Path(true_src_vol.last_known_drive_letter) / true_src_rel
-                dst_root = Path(target_vol.last_known_drive_letter)
-                dst_dir = (dst_root / clean_sub) if clean_sub else dst_root
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                dst_file = dst_dir / true_src_name
+            src_file = Path(src_vol.last_known_drive_letter) / it.relative_path
+            dst_root = Path(target_vol.last_known_drive_letter)
+            dst_dir = (dst_root / clean_sub) if clean_sub else dst_root
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst_file = dst_dir / it.file_name
 
-                if src_file.resolve() != dst_file.resolve():
-                    c = 1
-                    while dst_file.exists():
-                        dst_file = dst_dir / f"{src_file.stem}_{c}{src_file.suffix}"
-                        c += 1
-                    shutil.move(str(src_file), str(dst_file))
+            if src_file.resolve() != dst_file.resolve():
+                c = 1
+                while dst_file.exists():
+                    dst_file = dst_dir / f"{src_file.stem}_{c}{src_file.suffix}"
+                    c += 1
+                shutil.move(str(src_file), str(dst_file))
 
-                it.volume_id = target_vol.id
-                it.file_name = dst_file.name
-                it.relative_path = dst_file.resolve().relative_to(dst_root.resolve()).as_posix()
-                if existing_todo:
-                    self.db.delete(existing_todo)
-                moved_physically += 1
-            else:
-                # Logical move in DB + schedule physical move in pending_file_moves (Lista TODO)
-                if true_src_vol_id == target_vol.id and true_src_rel == new_rel:
-                    # Returned to original physical position -> remove pending todo
-                    if existing_todo:
-                        self.db.delete(existing_todo)
-                    it.volume_id = true_src_vol_id
-                    it.relative_path = true_src_rel
-                    it.file_name = true_src_name
-                else:
-                    if existing_todo:
-                        existing_todo.target_volume_id = target_vol.id
-                        existing_todo.target_relative_path = new_rel
-                        existing_todo.target_file_name = it.file_name
-                    else:
-                        todo = PendingFileMove(
-                            media_id=it.id,
-                            source_volume_id=true_src_vol_id,
-                            source_relative_path=true_src_rel,
-                            source_file_name=true_src_name,
-                            target_volume_id=target_vol.id,
-                            target_relative_path=new_rel,
-                            target_file_name=it.file_name,
-                            status="PENDING",
-                        )
-                        self.db.add(todo)
-                    it.volume_id = target_vol.id
-                    it.relative_path = new_rel
-                    queued_offline += 1
+            it.volume_id = target_vol.id
+            it.file_name = dst_file.name
+            it.relative_path = dst_file.resolve().relative_to(dst_root.resolve()).as_posix()
+            moved_physically += 1
 
         self.db.commit()
         OperationLogger.log(
             "FILE_MOVE",
-            f"Przeniesiono fizycznie: {moved_physically}, dodano do listy TODO (offline): {queued_offline} -> {target_vol.volume_label}/{clean_sub}",
+            f"Przeniesiono fizycznie: {moved_physically}, pominięto offline: {skipped_offline} -> {target_vol.volume_label}/{clean_sub}",
             status="OK",
             db=self.db,
         )
         return {
             "moved_physically": moved_physically,
-            "queued_offline": queued_offline,
+            "skipped_offline": skipped_offline,
             "target_volume_label": target_vol.volume_label,
             "target_subfolder": clean_sub,
         }
 
-    def get_pending_moves_summary(self) -> Dict[str, Any]:
-        """Returns the full list of pending offline file moves and groups them by volume pairs (Rule 4c, 4e)."""
-        self.refresh_volumes_online_status()
-        todos = list(
-            self.db.scalars(
-                select(PendingFileMove)
-                .options(
-                    joinedload(PendingFileMove.media_item),
-                    joinedload(PendingFileMove.source_volume),
-                    joinedload(PendingFileMove.target_volume),
-                )
-                .where(PendingFileMove.status == "PENDING")
-                .order_by(PendingFileMove.id.asc())
-            ).all()
-        )
-
-        pairs_map: Dict[Tuple[int, int], List[PendingFileMove]] = defaultdict(list)
-        for td in todos:
-            pk = (min(td.source_volume_id, td.target_volume_id), max(td.source_volume_id, td.target_volume_id))
-            pairs_map[pk].append(td)
-
-        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
-        ordered_pairs = []
-        for (va_id, vb_id), p_todos in pairs_map.items():
-            va = volumes.get(va_id)
-            vb = volumes.get(vb_id)
-            both_online = bool(va and vb and va.is_online and vb.is_online)
-            one_online = bool((va and va.is_online) or (vb and vb.is_online))
-            a_to_b = sum(1 for x in p_todos if x.source_volume_id == va_id and x.target_volume_id == vb_id)
-            b_to_a = sum(1 for x in p_todos if x.source_volume_id == vb_id and x.target_volume_id == va_id)
-            ordered_pairs.append(
-                {
-                    "pair_key": (va_id, vb_id),
-                    "vol_a": va,
-                    "vol_b": vb,
-                    "both_online": both_online,
-                    "one_online": one_online,
-                    "a_to_b": a_to_b,
-                    "b_to_a": b_to_a,
-                    "todos": p_todos,
-                }
-            )
-        ordered_pairs.sort(key=lambda p: (not p["both_online"], not p["one_online"], p["pair_key"]))
-
-        next_offline_pair = next((p for p in ordered_pairs if not p["both_online"]), None)
-        return {
-            "todos": todos,
-            "total_pending": len(todos),
-            "ordered_pairs": ordered_pairs,
-            "next_offline_pair": next_offline_pair,
-        }
-
-    def rollback_pending_moves(self, todo_ids: Optional[List[int]] = None) -> int:
-        """
-        Requirement 4d: Restores previous file locations in the database and clears the TODO list
-        when the user cancels pending moves or when a physical move operation fails.
-        """
-        stmt = select(PendingFileMove).where(PendingFileMove.status == "PENDING")
-        if todo_ids:
-            stmt = stmt.where(PendingFileMove.id.in_(todo_ids))
-        todos = list(self.db.scalars(stmt).all())
-
-        reverted = 0
-        for td in todos:
-            it = self.db.get(MediaItem, td.media_id)
-            if it:
-                it.volume_id = td.source_volume_id
-                it.relative_path = td.source_relative_path
-                it.file_name = td.source_file_name
-            self.db.delete(td)
-            reverted += 1
-
-        self.db.commit()
-        if reverted > 0:
-            OperationLogger.log(
-                "TODO_ROLLBACK",
-                f"Przywrócono pierwotne lokalizacje w bazie i wyczyszczono listę TODO dla {reverted} plików.",
-                status="WARN",
-                db=self.db,
-            )
-        return reverted
-
-    def execute_pending_moves_pairwise(self) -> Dict[str, Any]:
-        """
-        Requirement 4d & 4e: Executes pending physical moves pair-by-pair bidirectionally (Va <-> Vb).
-        If any physical operation fails on a connected pair, rolls back the database state to original
-        locations and clears the TODO list as required by 4d.
-        """
-        summary = self.get_pending_moves_summary()
-        ordered_pairs = summary["ordered_pairs"]
-        if not ordered_pairs:
-            return {
-                "executed_count": 0,
-                "rolled_back_count": 0,
-                "remaining_count": 0,
-                "next_offline_pair": None,
-                "status": "empty",
-                "message": "Lista TODO jest pusta — brak oczekujących przeniesień.",
-            }
-
-        self.backup_mgr.create_backup("pre_todo_pairwise_exec")
-        executed_count = 0
-        completed_physical_moves: List[Tuple[Path, Path, MediaItem, PendingFileMove]] = []
-
-        try:
-            for pair in ordered_pairs:
-                if not pair["both_online"]:
-                    continue
-                va: WindowsVolume = pair["vol_a"]
-                vb: WindowsVolume = pair["vol_b"]
-
-                for td in pair["todos"]:
-                    it = self.db.get(MediaItem, td.media_id)
-                    src_vol = va if td.source_volume_id == va.id else vb
-                    dst_vol = va if td.target_volume_id == va.id else vb
-
-                    src_path = Path(src_vol.last_known_drive_letter) / td.source_relative_path
-                    if not src_path.exists():
-                        raise FileNotFoundError(
-                            f"Brak pliku źródłowego na podłączonym dysku: {src_path}"
-                        )
-
-                    has_space, _ = self.check_volume_free_space(
-                        dst_vol.last_known_drive_letter, src_path.stat().st_size
-                    )
-                    if not has_space:
-                        raise RuntimeError(
-                            f"Brak wystarczającego miejsca na dysku docelowym {dst_vol.volume_label} ({dst_vol.last_known_drive_letter})."
-                        )
-
-                    dst_root = Path(dst_vol.last_known_drive_letter)
-                    dst_path = dst_root / td.target_relative_path
-                    dst_path.parent.mkdir(parents=True, exist_ok=True)
-
-                    if src_path.resolve() != dst_path.resolve():
-                        c = 1
-                        while dst_path.exists():
-                            dst_path = dst_path.parent / f"{src_path.stem}_{c}{src_path.suffix}"
-                            c += 1
-                        shutil.move(str(src_path), str(dst_path))
-                        completed_physical_moves.append((src_path, dst_path, it, td))
-
-                    if it:
-                        it.volume_id = dst_vol.id
-                        it.file_name = dst_path.name
-                        it.relative_path = dst_path.resolve().relative_to(dst_root.resolve()).as_posix()
-                    self.db.delete(td)
-                    executed_count += 1
-
-            self.db.commit()
-        except Exception as exc:
-            self.db.rollback()
-            # Revert any physical files moved during the failed transaction
-            for orig_p, moved_p, _, _ in reversed(completed_physical_moves):
-                try:
-                    if moved_p.exists() and not orig_p.exists():
-                        orig_p.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(moved_p), str(orig_p))
-                except OSError as move_exc:
-                    logger.warning("Rollback physical move warning: %s", move_exc)
-
-            # Requirement 4d: Restore original locations in DB and clear TODO list on failure
-            rolled_back = self.rollback_pending_moves()
-            OperationLogger.log(
-                "TODO_EXEC_FAIL",
-                f"Błąd fizycznego przenoszenia ({exc}). Przywrócono oryginalne lokalizacje dla {rolled_back} plików.",
-                status="ERROR",
-                db=self.db,
-            )
-            return {
-                "executed_count": 0,
-                "rolled_back_count": rolled_back,
-                "remaining_count": 0,
-                "next_offline_pair": None,
-                "status": "rolled_back",
-                "message": f"Operacja fizyczna nie powiodła się ({exc}). Przywrócono poprzednie lokalizacje w bazie i wyczyszczono listę TODO ({rolled_back} poz.).",
-            }
-
-        updated_summary = self.get_pending_moves_summary()
-        OperationLogger.log(
-            "TODO_EXEC_SUCCESS",
-            f"Wykonano fizyczne przeniesienia dla {executed_count} plików. Pozostało w kolejce: {updated_summary['total_pending']}.",
-            status="OK",
-            db=self.db,
-        )
-        return {
-            "executed_count": executed_count,
-            "rolled_back_count": 0,
-            "remaining_count": updated_summary["total_pending"],
-            "next_offline_pair": updated_summary["next_offline_pair"],
-            "status": "ok",
-            "message": f"Wykonano fizyczne przeniesienie {executed_count} plików (w obie strony dla podłączonych par dysków).",
-        }
-
     def consolidate_group(self, group_id: int, target_volume_id: int) -> Dict[str, int]:
         """
-        Moves all physical files of an album AND its child subalbums onto target USB drive,
+        Moves all physical files of an album AND its child subalbums onto target online USB drive,
         preserving the subalbum folder hierarchy on disk.
-        If source or target volume is offline, schedules the moves in the offline TODO list (Rule 4b).
         """
         self.refresh_volumes_online_status()
         target_vol = self.db.get(WindowsVolume, target_volume_id)
@@ -1452,13 +1993,13 @@ class StorageAutomationService:
             by_subfolder[rel_folder].append(it)
 
         moved_phys = 0
-        queued_todo = 0
+        skipped_offline = 0
         for rel_folder, sub_items in by_subfolder.items():
             res = self.schedule_or_execute_moves(sub_items, target_volume_id, target_subfolder=rel_folder)
             moved_phys += res["moved_physically"]
-            queued_todo += res["queued_offline"]
+            skipped_offline += res["skipped_offline"]
 
-        return {"moved_physically": moved_phys, "queued_offline": queued_todo}
+        return {"moved_physically": moved_phys, "skipped_offline": skipped_offline}
 
     def auto_group_items_by_date(self, items: List[MediaItem]) -> int:
         """Automatically builds Year -> Year-Month album hierarchy for a list of items."""
@@ -1517,175 +2058,6 @@ class StorageAutomationService:
 
         self.db.commit()
         return updated
-
-    def generate_offline_procedure_report(
-        self,
-        preferred_target_volume_id: Optional[int] = None,
-        operation_mode: str = "both",
-        selected_pair_keys: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Builds the offline backup, deduplication, and pending move plan using persisted disk capacities
-        and saves a human-readable Polish text report on the local disk before any physical changes occur.
-        """
-        norm_mode = operation_mode if operation_mode in ("both", "backup_only", "dedup_only") else "both"
-        do_backup = norm_mode in ("both", "backup_only")
-        do_dedup = norm_mode in ("both", "dedup_only")
-        selected_pairs_set = self.parse_pair_keys(selected_pair_keys)
-
-        plan = self.build_backup_and_dedup_plan(
-            preferred_target_volume_id=preferred_target_volume_id,
-            selected_pair_keys=selected_pair_keys,
-        )
-        pending_summary = self.get_pending_moves_summary()
-        volumes: Dict[int, WindowsVolume] = plan["volumes"]
-        vol_space_summary: Dict[int, Dict[str, Any]] = plan["volume_space_summary"]
-
-        filtered_pairs = [
-            p for p in plan["ordered_pairs"]
-            if selected_pairs_set is None or p["pair_key"] in selected_pairs_set
-        ]
-
-        mode_names = {
-            "both": "Backup + Deduplikacja (oba)",
-            "backup_only": "Tylko Backup",
-            "dedup_only": "Tylko Deduplikacja",
-        }
-        now_dt = datetime.datetime.now()
-        ts_str = now_dt.strftime("%Y%m%d_%H%M%S")
-        lines: List[str] = [
-            "=" * 84,
-            "DOMOWE ARCHIWUM FOTO — RAPORT PROCEDURY BACKUPU, DEDUPLIKACJI I ZMIAN (TRYB OFFLINE)",
-            f"Wygenerowano: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Wybrany tryb operacji: {mode_names[norm_mode]} | Wybrane pary dysków: {len(filtered_pairs)} z {len(plan['ordered_pairs'])}",
-            "Przeznaczenie: Weryfikacja poprawności planowanych operacji przed podjęciem fizycznych zmian na dyskach.",
-            "=" * 84,
-            "",
-            "1. STAN DYSKÓW I BILANS MIEJSCA (ZAPISANE W BAZIE DLA TRYBU OFFLINE):",
-        ]
-
-        if not volumes:
-            lines.append("   Brak zarejestrowanych urządzeń w bazie.")
-        else:
-            for vid in sorted(volumes.keys()):
-                v = volumes[vid]
-                sp = vol_space_summary[vid]
-                status_lbl = "ONLINE" if v.is_online else "OFFLINE (Dane z bazy SQLite)"
-                if sp["has_known_capacity"]:
-                    free_mb = sp["known_free_bytes"] / (1024 * 1024)
-                    total_mb = sp["known_total_bytes"] / (1024 * 1024)
-                    recl_mb = sp["reclaimed_bytes"] / (1024 * 1024)
-                    req_mb = sp["required_bytes"] / (1024 * 1024)
-                    proj_mb = sp["projected_free_bytes"] / (1024 * 1024)
-                    cap_note = "OK" if sp["space_ok"] else "UWAGA: NIEWYSTARCZAJĄCE MIEJSCE!"
-                    lines.append(
-                        f"   - [{status_lbl}] {v.volume_label} ({v.last_known_drive_letter}, VSN: {v.volume_serial_number})"
-                    )
-                    lines.append(
-                        f"     Pojemność całkowita: {total_mb:.2f} MB | Wolne w bazie: {free_mb:.2f} MB | "
-                        f"Do odzyskania z duplikatów: +{recl_mb:.2f} MB | Wymagane na backup: -{req_mb:.2f} MB | "
-                        f"Prognoza po operacji: {proj_mb:.2f} MB [{cap_note}]"
-                    )
-                else:
-                    lines.append(
-                        f"   - [{status_lbl}] {v.volume_label} ({v.last_known_drive_letter}, VSN: {v.volume_serial_number}) — brak zapisanej pojemności"
-                    )
-
-        lines.extend(["", "2. PLANOWANE OPERACJE BACKUPU I DEDUPLIKACJI (WG WYBRANYCH PAR URZĄDZEŃ A <-> B):"])
-        if not filtered_pairs:
-            lines.append("   Brak operacji dla wybranych par urządzeń i trybu.")
-        else:
-            for idx, pair in enumerate(filtered_pairs, start=1):
-                va = pair["vol_a"]
-                vb = pair["vol_b"]
-                va_lbl = f"{va.volume_label} ({va.last_known_drive_letter})" if va else "?"
-                vb_lbl = f"{vb.volume_label} ({vb.last_known_drive_letter})" if vb else "?"
-                pair_state = "GOTOWA (OBA ONLINE)" if pair["both_online"] else "OFFLINE / WYMAGA PODŁĄCZENIA"
-                lines.append(f"   --- Para #{idx}: {va_lbl} <-> {vb_lbl} [{pair_state}] ---")
-                tasks = pair["tasks"]
-
-                if do_backup:
-                    for ct in tasks["backups_to_copy"]:
-                        sv = volumes.get(ct["src_vol_id"])
-                        dv = volumes.get(ct["dst_vol_id"])
-                        sz_mb = (ct["file_size"] or 0) / (1024 * 1024)
-                        lines.append(
-                            f"     [KOPIOWANIE BACKUPU] {(sv.volume_label if sv else '?')}:{ct.get('src_relative_path', ct['file_name'])} "
-                            f"-> {(dv.volume_label if dv else '?')}:{ct.get('dst_relative_path', f'{self.BACKUP_DIR_NAME}/')} ({sz_mb:.2f} MB)"
-                        )
-
-                    for rt in tasks["backups_to_relocate"]:
-                        rv = volumes.get(rt["vol_id"])
-                        lines.append(
-                            f"     [PRZENIESIENIE DO {self.BACKUP_DIR_NAME}/] {(rv.volume_label if rv else '?')}:{rt.get('src_relative_path', '')} "
-                            f"-> {(rv.volume_label if rv else '?')}:{rt.get('dst_relative_path', f'{self.BACKUP_DIR_NAME}/')}"
-                        )
-
-                if do_dedup:
-                    for dt in tasks["duplicates_to_delete"]:
-                        dv = volumes.get(dt["dup_vol_id"])
-                        rv = volumes.get(dt["ref_vol_id"])
-                        sz_mb = (dt.get("file_size") or 0) / (1024 * 1024)
-                        lines.append(
-                            f"     [USUNIĘCIE DUPLIKATU] {(dv.volume_label if dv else '?')}:{dt.get('dup_relative_path', dt.get('file_name', ''))} "
-                            f"({sz_mb:.2f} MB) | Zachowany oryginał: {(rv.volume_label if rv else '?')}:{dt.get('ref_relative_path', '')}"
-                        )
-
-        lines.extend(["", "3. OCZEKUJĄCE PRZENIESIENIA PLIKÓW Z LISTY TODO (TRYB OFFLINE):"])
-        if not pending_summary["todos"]:
-            lines.append("   Lista TODO jest pusta — brak oczekujących przeniesień plików.")
-        else:
-            for td in pending_summary["todos"]:
-                sv_lbl = td.source_volume.volume_label if td.source_volume else "?"
-                tv_lbl = td.target_volume.volume_label if td.target_volume else "?"
-                lines.append(
-                    f"   - [PRZENIESIENIE TODO #{td.id}] {sv_lbl}:{td.source_relative_path} -> {tv_lbl}:{td.target_relative_path}"
-                )
-
-        lines.extend(["", "4. ORYGINAŁY Z DUPLIKATAMI NA TYM SAMYM DYSKU (DO ALBUMU 'WAŻNE'):"])
-        active_vols = {v for p in selected_pairs_set for v in p} if selected_pairs_set is not None else None
-        imp_candidates = [
-            (it, v) for it, v in plan["important_candidates"]
-            if active_vols is None or v.id in active_vols
-        ]
-        if not imp_candidates:
-            lines.append("   Brak nowych kandydatów.")
-        else:
-            for orig_it, orig_v in imp_candidates:
-                lines.append(
-                    f"   - {orig_v.volume_label}:{orig_it.relative_path} -> Album: Ważne - {orig_v.volume_label} / {orig_it.effective_date.strftime('%Y / %Y-%m')}"
-                )
-
-        lines.extend(["", "=" * 84])
-        report_text = "\n".join(lines)
-
-        reports_dir = db_module.REPORTS_DIR
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        report_file = reports_dir / f"raport_procedura_offline_{ts_str}.txt"
-        latest_file = reports_dir / "raport_procedura_offline_ostatni.txt"
-        report_file.write_text(report_text, encoding="utf-8")
-        latest_file.write_text(report_text, encoding="utf-8")
-
-        OperationLogger.log(
-            "OFFLINE_REPORT",
-            f"Wygenerowano raport procedury offline: {report_file.name}",
-            status="OK",
-            details={
-                "report_path": str(report_file),
-                "unbacked_count": plan["unbacked_count"],
-                "redundant_duplicates_count": plan["redundant_duplicates_count"],
-                "pending_todos_count": pending_summary["total_pending"],
-            },
-            db=self.db,
-        )
-
-        return {
-            "report_path": str(report_file),
-            "latest_path": str(latest_file),
-            "report_text": report_text,
-            "plan": plan,
-            "pending_summary": pending_summary,
-        }
 
     def recalculate_date_anomalies(self) -> Dict[str, int]:
         """

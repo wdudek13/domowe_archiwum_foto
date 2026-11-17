@@ -47,17 +47,17 @@
                 <span class="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Domowe Archiwum Foto</span>
             </a>
         </div>
-        <div id="global-notification" class="text-xs px-3 py-1 rounded max-w-2xl truncate"></div>
+        <div id="global-notification" class="text-xs px-3 py-1 rounded max-w-2xl leading-snug"></div>
         <div class="flex items-center space-x-2 text-xs">
             <button type="button"
                     onclick="openBackupModal()"
                     class="bg-emerald-900/80 hover:bg-emerald-800 border border-emerald-600/60 px-3 py-1.5 rounded-lg text-emerald-200 font-semibold transition">
-                🛡️ Backup i Deduplikacja (100%)
+                🛡️ Backup zdjęć/filmów
             </button>
             <button type="button"
-                    onclick="openTodoModal()"
-                    class="bg-amber-900/80 hover:bg-amber-800 border border-amber-600/60 px-3 py-1.5 rounded-lg text-amber-200 font-medium transition">
-                📋 Lista TODO (Offline)
+                    onclick="openMoveBackupsModal()"
+                    class="bg-teal-900/80 hover:bg-teal-800 border border-teal-600/60 px-3 py-1.5 rounded-lg text-teal-200 font-medium transition">
+                🚚 Przenieś backupy
             </button>
             <button type="button"
                     onclick="openStatusModal()"
@@ -143,13 +143,13 @@
         </div>
     </div>
 
-    <!-- Backup & 100% Safe Deduplication Modal -->
+    <!-- Backup zdjęć/filmów Modal -->
     <div id="backup-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
+        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-5xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
             <div class="flex justify-between items-center border-b border-borderBg pb-3">
                 <div>
-                    <h3 class="font-bold text-sm text-emerald-400">🛡️ Automatyczny Backup na inne urządzenie i 100% Bezpieczna Deduplikacja</h3>
-                    <p class="text-[11px] text-slate-400">Kopia zapasowa zawsze w katalogu <code>daf_backup/</code> na innym dysku niż oryginał • Wielowarstwowa weryfikacja 100% przed usunięciem duplikatów • Obsługa par dysków w obie strony.</p>
+                    <h3 class="font-bold text-sm text-emerald-400">🛡️ Backup zdjęć i filmów (katalog <code>daf_backup/</code>)</h3>
+                    <p class="text-[11px] text-slate-400">Wybór urządzeń docelowych • Kopie w strukturze <code>daf_backup/RRRR/MM/DD/</code> na innym dysku niż oryginał • 100% weryfikacja binarna • Albumy „Ważne”.</p>
                 </div>
                 <button type="button" onclick="document.getElementById('backup-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
             </div>
@@ -157,17 +157,17 @@
         </div>
     </div>
 
-    <!-- Offline Pending Moves (Lista TODO) Modal -->
-    <div id="todo-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <!-- Move Backups Between Devices Modal -->
+    <div id="move-backups-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
         <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
             <div class="flex justify-between items-center border-b border-borderBg pb-3">
                 <div>
-                    <h3 class="font-bold text-sm text-amber-400">📋 Lista TODO — Oczekujące fizyczne przeniesienia plików (Tryb Offline)</h3>
-                    <p class="text-[11px] text-slate-400">Pliki zostały już przeniesione logicznie w bazie. Tutaj możesz wykonać fizyczne przeniesienia parami dysków w obie strony lub wycofać zmiany.</p>
+                    <h3 class="font-bold text-sm text-teal-400">🚚 Przenoszenie backupów między urządzeniami</h3>
+                    <p class="text-[11px] text-slate-400">Przenoszenie plików backupu z jednego dysku na drugi z zachowaniem zasady rozdzielenia Oryginału i Backupu na różnych nośnikach.</p>
                 </div>
-                <button type="button" onclick="document.getElementById('todo-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+                <button type="button" onclick="document.getElementById('move-backups-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
             </div>
-            <div id="todo-panel-body"></div>
+            <div id="move-backups-panel-body"></div>
         </div>
     </div>
 
@@ -220,14 +220,14 @@
 
         function openBackupModal() {
             document.getElementById('backup-modal').classList.remove('hidden');
-            document.getElementById('backup-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Analizowanie dysków, duplikatów i brakujących backupów...</div>";
+            document.getElementById('backup-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Analizowanie dysków i brakujących backupów...</div>";
             htmx.ajax('GET', '/actions/backup-panel', '#backup-panel-body');
         }
 
-        function openTodoModal() {
-            document.getElementById('todo-modal').classList.remove('hidden');
-            document.getElementById('todo-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Ładowanie listy oczekujących przeniesień (TODO)...</div>";
-            htmx.ajax('GET', '/actions/todo-panel', '#todo-panel-body');
+        function openMoveBackupsModal() {
+            document.getElementById('move-backups-modal').classList.remove('hidden');
+            document.getElementById('move-backups-panel-body').innerHTML = "<div class='p-8 text-center text-slate-400 animate-pulse'>Analizowanie backupów na urządzeniach...</div>";
+            htmx.ajax('GET', '/actions/move-backups-panel', '#move-backups-panel-body');
         }
 
         function openStatusModal() {
@@ -276,11 +276,42 @@
 
         function updateSelectionState() {
             syncPersistedSelectionFromDom();
-            const checked = document.querySelectorAll("input[name='selected_ids']:checked");
+            const totalSelected = window.persistedSelectedIds.size;
             const countSpan = document.getElementById('selected-counter');
             const scopeSelect = document.getElementById('bulk-scope-select');
-            if (countSpan) countSpan.textContent = checked.length;
-            if (scopeSelect) scopeSelect.value = checked.length > 0 ? 'selected' : 'filtered';
+            if (countSpan) countSpan.textContent = totalSelected;
+            if (scopeSelect) scopeSelect.value = totalSelected > 0 ? 'selected' : 'filtered';
+        }
+
+        async function selectAllRedundantDuplicates() {
+            const form = document.getElementById('filter-form');
+            const params = form ? new URLSearchParams(new FormData(form)) : new URLSearchParams();
+            try {
+                const resp = await fetch('/actions/redundant-duplicate-ids?' + params.toString());
+                if (resp.ok) {
+                    const data = await resp.json();
+                    window.persistedSelectedIds = new Set(data.ids || []);
+                    document.querySelectorAll("input[name='selected_ids']").forEach(cb => {
+                        cb.checked = window.persistedSelectedIds.has(cb.value);
+                    });
+                    const countSpan = document.getElementById('selected-counter');
+                    const scopeSelect = document.getElementById('bulk-scope-select');
+                    if (countSpan) countSpan.textContent = window.persistedSelectedIds.size;
+                    if (scopeSelect) scopeSelect.value = window.persistedSelectedIds.size > 0 ? 'selected' : 'filtered';
+                    return;
+                }
+            } catch (e) {
+                console.error('Error fetching redundant duplicate IDs:', e);
+            }
+            document.querySelectorAll("input[data-is-dup='true']").forEach(cb => {
+                cb.checked = true;
+                window.persistedSelectedIds.add(cb.value);
+            });
+            document.querySelectorAll("input[data-is-dup='false']").forEach(cb => {
+                cb.checked = false;
+                window.persistedSelectedIds.delete(cb.value);
+            });
+            updateSelectionState();
         }
 
         function selectAllVisible(state) {
@@ -672,15 +703,28 @@
             }
         }
 
+        document.body.addEventListener('htmx:configRequest', function(evt) {
+            const detail = evt.detail || {};
+            const elt = detail.elt;
+            const inc = elt && elt.getAttribute ? (elt.getAttribute('hx-include') || '') : '';
+            const scopeEl = document.getElementById('bulk-scope-select');
+            if (inc.includes('bulk-scope-select') && scopeEl && scopeEl.value === 'selected' && window.persistedSelectedIds.size > 0) {
+                detail.parameters['selected_ids_json'] = JSON.stringify(Array.from(window.persistedSelectedIds));
+            }
+        });
+
         document.body.addEventListener('htmx:beforeRequest', function(evt) {
             const detail = evt.detail || {};
             const path = (detail.pathInfo && detail.pathInfo.requestPath) || '';
             const silentPaths = [
                 '/actions/ai-status',
+                '/actions/dup-delete-status',
+                '/actions/dup-delete-stop',
                 '/actions/unindex-status',
                 '/actions/status-panel',
                 '/actions/backup-panel',
-                '/actions/todo-panel',
+                '/actions/move-backups-panel',
+                '/actions/gdrive-panel',
                 '/media/search'
             ];
             const isSilent = silentPaths.some(p => path.startsWith(p));
@@ -717,6 +761,36 @@
             )) {
                 clearPersistedSelection();
             }
+        });
+
+        function _renderHtmxError(detail, fallbackLabel) {
+            document.querySelectorAll("[data-busy-disabled='1']").forEach(btn => {
+                btn.disabled = false;
+                delete btn.dataset.busyDisabled;
+            });
+            const xhr = detail && detail.xhr;
+            const status = xhr ? xhr.status : 0;
+            let errText = fallbackLabel;
+            if (xhr && xhr.responseText) {
+                try {
+                    const j = JSON.parse(xhr.responseText);
+                    if (j && j.detail) errText = String(j.detail);
+                } catch (_) {
+                    errText = String(xhr.responseText).slice(0, 200);
+                }
+            }
+            const notif = document.getElementById('global-notification');
+            if (notif) {
+                notif.innerHTML = `<span class='text-rose-400 text-xs font-semibold'>❌ Błąd operacji${status ? ' (HTTP ' + status + ')' : ''}: ${errText}</span>`;
+            }
+        }
+
+        document.body.addEventListener('htmx:responseError', function(evt) {
+            _renderHtmxError(evt.detail, 'Serwer odrzucił żądanie lub wystąpił błąd.');
+        });
+
+        document.body.addEventListener('htmx:sendError', function(evt) {
+            _renderHtmxError(evt.detail, 'Błąd połączenia z serwerem lokalnym.');
         });
 
         document.body.addEventListener('htmx:afterSwap', function(evt) {

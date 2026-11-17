@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Przewodnik Użytkownika — Domowe Archiwum Foto</title>
+    <style>
+        :root {
+            --bg-main: #0b0f19;
+            --bg-card: #131b2e;
+            --bg-soft: #1a243d;
+            --border: #253356;
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent: #6366f1;
+            --accent-2: #38bdf8;
+            --emerald: #34d399;
+            --amber: #fbbf24;
+            --rose: #fb7185;
+            --purple: #c084fc;
+        }
+        * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg-main);
+            color: var(--text-main);
+            line-height: 1.65;
+        }
+        a { color: var(--accent-2); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        header.hero {
+            background: linear-gradient(135deg, #131b2e 0%, #1e1b4b 55%, #0f172a 100%);
+            border-bottom: 1px solid var(--border);
+            padding: 2rem 1.5rem;
+        }
+        .hero-inner {
+            max-width: 1280px;
+            margin: 0 auto;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.25rem;
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+        }
+        .brand-badge {
+            background: var(--accent);
+            color: #fff;
+            font-weight: 800;
+            padding: 0.55rem 0.85rem;
+            border-radius: 0.65rem;
+            letter-spacing: 0.05em;
+            font-size: 0.95rem;
+        }
+        h1 { margin: 0; font-size: 1.85rem; color: #fff; }
+        .subtitle { margin: 0.25rem 0 0; color: var(--text-muted); font-size: 0.95rem; }
+        .header-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+        .btn-link {
+            display: inline-block;
+            padding: 0.55rem 1rem;
+            border-radius: 0.55rem;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            color: #fff;
+            font-weight: 600;
+            font-size: 0.88rem;
+        }
+        .btn-link.primary { background: var(--accent); border-color: var(--accent); }
+        .layout {
+            max-width: 1280px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 290px 1fr;
+            gap: 1.75rem;
+            padding: 1.75rem 1.5rem 4rem;
+        }
+        nav.toc {
+            position: sticky;
+            top: 1rem;
+            align-self: start;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 0.85rem;
+            padding: 1.15rem;
+            max-height: calc(100vh - 2rem);
+            overflow-y: auto;
+        }
+        nav.toc h2 {
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            margin: 0 0 0.75rem;
+        }
+        nav.toc ol {
+            margin: 0;
+            padding-left: 1.15rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+            font-size: 0.88rem;
+        }
+        nav.toc a { color: #cbd5e1; }
+        nav.toc a:hover { color: #fff; }
+        main.guide-content {
+            display: flex;
+            flex-direction: column;
+            gap: 1.75rem;
+            min-width: 0;
+        }
+        section.chapter {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 0.95rem;
+            padding: 1.5rem 1.75rem;
+        }
+        section.chapter h2 {
+            margin: 0 0 0.85rem;
+            font-size: 1.35rem;
+            color: #fff;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0.55rem;
+        }
+        section.chapter h3 {
+            margin: 1.25rem 0 0.5rem;
+            font-size: 1.05rem;
+            color: var(--accent-2);
+        }
+        .steps {
+            margin: 0.75rem 0;
+            padding-left: 1.35rem;
+        }
+        .steps li { margin-bottom: 0.45rem; }
+        .callout {
+            border-left: 4px solid var(--accent-2);
+            background: rgba(56, 189, 248, 0.08);
+            padding: 0.85rem 1rem;
+            border-radius: 0 0.6rem 0.6rem 0;
+            margin: 1rem 0;
+            font-size: 0.92rem;
+        }
+        .callout.warn {
+            border-left-color: var(--amber);
+            background: rgba(251, 191, 36, 0.09);
+        }
+        .callout.safe {
+            border-left-color: var(--emerald);
+            background: rgba(52, 211, 153, 0.09);
+        }
+        .ui-btn {
+            display: inline-block;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 0.1rem 0.48rem;
+            border-radius: 0.38rem;
+            font-size: 0.84rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        kbd {
+            background: #0f172a;
+            border: 1px solid #475569;
+            border-radius: 0.3rem;
+            padding: 0.08rem 0.42rem;
+            font-family: ui-monospace, Consolas, monospace;
+            font-size: 0.84em;
+            color: #f8fafc;
+        }
+        code {
+            background: #0f172a;
+            padding: 0.12rem 0.4rem;
+            border-radius: 0.3rem;
+            font-family: ui-monospace, Consolas, monospace;
+            font-size: 0.88em;
+            color: var(--emerald);
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 1rem;
+            margin-top: 0.85rem;
+        }
+        .mini-card {
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: 0.65rem;
+            padding: 0.9rem 1rem;
+            font-size: 0.9rem;
+        }
+        .mini-card strong { color: #fff; display: block; margin-bottom: 0.25rem; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 0.85rem 0;
+            font-size: 0.9rem;
+        }
+        th, td {
+            border: 1px solid var(--border);
+            padding: 0.55rem 0.75rem;
+            text-align: left;
+            vertical-align: top;
+        }
+        th { background: var(--bg-soft); color: #fff; }
+        footer {
+            border-top: 1px solid var(--border);
+            text-align: center;
+            padding: 1.5rem;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+        @media (max-width: 920px) {
+            .layout { grid-template-columns: 1fr; }
+            nav.toc { position: static; max-height: none; }
+        }
+        @media print {
+            body { background: #fff; color: #000; }
+            nav.toc, .header-actions { display: none; }
+            section.chapter { border-color: #cbd5e1; background: #fff; break-inside: avoid; }
+            code, .ui-btn, kbd { background: #f1f5f9; color: #000; border-color: #94a3b8; }
+        }
+    </style>
+</head>
+<body>
+    <header class="hero">
+        <div class="hero-inner">
+            <div class="brand">
+                <div class="brand-badge">DAF</div>
+                <div>
+                    <h1>Przewodnik Użytkownika — Domowe Archiwum Foto</h1>
+                    <p class="subtitle">Instrukcja krok po kroku: bezpieczne porządkowanie zdjęć na wielu dyskach USB, backup, praca Offline, AI i chmura Google Drive</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <a href="/" class="btn-link primary">🏠 Otwórz Galerię</a>
+                <a href="/dokumentacja" class="btn-link">🛠️ Dokumentacja Techniczna</a>
+            </div>
+        </div>
+    </header>
+
+    <div class="layout">
+        <nav class="toc" aria-label="Spis treści przewodnika">
+            <h2>Spis rozdziałów</h2>
+            <ol>
+                <li><a href="#r1">Szybki start i budowa ekranu</a></li>
+                <li><a href="#r2">Podłączanie i skanowanie dysków USB</a></li>
+                <li><a href="#r3">Przeglądanie galerii i wyszukiwanie podobnych</a></li>
+                <li><a href="#r4">Backup i 100% bezpieczna deduplikacja</a></li>
+                <li><a href="#r5">Albumy i Podalbumy (Organizacja)</a></li>
+                <li><a href="#r6">Tryb Offline i Lista TODO</a></li>
+                <li><a href="#r7">Podgląd, obracanie, zoom i Pełny Ekran</a></li>
+                <li><a href="#r8">Zmiana daty i lista anomalii dat</a></li>
+                <li><a href="#r9">Analiza AI oraz Status i Log Operacji</a></li>
+                <li><a href="#r10">Google Drive — kopia i przywracanie bazy</a></li>
+                <li><a href="#r11">Lokalny Kosz i odzyskiwanie plików</a></li>
+            </ol>
+        </nav>
+
+        <main class="guide-content">
+            <section id="r1" class="chapter">
+                <h2>1. Szybki start i budowa ekranu</h2>
+                <p>
+                    <strong>Domowe Archiwum Foto</strong> działa lokalnie na Twoim komputerze z systemem Windows, bez wysyłania zdjęć na obce serwery.
+                    Wszystkie indeksy i miniaturki znajdują się w katalogu programu <code>data/</code>, dzięki czemu możesz przeglądać całą kolekcję nawet wtedy, gdy zewnętrzne pendrive'y i dyski USB są schowane w szufladzie.
+                </p>
+                <h3>Jak uruchomić program</h3>
+                <ol class="steps">
+                    <li>Kliknij dwukrotnie plik <code>run.bat</code> (lub uruchom w PowerShell skrypt <code>.\start.ps1</code>).</li>
+                    <li>Poczekaj kilka sekund na uruchomienie lokalnego serwera WWW.</li>
+                    <li>Otwórz w przeglądarce adres <code>http://localhost:8000</code> (lub wpisz z innego urządzenia w domowej sieci Wi-Fi adres Twojego komputera na porcie <code>8000</code>).</li>
+                </ol>
+                <h3>Co gdzie znajduje się na ekranie</h3>
+                <div class="grid-2">
+                    <div class="mini-card">
+                        <strong>Górny pasek narzędzi</strong>
+                        Szybki dostęp do: <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>, <span class="ui-btn">📋 Lista TODO (Offline)</span>, <span class="ui-btn">⚙️ Status i Log Operacji</span>, <span class="ui-btn">☁️ Google Drive Archiwum</span> oraz niniejszego <span class="ui-btn">📖 Przewodnik</span>.
+                    </div>
+                    <div class="mini-card">
+                        <strong>Lewy panel boczny</strong>
+                        Lista wszystkich rozpoznanych dysków USB ze statusem <kbd>Online</kbd> / <kbd>Offline</kbd> i wolnym miejscem w GB, drzewo Twoich <strong>Albumów</strong>, tagi AI, lata oraz szybkie filtry problemów (duplikaty, anomalie dat, rozmyte, bez backupu, Kosz).
+                    </div>
+                </div>
+            </section>
+
+            <section id="r2" class="chapter">
+                <h2>2. Podłączanie i skanowanie dysków USB / pendrive'ów</h2>
+                <p>
+                    System Windows potrafi przy kolejnym podpięciu nadać temu samemu pendrive'owi inną literę dysku (raz <code>E:\</code>, innym razem <code>G:\</code>).
+                    <strong>Domowe Archiwum Foto</strong> rozpoznaje nośniki po sprzętowym numerze seryjnym wolumenu (<strong>Windows VSN</strong>), dlatego nigdy nie myli dysków.
+                </p>
+                <ol class="steps">
+                    <li>Podłącz dysk USB lub pendrive do komputera.</li>
+                    <li>Wpisz literę dysku lub konkretny folder (np. <code>E:\</code> albo <code>D:\Zdjecia</code>) w polu skanowania na górze ekranu.</li>
+                    <li>Kliknij <span class="ui-btn">Skanuj dysk</span>. Program policzy sumy kontrolne, wyciągnie najstarszą datę i utworzy lekkie miniatury <code>WebP</code> na dysku lokalnym.</li>
+                    <li>Jeśli przerwiesz duże skanowanie lub chcesz odświeżyć zmienione pliki, możesz włączyć <span class="ui-btn">Re-indeksuj</span> lub wznowić przerwane zadanie w panelu <span class="ui-btn">⚙️ Status i Log Operacji</span>.</li>
+                </ol>
+                <div class="callout">
+                    <strong>Wskazówka:</strong> Po wybraniu dysku w lewym panelu bocznym możesz kliknąć ikonę ołówka / zmianę nazwy dysku i nadać mu czytelną etykietę, np. <em>Pendrive_Kopia_Rodzina</em> albo <em>Dysk_Toshiba_2TB</em>.
+                </div>
+            </section>
+
+            <section id="r3" class="chapter">
+                <h2>3. Przeglądanie galerii i 6 trybów wyszukiwania podobnych zdjęć</h2>
+                <p>
+                    Pasek filtrów na górze pozwala zawęzić widok według dysku, podfolderu, albumu, roku, typu pliku (<em>Zdjęcia / Wideo</em>), tagów oraz jakości obrazu.
+                    Możesz przełączać styl wyświetlania między osią czasu, gęstą siatką miniatur i tabelą techniczną.
+                </p>
+                <h3>6 trybów wyszukiwania podobieństwa</h3>
+                <p>Kliknij zdjęcie, aby je powiększyć, a następnie wybierz <span class="ui-btn">🔍 Podobne</span> (lub skorzystaj z paska wyszukiwania semantycznego):</p>
+                <table>
+                    <thead>
+                        <tr><th>Tryb wyszukiwania</th><th>Do czego służy najlepiej</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><strong>Hybrydowe</strong></td><td>Łączy cechy obiektów AI, kolorystykę oraz podobieństwo wizualne sceny.</td></tr>
+                        <tr><td><strong>Duplikaty wizualne (CIE LAB)</strong></td><td>Znajduje niemal identyczne ujęcia zrobione seryjnie lub po lekkim skompresowaniu/przycięciu.</td></tr>
+                        <tr><td><strong>Te same obiekty AI</strong></td><td>Wyszukuje zdjęcia przedstawiające tę samą kategorię scen lub obiektów (np. pies, plaża, góry).</td></tr>
+                        <tr><td><strong>Paleta barw HSV</strong></td><td>Znajduje ujęcia o identycznej kolorystyce (np. zachody słońca, zimowe krajobrazy).</td></tr>
+                        <tr><td><strong>Ta sama sesja czasowa</strong></td><td>Grupuje fotografie wykonane w bardzo bliskim odstępie czasu z tego samego wydarzenia.</td></tr>
+                        <tr><td><strong>Kompozycja i Twarze</strong></td><td>Dopasowuje zdjęcia portretowe o podobnym układzie kadru.</td></tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <section id="r4" class="chapter">
+                <h2>4. Automatyczny Backup na inne urządzenie i 100% bezpieczna deduplikacja</h2>
+                <p>
+                    To najważniejszy mechanizm chroniący Twoje pamiątki przed utratą i bałaganem z dziesiątkami zbędnych kopii.
+                    Celem systemu jest stan idealny: <strong>dla każdego zdjęcia i filmu pozostaje wyłącznie 1 Oryginał + dokładnie 1 Backup na innym fizycznym dysku — i ani jednego duplikatu więcej.</strong>
+                </p>
+                <h3>Nowe tryby wyboru: Zakres operacji i wybrane pary dysków (A ↔ B)</h3>
+                <ul class="steps">
+                    <li><strong>Wybór zakresu operacji:</strong> przed uruchomieniem wybierasz, czy chcesz wykonać <em>Backup + Deduplikacja (oba)</em>, <em>Tylko Backup brakujących plików</em>, czy <em>Tylko Bezpieczna Deduplikacja 100%</em>.</li>
+                    <li><strong>Wybór konkretnych par urządzeń:</strong> na liście <em>Harmonogram par urządzeń (A ↔ B)</em> zaznaczasz tylko te pary nośników, które chcesz obsłużyć w tej sesji (pozostałe możesz zostawić odznaczone i obsłużyć przy kolejnym powrocie). Lista <em>Plików bez backupu na innym urządzeniu</em> automatycznie filtruje się według wybranych par dysków.</li>
+                </ul>
+
+                <h3>Trzy scenariusze pracy z Backupe'm i Deduplikacją</h3>
+                <div class="grid-2" style="grid-template-columns: 1fr;">
+                    <div class="mini-card">
+                        <strong>1. Zrobienie Offline (bez fizycznych zmian na dyskach)</strong>
+                        Kiedy Twoje pendrive'y i dyski zewnętrzne są odłączone, otwórz <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>. Program korzysta z zapisanej w bazie SQLite wolnej przestrzeni dysków (<code>free_bytes</code>), wylicza bilans miejsca (odzysk z duplikatów minus wymagany backup) i pozwala wybrać tryb (backup / deduplikacja / oba) oraz konkretne pary dysków. Kliknij <span class="ui-btn">📄 Przygotuj procedurę Offline i zapisz raport (.txt)</span> — w katalogu <code>data\reports\</code> (oraz jako pobrany plik tekstowy) powstaje szczegółowy plan wszystkich planowanych kopiowań i usunięć do sprawdzenia na spokojnie <strong>bez dotykania żadnych plików na dysku</strong>.
+                    </div>
+                    <div class="mini-card">
+                        <strong>2. Zrobienie od razu Online (ze zmianami fizycznymi)</strong>
+                        Podłącz wybrane dwa (lub więcej) dyski USB do komputera, otwórz okno <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>, wybierz zakres operacji (Backup / Deduplikacja / Oba) oraz zaznacz gotowe pary oznaczone zieloną etykietą <kbd>ONLINE</kbd>. Kliknij <span class="ui-btn">🛡️ Wykonaj dla wybranych par (Backup / Deduplikacja)</span>. Program na bieżąco kopiuje brakujące backupy do <code>daf_backup\RRRR\RRRR-MM\</code>, przelicza wolne miejsce oraz kasuje wyłącznie w 100% zweryfikowane duplikaty w obu kierunkach (<code>A ↔ B</code>).
+                    </div>
+                    <div class="mini-card">
+                        <strong>3. Kontynuacja Offline (na podstawie poprzednio utworzonego raportu)</strong>
+                        Gdy wcześniej wygenerowałeś raport offline (<code>data\reports\raport_procedura_offline_ostatni.txt</code>), w dowolnym momencie wróć do okna <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span> (na górze okna widoczna jest sekcja ostatniego zapisanego raportu oraz przycisk <span class="ui-btn">⬇️ Pobierz raport (.txt)</span>). Zweryfikuj zaplanowane operacje z pliku tekstowego, podłącz wskazane przez raport urządzenia, zaznacz w <em>Harmonogramie par</em> konkretną parę dysków z raportu i kliknij <span class="ui-btn">🛡️ Wykonaj dla wybranych par</span>. Dla większej liczby nośników wykonujesz kolejne pary etapami — wracając później i zaznaczając pozostałe pary lub drugi tryb (np. najpierw <em>Tylko Backup</em>, potem <em>Tylko Deduplikacja</em>).
+                    </div>
+                </div>
+
+                <h3>Zasady działania i gwarancje</h3>
+                <ul class="steps">
+                    <li><strong>Backup zawsze na innym urządzeniu:</strong> kopia zapasowa nigdy nie trafi na ten sam pendrive/dysk, na którym leży oryginał.</li>
+                    <li><strong>Zawsze w kartotece <code>daf_backup\</code>:</strong> oryginał zostaje tam, gdzie akurat jest, natomiast kopia na drugim dysku trafia (lub jest automatycznie przenoszona) do podkatalogu <code>daf_backup\RRRR\RRRR-MM\</code>. Zdjęcia z tego folderu nie pojawiają się w galerii multimediów.</li>
+                    <li><strong>Kontrola wolnego miejsca (Online i Offline):</strong> dla każdego dysku system zapisuje całkowitą i wolną przestrzeń w bazie SQLite. Nawet w trybie <em>Offline</em> znasz dostępną pojemność dysków oraz bilans miejsca (odzyskane z duplikatów minus wymagane na backupy).</li>
+                    <li><strong>Automatyczny album „Ważne”:</strong> jeśli w trakcie porządkowania okaże się, że na jednym dysku znajdował się oryginał i jego lokalny duplikat (lub gdy wśród wielu kopii wybierany jest oryginał z takiego dysku), program automatycznie dopisze ten oryginał do albumu <code>Ważne - &lt;Nazwa Urządzenia&gt; → RRRR → RRRR-MM</code>. W oknie <em>Backup i Deduplikacja</em> harmonogram par prezentuje liczbę takich plików (metryka <em>Do albumu „Ważne”</em> dla obu dysków pary), a pod harmonogramem dostępna jest dedykowana lista podglądu <em>Lista oryginałów dodawanych do albumu „Ważne…”</em>.</li>
+                </ul>
+                <div class="callout safe">
+                    <strong>Gwarancja 100% bezpieczeństwa przed skasowaniem duplikatu:</strong>
+                    Zanim program usunie choćby jeden nadmiarowy duplikat, weryfikuje niezależnie na wiele sposobów, że zachowywana kopia naprawdę istnieje i jest identyczna co do bajta:
+                    sprawdza różne ścieżki fizyczne, rozmiar pliku, pełny hash <strong>SHA-256</strong>, pełny hash <strong>BLAKE2b</strong>, pełny hash <strong>MD5</strong>, wykonuje bezpośrednie porównanie strumienia bajt po bajcie (<code>filecmp</code>) oraz test dekodowania obrazu. Jeśli dowolny test zawiedzie — usunięcie zostaje zablokowane.
+                </div>
+            </section>
+
+            <section id="r5" class="chapter">
+                <h2>5. Albumy i Podalbumy (Organizacja kolekcji)</h2>
+                <p>
+                    Zamiast technicznego pojęcia grup używamy przejrzystych <strong>Albumów i Podalbumów</strong> (drzewa hierarchicznego w lewym panelu).
+                </p>
+                <div class="grid-2">
+                    <div class="mini-card">
+                        <strong>Dodawanie zdjęć do albumu</strong>
+                        Zaznacz zdjęcia (lub ustaw zakres na cały filtr), kliknij <span class="ui-btn">📁 Przypisz do albumu</span>. Możesz <strong>wybrać istniejący album z listy rozwijanej</strong> albo wpisać nazwę nowego albumu.
+                    </div>
+                    <div class="mini-card">
+                        <strong>Zmiana nazwy albumu</strong>
+                        W sekcji zarządzania albumem wybierz album i użyj opcji <strong>Zmień nazwę</strong>, aby poprawić nazwę bez ruszania zdjęć.
+                    </div>
+                    <div class="mini-card">
+                        <strong>1-Klik Auto-Organizacja</strong>
+                        Dostępna <strong>wyłącznie wtedy, gdy wybierzesz konkretne urządzenie (dysk) oraz katalog</strong> w lewym panelu bocznym. Tworzy automatyczne drzewo podalbumów według dat (<code>Rok → Miesiąc</code>) lub struktury folderów dla wybranego wycinka dysku.
+                    </div>
+                    <div class="mini-card">
+                        <strong>Szybkie usuwanie albumu oraz przerzucanie</strong>
+                        <ul>
+                            <li><strong>Szybkie usunięcie samego albumu:</strong> natychmiast usuwa album, a wszystkie zdjęcia wracają bezpiecznie do swobodnej puli (nie są kasowane z dysku!).</li>
+                            <li><strong>Przerzuć do innego albumu i usuń poprzedni:</strong> jednym kliknięciem przenosi wszystkie zdjęcia do docelowego albumu i kasuje stary pusty album.</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <section id="r6" class="chapter">
+                <h2>6. Tryb Offline i Lista TODO (Przenoszenie plików bez podłączonych dysków)</h2>
+                <p>
+                    W trybie <strong>Offline</strong> możesz porządkować swoją kolekcję z kanapy, nawet gdy wszystkie pendrive'y i dyski USB są odłączone:
+                    przypisywać do albumów, zmieniać daty, obracać zdjęcia, uruchamiać wyszukiwanie i planować przeniesienia plików między nośnikami.
+                </p>
+                <ol class="steps">
+                    <li>Zaznacz zdjęcia i kliknij <span class="ui-btn">🚚 Przenieś pliki</span> (wybierz docelowy dysk i opcjonalnie podfolder).</li>
+                    <li>Gdy dysk źródłowy lub docelowy jest odłączony (<em>Offline</em>), program zapisuje operację w bazie na <strong>Liście TODO</strong> oraz <strong>natychmiast aktualizuje logiczną lokalizację w bazie</strong> — od razu widzisz zdjęcia tak, jakby już leżały w nowym miejscu.</li>
+                    <li>Kliknij <span class="ui-btn">📋 Lista TODO (Offline)</span> na górnym pasku, aby w dowolnym momencie obejrzeć pełne zestawienie <strong>Skąd → Dokąd</strong> lub zapisać na dysku lokalnym raport tekstowy (<span class="ui-btn">📄 Zapisz raport zmian (.txt)</span>) przed fizycznym wykonaniem operacji.</li>
+                    <li>Gdy podłączysz potrzebne dyski, otwórz panel TODO i kliknij wykonanie przeniesień — operacje zostaną wykonane <strong>parami dysków w obie strony (A ↔ B)</strong> i system poprosi o kolejne dyski z listy.</li>
+                </ol>
+                <div class="callout warn">
+                    <strong>Pełne bezpieczeństwo wycofania (Rollback):</strong> Jeśli fizyczne przeniesienie nie powiedzie się (np. brak pliku lub miejsca) albo sam klikniesz <strong>Anuluj / Zrezygnuj</strong> na liście TODO, baza danych automatycznie przywróci poprzednie lokalizacje wszystkich niewykonanych plików i wyczyści listę TODO.
+                </div>
+            </section>
+
+            <section id="r7" class="chapter">
+                <h2>7. Podgląd multimediów, obracanie, przesuwanie po powiększeniu i Pełny Ekran</h2>
+                <p>Kliknij miniaturę zdjęcia lub filmu, aby otworzyć pełnoekranowy podgląd (Lightbox):</p>
+                <ul class="steps">
+                    <li><strong>Obracanie z zapamiętaniem w bazie (pojedynczo, listą i grupą):</strong> w podglądzie Lightbox użyj przycisków <span class="ui-btn">⟲ Obróć -90°</span> i <span class="ui-btn">⟳ Obróć +90°</span>. W głównej galerii zaznacz listę zdjęć (albo ustaw zakres na cały filtr) i kliknij <span class="ui-btn">⟳ Obróć +90°</span> na pasku akcji masowych, lub użyj <span class="ui-btn">⟳ Obróć album +90°</span> na pasku aktywnego albumu. Wybrany kąt zapisuje się trwale w SQLite.</li>
+                    <li><strong>Powiększanie i przesuwanie myszką:</strong> klikaj <span class="ui-btn">🔍+</span> / <span class="ui-btn">🔍-</span> (lub kręć kółkiem myszy) i <strong>przeciągaj obraz lewym przyciskiem myszy</strong>, aby obejrzeć detale w dowolnym fragmencie kadru. Przycisk <span class="ui-btn">1:1</span> resetuje widok.</li>
+                    <li><strong>Czysty Pełny Ekran:</strong> przycisk <span class="ui-btn">⛶ Pełny ekran (Czysty)</span> maksymalnie dopasowuje zdjęcie do całego ekranu (100% szerokości/wysokości z zachowaniem oryginalnych proporcji <em>aspect ratio</em>), ukrywając wszystkie paski i opisy. Wciśnij klawisz <kbd>ESC</kbd>, aby wrócić do normalnego widoku.</li>
+                    <li><strong>Tryb TV:</strong> przycisk <span class="ui-btn">📺 Tryb TV</span> uruchamia płynny pokaz slajdów ze sterowaniem strzałkami <kbd>←</kbd> <kbd>→</kbd> lub pilotem Google TV.</li>
+                </ul>
+            </section>
+
+            <section id="r8" class="chapter">
+                <h2>8. Zmiana daty zdjęć oraz zarządzanie listą niezgodności dat</h2>
+                <p>
+                    Program analizuje <strong>wszystkie dostępne źródła daty</strong> według reguły:
+                    (a) jeśli istnieje data <strong>EXIF / wideo</strong>, jest ona używana bez niezgodności;
+                    (b) gdy brak EXIF, wybierana jest <strong>data utworzenia pliku</strong>, o ile zgadza się z nazwą pliku oraz folderem (w nazwie folderu dzień może się różnić, ale <strong>miesiąc i rok muszą się zgadzać</strong>) i nie została zmieniona przy kopiowaniu;
+                    (c) przy rozbieżności wybierana jest <strong>najstarsza data z istniejących źródeł</strong> oraz oznaczana jest <strong>Niezgodność dat</strong>. Wszystkie 5 źródeł daty zobaczysz w oknie szczegółów pliku.
+                </p>
+                <ol class="steps">
+                    <li>Zaznacz wybrane zdjęcia (albo wybierz cały <strong>Album</strong>) i kliknij <span class="ui-btn">📅 Zmień datę / Niezgodności</span>, albo uruchom analizę zbiorczą w <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> &rarr; <em>📅 Analiza niezgodności dat</em>.</li>
+                    <li><strong>Ustawienie nowej daty:</strong> wpisz prawidłową datę i zatwierdź — wszystkie wskazane zdjęcia otrzymają nową datę w bazie i zostaną <strong>automatycznie zdjęte z listy niezgodności dat</strong> (zmiana odświeża się natychmiast również w otwartym oknie szczegółów pliku).</li>
+                    <li><strong>Usunięcie z listy niezgodności bez zmiany daty:</strong> jeśli obecna data pliku jest dla Ciebie właściwa i chcesz tylko wyczyścić flagę ostrzeżenia, kliknij opcję zdjęcia flagi bez zmiany samej daty.</li>
+                </ol>
+            </section>
+
+            <section id="r9" class="chapter">
+                <h2>9. Analiza AI na żądanie, jakość zdjęć oraz Panel Statusu</h2>
+                <p>
+                    Aby nie zużywać pamięci RAM ani procesora podczas zwykłego przeglądania i skanowania dysków, modele AI oraz analizy duplikatów / brakujących backupów uruchamiają się <strong>wyłącznie na Twoje żądanie</strong> (w oknie <em>Analizuj AI</em> oraz w module <em>Backup i Deduplikacja</em>), a po zakończeniu natychmiast zwalniają pamięć RAM.
+                    Dla każdej dłuższej operacji od pierwszej sekundy wyświetla się animowany baner postępu na górnym pasku aplikacji.
+                </p>
+                <h3>Rozbita Analiza AI + Zdjęcia bez danych Analizy AI</h3>
+                <p>W lewym panelu bocznym w sekcji <strong>⚡ Zdjęcia bez danych Analizy AI</strong> jednym kliknięciem wyfiltrujesz zdjęcia według brakującego typu analizy (<em>Brak tagów AI</em>, <em>Brak wektorów 512-D</em>, <em>Niezbadana jakość / ostrość</em>). Następnie kliknij <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> i wybierz tryb:</p>
+                <ul class="steps">
+                    <li><strong>Tagowanie obiektów i scen</strong> (MobileNetV2 ONNX + Haar), <strong>Wektory podobieństwa 512-D</strong>, albo <strong>Wszystkie analizy naraz</strong>.</li>
+                    <li><strong>Rozszerzona detekcja ostrości, uszkodzeń i zdjęć do usunięcia:</strong> analizuje nie tylko rozmycie (Laplacian/Sobel), lecz także skrajne niedoświetlenie (zbyt ciemne kadry), prześwietlenie (wypalona biel), jednorodne puste klatki bez detali oraz uszkodzenia / bardzo niską rozdzielczość — dopisując czytelne tagi <code>do_usuniecia</code> (np. <code>do_usuniecia:rozmyte</code>, <code>do_usuniecia:niedoswietlone</code>, <code>do_usuniecia:przeswietlone</code>).</li>
+                    <li><strong>Szybka vs Dokładna analiza duplikatów (na żądanie):</strong> szybka sprawdza indeks SHA-256 / hash wideo w SQLite, natomiast dokładna 100% weryfikuje pliki bajt po bajcie bezpośrednio na podłączonych dyskach.</li>
+                    <li><strong>Analiza zdjęć bez kopii zapasowej (na żądanie):</strong> odświeża zestawienie plików nieposiadających backupu na innym urządzeniu fizycznym.</li>
+                    <li><strong>Analiza niezgodności dat (na żądanie):</strong> przelicza źródła dat (EXIF, utworzenie pliku, nazwa pliku, nazwa folderu) dla wybranego zakresu lub całej kolekcji i aktualizuje flagi niezgodności dat.</li>
+                </ul>
+                <h3>Pełna kontrola nad procesami i Log na dysku</h3>
+                <p>
+                    Otwórz <span class="ui-btn">⚙️ Status i Log Operacji</span>, aby kontrolować każde uruchomione lub przerwane zadanie (analizę AI, skanowanie, backup i deduplikację, przenoszenie do kosza, trwałe usuwanie plików):
+                </p>
+                <ul class="steps">
+                    <li><strong>Zatrzymaj:</strong> bezpiecznie wstrzymuje działanie w połowie bez utraty dotychczasowego postępu.</li>
+                    <li><strong>Wznów:</strong> kontynuuje niedokończony proces od pozostałych plików.</li>
+                    <li><strong>Usuń z listy:</strong> anuluje zapamiętane zadanie z kolejki.</li>
+                    <li><strong>Log operacji:</strong> wszystkie zdarzenia są równolegle zapisywane w trwałym pliku na dysku <code>data/logs/operations.log</code> oraz prezentowane w tabeli w tym panelu.</li>
+                </ul>
+            </section>
+
+            <section id="r10" class="chapter">
+                <h2>10. Archiwum Google Drive — wysyłanie i przywracanie bazy SQLite</h2>
+                <p>
+                    Panel <span class="ui-btn">☁️ Google Drive Archiwum</span> łączy lokalną bazę z Twoim kontem Google Drive (OAuth 2.0 na podstawie pliku <code>data/credentials.json</code>).
+                </p>
+                <h3>Wysyłanie zdjęć oraz kopii bazy do chmury</h3>
+                <ol class="steps">
+                    <li>Wybierz istniejącą kartotekę na Google Drive albo wpisz nazwę nowej.</li>
+                    <li>Kliknij <span class="ui-btn">☁️ Wyślij wybrane zdjęcia do kartoteki</span> (opcjonalnie z trybem archiwum kasującym oryginał z dysku dopiero po potwierdzeniu zgodności rozmiaru i sumy <code>MD5</code>) lub <span class="ui-btn">📦 Wyślij Backup Bazy SQLite</span>.</li>
+                </ol>
+                <h3>Przywracanie bazy danych z backupu na Google Drive</h3>
+                <ol class="steps">
+                    <li>W oknie <span class="ui-btn">☁️ Google Drive Archiwum</span> wskaż kartotekę zawierającą wysłane wcześniej pliki kopii bazy (<code>.db</code>).</li>
+                    <li>W sekcji <strong>♻️ Przywracanie bazy SQLite z backupu na Google Drive</strong> wybierz plik kopii z listy i kliknij <span class="ui-btn">♻️ Pobierz i przywróć wybraną bazę z Google Drive</span> (albo kliknij <span class="ui-btn">♻️ Przywróć tę bazę</span> bezpośrednio w tabeli zawartości folderu).</li>
+                    <li>System pobierze plik, sprawdzi kryptograficznie sumę kontrolną <strong>MD5</strong> oraz rozmiar, przetestuje integralność SQLite (<code>PRAGMA integrity_check</code>), zachowa profilaktycznie Twoją obecną bazę jako lokalną kopię <code>pre_restore</code> w <code>data/backups/</code> i atomowo odtworzy całą bazę.</li>
+                </ol>
+            </section>
+
+            <section id="r11" class="chapter">
+                <h2>11. Lokalny Kosz i bezpieczne usuwanie</h2>
+                <p>
+                    Domyślne usuwanie nie kasuje zdjęć bezpowrotnie — przenosi je do lokalnego, odwracalnego <strong>Kosza</strong> w katalogu <code>data/kosz</code>:
+                </p>
+                <ul class="steps">
+                    <li>Przełącz widok w lewym panelu bocznym na <strong>Kosz</strong>, aby przejrzeć usunięte elementy.</li>
+                    <li>Możesz przywrócić wybrane zdjęcia lub cały album z powrotem na pierwotną ścieżkę (jeśli dysk jest podłączony) albo opróżnić Kosz trwale.</li>
+                    <li>Przed każdą operacją masowego kasowania program automatycznie wykonuje kopię zapasową bazy danych w <code>data/backups/</code>.</li>
+                </ul>
+            </section>
+        </main>
+    </div>
+
+    <footer>
+        Domowe Archiwum Foto — lokalny system archiwizacji zdjęć i wideo dla Windows &bull; Przewodnik Użytkownika (HTML5)
+    </footer>
+</body>
+</html>

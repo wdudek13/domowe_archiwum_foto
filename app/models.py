@@ -60,6 +60,7 @@ class MediaItem(Base):
     hash_algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
     is_primary_duplicate: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
     is_backup_copy: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    duplicate_role: Mapped[str] = mapped_column(String(32), default="original", index=True, nullable=False)
     verified_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
 
     width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -119,27 +120,6 @@ class MediaEmbedding(Base):
     vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
     media_item: Mapped["MediaItem"] = relationship("MediaItem", back_populates="embedding")
-
-
-class PendingFileMove(Base):
-    """Stores deferred physical file moves scheduled while source or target devices are offline."""
-    __tablename__ = "pending_file_moves"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    media_id: Mapped[str] = mapped_column(String(36), ForeignKey("media_items.id", ondelete="CASCADE"), nullable=False, index=True)
-    source_volume_id: Mapped[int] = mapped_column(Integer, ForeignKey("windows_volumes.id", ondelete="CASCADE"), nullable=False, index=True)
-    source_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
-    source_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    target_volume_id: Mapped[int] = mapped_column(Integer, ForeignKey("windows_volumes.id", ondelete="CASCADE"), nullable=False, index=True)
-    target_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
-    target_file_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True, nullable=False)
-    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-
-    media_item: Mapped["MediaItem"] = relationship("MediaItem")
-    source_volume: Mapped["WindowsVolume"] = relationship("WindowsVolume", foreign_keys=[source_volume_id])
-    target_volume: Mapped["WindowsVolume"] = relationship("WindowsVolume", foreign_keys=[target_volume_id])
 
 
 class BackgroundJob(Base):
