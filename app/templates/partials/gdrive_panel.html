@@ -363,4 +363,9 @@
             {% endif %}
         </div>
     </div>
+
+    <!-- Narzędzia konserwacji bazy SQLite (VACUUM) i miniatur -->
+    {% with maint_prefix='gdrive' %}
+        {% include "partials/maintenance_tools.html" %}
+    {% endwith %}
 </div>

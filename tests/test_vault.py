@@ -4154,6 +4154,151 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertFalse(p1_d2.exists())
 
+                # Verify prompt priorities, per-drive delete counts, and skip_db_backup=1 on continuation:
+                # Create DiskD (offline, 0 duplicates, only reference copies) + DiskE (offline, 2 duplicates)
+                drive_d_off = self.root / "DriveD_OffRef"
+                drive_e_off = self.root / "DriveE_OffDups"
+                drive_d_off.mkdir(parents=True, exist_ok=True)
+                drive_e_off.mkdir(parents=True, exist_ok=True)
+                vol_d = WindowsVolume(
+                    volume_serial_number="DD00-0001",
+                    volume_label="DiskD_RefOnly",
+                    last_known_drive_letter=str(drive_d_off),
+                    is_online=False,
+                )
+                vol_e = WindowsVolume(
+                    volume_serial_number="EE00-0002",
+                    volume_label="DiskE_HasDups",
+                    last_known_drive_letter=str(drive_e_off),
+                    is_online=False,
+                )
+                db.add_all([vol_d, vol_e])
+                db.commit()
+                db.refresh(vol_d)
+                db.refresh(vol_e)
+
+                # Online duplicate on DiskA whose ONLY surviving reference copies sit on offline DiskD (0 dups on D!)
+                # + 2 duplicates on offline DiskE referencing DiskA/DiskB
+                p_ref_only = create_synthetic_jpeg(drive_d_off / "ref_only.jpg", color=(12, 34, 56))
+                p_bkp_d = drive_d_off / "daf_backup" / "2024" / "06" / "01" / "ref_only.jpg"
+                p_bkp_d.parent.mkdir(parents=True, exist_ok=True)
+                p_bkp_d.write_bytes(p_ref_only.read_bytes())
+                p_dup_a_from_d = self.drive_a / "ref_only_dup.jpg"
+                p_dup_a_from_d.write_bytes(p_ref_only.read_bytes())
+
+                p_e_orig = create_synthetic_jpeg(self.drive_a / "e_src.jpg", color=(90, 80, 70))
+                p_e_bkp = self.drive_b / "daf_backup" / "2024" / "06" / "01" / "e_src.jpg"
+                p_e_bkp.parent.mkdir(parents=True, exist_ok=True)
+                p_e_bkp.write_bytes(p_e_orig.read_bytes())
+                p_e_dup1 = drive_e_off / "e_dup1.jpg"
+                p_e_dup2 = drive_e_off / "e_dup2.jpg"
+                p_e_dup1.write_bytes(p_e_orig.read_bytes())
+                p_e_dup2.write_bytes(p_e_orig.read_bytes())
+
+                extra_items = [
+                    FileScannerService.process_file(p_ref_only, vol_d),
+                    FileScannerService.process_file(p_bkp_d, vol_d),
+                    FileScannerService.process_file(p_dup_a_from_d, vol_a),
+                    FileScannerService.process_file(p_e_orig, vol_a),
+                    FileScannerService.process_file(p_e_bkp, vol_b),
+                    FileScannerService.process_file(p_e_dup1, vol_e),
+                    FileScannerService.process_file(p_e_dup2, vol_e),
+                ]
+                db.add_all(extra_items)
+                db.commit()
+                svc.flag_duplicate_clusters()
+
+                # Mark DiskD offline AFTER scanning (A, B, C online; D and E offline)
+                dup_target_ids = [extra_items[2].id, extra_items[5].id, extra_items[6].id]
+                r_off_plan = self.client.post(
+                    "/actions/delete-permanently",
+                    headers={"HX-Request": "true"},
+                    data={
+                        "scope": "selected",
+                        "selected_ids": dup_target_ids,
+                        "duplicates_only": "true",
+                    },
+                )
+                self.assertEqual(r_off_plan.status_code, 200)
+                for _ in range(100):
+                    if not actions_router.DUP_DELETE_STATE["running"]:
+                        break
+                    time.sleep(0.05)
+                r_off_poll = self.client.get("/actions/dup-delete-status")
+                self.assertEqual(r_off_poll.status_code, 200)
+                # Must ask for DiskE_HasDups (2 duplicates) BEFORE DiskD_RefOnly (0 duplicates) and never prompt online DiskA!
+                self.assertIn("DiskE_HasDups", r_off_poll.text)
+                self.assertNotIn("<u>DiskA</u>", r_off_poll.text)
+                self.assertIn("na tym dysku do usunięcia jest <strong>2</strong> duplikatów", r_off_poll.text)
+                self.assertIn("&quot;skip_db_backup&quot;: &quot;1&quot;", r_off_poll.text)
+
+                # Clicking continue with skip_db_backup=1 must NOT call BackupManager.create_backup
+                with patch("app.routers.actions.BackupManager.create_backup") as mock_bkp:
+                    r_cont = self.client.post(
+                        "/actions/delete-permanently",
+                        headers={"HX-Request": "true"},
+                        data={
+                            "scope": "selected",
+                            "selected_ids": [extra_items[5].id, extra_items[6].id],
+                            "duplicates_only": "true",
+                            "skip_db_backup": "1",
+                        },
+                    )
+                    self.assertEqual(r_cont.status_code, 200)
+                    for _ in range(100):
+                        if not actions_router.DUP_DELETE_STATE["running"]:
+                            break
+                        time.sleep(0.05)
+                    mock_bkp.assert_not_called()
+
+    def test_maintenance_vacuum_and_orphan_thumbnails(self):
+        with self.TestingSessionLocal() as db:
+            vol = WindowsVolume(
+                volume_serial_number="VSN-MNT-1",
+                volume_label="MaintDisk",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            db.add(vol)
+            db.commit()
+            db.refresh(vol)
+
+            p_keep = create_synthetic_jpeg(self.drive_a / "keep.jpg")
+            p_trash = create_synthetic_jpeg(self.drive_a / "trashed.jpg")
+            it_keep = FileScannerService.process_file(p_keep, vol)
+            it_trash = FileScannerService.process_file(p_trash, vol)
+            it_trash.is_trashed = True
+            db.add_all([it_keep, it_trash])
+            db.commit()
+
+            # Create an orphan thumbnail in self.thumbs_dir that does NOT belong to any DB item
+            orphan_thumb = self.thumbs_dir / "orphan_leftover_123.webp"
+            orphan_thumb.write_bytes(b"RIFF1234WEBPorphan_data_padding" * 10)
+            valid_thumb = self.thumbs_dir / it_keep.thumbnail_relative_path
+            trashed_thumb = self.thumbs_dir / it_trash.thumbnail_relative_path
+            self.assertTrue(orphan_thumb.exists())
+            self.assertTrue(valid_thumb.exists())
+            self.assertTrue(trashed_thumb.exists())
+
+            # Status panel shows both maintenance tools
+            r_sp = self.client.get("/actions/status-panel")
+            self.assertEqual(r_sp.status_code, 200)
+            self.assertIn("Kompaktuj bazę (VACUUM)", r_sp.text)
+            self.assertIn("Usuń osierocone miniatury", r_sp.text)
+
+            # Cleanup orphan thumbnails deletes ONLY orphan_thumb while keeping active and trashed thumbnails
+            r_clean = self.client.post("/actions/cleanup-orphan-thumbs")
+            self.assertEqual(r_clean.status_code, 200)
+            self.assertIn("Wyczyszczono osierocone miniatury", r_clean.text)
+            self.assertFalse(orphan_thumb.exists())
+            self.assertTrue(valid_thumb.exists())
+            self.assertTrue(trashed_thumb.exists())
+
+            # Manual VACUUM compacts SQLite cleanly and logs DB_VACUUM
+            r_vac = self.client.post("/actions/vacuum-db")
+            self.assertEqual(r_vac.status_code, 200)
+            self.assertIn("Zakończono kompaktowanie bazy (VACUUM)", r_vac.text)
+
 
 if __name__ == "__main__":
     unittest.main()

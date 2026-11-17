@@ -6,12 +6,13 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import threading
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from sqlalchemy import select, delete, update
+from sqlalchemy import select, delete, update, text
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
@@ -942,11 +943,29 @@ def trigger_full_ai_analysis(
     return get_ai_batch_status()
 
 
+def _get_maintenance_stats(db: Session) -> Dict[str, float]:
+    """Returns current SQLite file size and reclaimable freelist MB without heavy disk walks."""
+    db_path = db_module.DB_PATH
+    db_size_mb = (db_path.stat().st_size / (1024 * 1024)) if db_path.exists() else 0.0
+    freelist_mb = 0.0
+    try:
+        freelist_cnt = db.execute(text("PRAGMA freelist_count;")).scalar() or 0
+        page_sz = db.execute(text("PRAGMA page_size;")).scalar() or 4096
+        freelist_mb = (int(freelist_cnt) * int(page_sz)) / (1024 * 1024)
+    except Exception as exc:
+        logger.debug("freelist_count query failed: %s", exc)
+    return {
+        "db_size_mb": db_size_mb,
+        "freelist_mb": freelist_mb,
+    }
+
+
 @router.get("/status-panel")
 def get_status_and_logs_panel(request: Request, db: Session = Depends(get_db)):
     summary = ProcessManager.get_jobs_summary(db)
     logs = OperationLogger.get_recent_logs(db, limit=100)
     volumes = StorageAutomationService(db).refresh_volumes_online_status()
+    maint_stats = _get_maintenance_stats(db)
     return render_template(
         request,
         "partials/status_panel.html",
@@ -956,7 +975,104 @@ def get_status_and_logs_panel(request: Request, db: Session = Depends(get_db)):
             "volumes": volumes,
             "ai_state": AI_BATCH_STATE,
             "dup_state": DUP_DELETE_STATE,
+            "maint_stats": maint_stats,
         },
+    )
+
+
+@router.post("/vacuum-db")
+def vacuum_sqlite_database(db: Session = Depends(get_db)):
+    """Rebuilds the SQLite database file on disk (VACUUM) to physically reclaim freed pages."""
+    db_path = db_module.DB_PATH
+    if not db_path.exists():
+        return HTMLResponse("<span class='text-rose-400 font-semibold'>Brak pliku bazy SQLite na dysku.</span>")
+
+    before_bytes = db_path.stat().st_size
+    wal_path = Path(str(db_path) + "-wal")
+    if wal_path.exists():
+        before_bytes += wal_path.stat().st_size
+
+    # Release this request's SQLAlchemy transaction before exclusive VACUUM rebuild
+    db.close()
+
+    conn = sqlite3.connect(db_path.as_posix(), timeout=30.0, isolation_level=None)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.execute("VACUUM;")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    except sqlite3.Error as exc:
+        return HTMLResponse(
+            f"<div class='p-2.5 rounded-lg bg-rose-950/70 border border-rose-700 text-rose-200'>"
+            f"❌ Błąd kompaktowania bazy (VACUUM): {exc} (upewnij się, że inne ciężkie zapisy zostały zakończone)."
+            f"</div>"
+        )
+    finally:
+        conn.close()
+
+    after_bytes = db_path.stat().st_size
+    if wal_path.exists():
+        after_bytes += wal_path.stat().st_size
+    before_mb = before_bytes / (1024 * 1024)
+    after_mb = after_bytes / (1024 * 1024)
+    saved_mb = max(0.0, before_mb - after_mb)
+
+    OperationLogger.log(
+        "DB_VACUUM",
+        f"Kompaktowanie bazy SQLite (VACUUM): {before_mb:.2f} MB -> {after_mb:.2f} MB (odzyskano {saved_mb:.2f} MB).",
+        status="OK",
+    )
+    return HTMLResponse(
+        f"<div class='p-2.5 rounded-lg bg-emerald-950/70 border border-emerald-600 text-emerald-100'>"
+        f"🗜️ <strong>Zakończono kompaktowanie bazy (VACUUM):</strong> "
+        f"<span class='font-mono'>{before_mb:.2f} MB &rarr; {after_mb:.2f} MB</span> "
+        f"(odzyskano na dysku: <strong class='text-emerald-300 font-mono'>{saved_mb:.2f} MB</strong>)."
+        f"</div>"
+    )
+
+
+@router.post("/cleanup-orphan-thumbs")
+def cleanup_orphan_thumbnails(db: Session = Depends(get_db)):
+    """Deletes thumbnail files in THUMBNAILS_DIR that are no longer referenced by any MediaItem (including Kosz)."""
+    eff_thumbs_dir = THUMBNAILS_DIR
+    if not eff_thumbs_dir.exists():
+        return HTMLResponse("<span class='text-slate-400'>Katalog miniatur jeszcze nie istnieje (0 plików).</span>")
+
+    known_thumbs = {
+        str(p).replace("\\", "/").lstrip("/")
+        for p in db.scalars(select(MediaItem.thumbnail_relative_path)).all()
+        if p
+    }
+    scanned_cnt = 0
+    deleted_cnt = 0
+    freed_bytes = 0
+
+    for fp in eff_thumbs_dir.rglob("*"):
+        if not fp.is_file():
+            continue
+        scanned_cnt += 1
+        rel = fp.relative_to(eff_thumbs_dir).as_posix()
+        if rel not in known_thumbs:
+            try:
+                sz = fp.stat().st_size
+                fp.unlink()
+                deleted_cnt += 1
+                freed_bytes += sz
+            except OSError as exc:
+                logger.debug("Orphan thumbnail unlink failed for %s: %s", fp, exc)
+
+    freed_mb = freed_bytes / (1024 * 1024)
+    OperationLogger.log(
+        "THUMB_CLEANUP",
+        f"Czyszczenie osieroconych miniatur: usunięto {deleted_cnt} z {scanned_cnt} plików (odzyskano {freed_mb:.2f} MB).",
+        status="OK",
+        db=db,
+    )
+    return HTMLResponse(
+        f"<div class='p-2.5 rounded-lg bg-emerald-950/70 border border-emerald-600 text-emerald-100'>"
+        f"🖼️ <strong>Wyczyszczono osierocone miniatury:</strong> usunięto <strong class='font-mono'>{deleted_cnt}</strong> "
+        f"spośród <span class='font-mono'>{scanned_cnt}</span> plików w <code>data/thumbnails/</code> "
+        f"(odzyskano: <strong class='text-emerald-300 font-mono'>{freed_mb:.2f} MB</strong>)."
+        f"</div>"
     )
 
 
@@ -2067,6 +2183,7 @@ def get_gdrive_panel(
     )
 
     active_backup_job = ProcessManager.get_active_backup_job(db)
+    maint_stats = _get_maintenance_stats(db)
 
     try:
         gdrive = GoogleDriveManager()
@@ -2093,6 +2210,7 @@ def get_gdrive_panel(
                 "medium_backups": medium_backups,
                 "local_backups": local_backups,
                 "active_backup_job": active_backup_job,
+                "maint_stats": maint_stats,
                 "error_msg": None,
                 "status_report": False,
             },
@@ -2111,6 +2229,7 @@ def get_gdrive_panel(
                 "medium_backups": medium_backups,
                 "local_backups": local_backups,
                 "active_backup_job": active_backup_job,
+                "maint_stats": maint_stats,
                 "error_msg": str(e),
                 "status_report": False,
             },
@@ -2877,14 +2996,23 @@ def _build_safe_removal_html_response(
     nxt = res["next_offline_prompt"]
 
     if offline_items:
+        nxt_del = int(nxt.get("delete_count", nxt.get("count", 0)) or 0)
+        nxt_ref = int(nxt.get("verify_only_count", 0) or 0)
+        if nxt_del > 0:
+            nxt_job_msg = (
+                f"Przetworzono online: {processed} | Podłącz dysk {nxt['vol_label']} ({nxt['drive_letter']}) "
+                f"— do usunięcia na tym dysku: {nxt_del} duplikatów (łącznie pozostało: {len(offline_ids)})."
+            )
+        else:
+            nxt_job_msg = (
+                f"Przetworzono online: {processed} | Podłącz dysk referencyjny {nxt['vol_label']} ({nxt['drive_letter']}) "
+                f"(0 duplikatów na dysku, {nxt_ref} plików do weryfikacji 100%)."
+            )
         ProcessManager.update_progress(
             job_id,
             remaining_ids=offline_ids,
             status="WAITING_FOR_DEVICE",
-            message=(
-                f"Przetworzono online: {processed} | Oczekuje na podłączenie dysku "
-                f"{nxt['vol_label']} ({nxt['drive_letter']}) dla {len(offline_ids)} plików."
-            ),
+            message=nxt_job_msg,
             db=db,
         )
     else:
@@ -2920,15 +3048,36 @@ def _build_safe_removal_html_response(
                 {
                     "scope": "selected",
                     "duplicates_only": "true",
+                    "skip_db_backup": "1",
                     "selected_ids_json": json.dumps(offline_ids),
                 }
             )
         )
+        nxt_del = int(nxt.get("delete_count", nxt.get("count", 0)) or 0)
+        nxt_ref = int(nxt.get("verify_only_count", 0) or 0)
+        del_drives = [d for d in res["offline_drives"] if int(d.get("delete_count", d.get("count", 0)) or 0) > 0]
+        drive_breakdown = ", ".join(
+            f"{html_mod.escape(d['vol_label'])}: {int(d.get('delete_count', d.get('count', 0)) or 0)} szt."
+            for d in del_drives
+        )
+        if nxt_del > 0:
+            prompt_desc = (
+                f"<span>🔌 <strong>Podłącz kolejny dysk (pozostało dysków z duplikatami: {len(del_drives)})</strong>: "
+                f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
+                f"— na tym dysku do usunięcia jest <strong>{nxt_del}</strong> duplikatów "
+                f"(łącznie pozostało: <strong>{len(offline_ids)}</strong> szt."
+                f"{f' — {drive_breakdown}' if drive_breakdown else ''}).</span>"
+            )
+        else:
+            prompt_desc = (
+                f"<span>🔌 <strong>Podłącz dysk referencyjny do weryfikacji</strong>: "
+                f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
+                f"— na tym dysku brak duplikatów (0 szt.), zawiera kopie referencyjne (Oryginał/Backup) dla "
+                f"<strong>{nxt_ref}</strong> duplikatów oczekujących na podłączonym dysku.</span>"
+            )
         parts.append(
             f"<div class='mt-1.5 p-2 rounded-lg bg-amber-950/90 border border-amber-500 text-amber-100 flex flex-wrap items-center justify-between gap-2 text-[11px]'>"
-            f"<span>🔌 <strong>Podłącz kolejny dysk (offline: {len(res['offline_drives'])})</strong>: "
-            f"<u>{html_mod.escape(nxt['vol_label'])}</u> ({html_mod.escape(nxt['drive_letter'])}, VSN: {html_mod.escape(nxt['vsn'])}) "
-            f"— pozostało <strong>{len(offline_ids)}</strong> duplikatów do bezpiecznego usunięcia.</span>"
+            f"{prompt_desc}"
             f"<button type='button' hx-post='{action_url}' hx-vals=\"{vals_payload}\" hx-target='#global-notification' "
             f"class='bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded font-semibold shadow cursor-pointer'>"
             f"▶️ Kontynuuj na podłączonym dysku"
@@ -2960,31 +3109,33 @@ def _run_duplicate_removal_worker(
     delete_mode: str,
     force_duplicate_verification: bool,
     action_url: str,
+    skip_db_backup: bool = False,
 ) -> None:
     import html as html_mod
 
     try:
-        DUP_DELETE_STATE["stage"] = "backup"
-        DUP_DELETE_STATE["bkp_pct"] = 5
-        DUP_DELETE_STATE["phase"] = "Etap 1/2: Tworzenie bezpiecznej kopii bazy SQLite przed usunięciem..."
-        ProcessManager.update_cache_only(job_id, message=DUP_DELETE_STATE["phase"])
+        if not skip_db_backup:
+            DUP_DELETE_STATE["stage"] = "backup"
+            DUP_DELETE_STATE["bkp_pct"] = 5
+            DUP_DELETE_STATE["phase"] = "Etap 1/2: Tworzenie bezpiecznej kopii bazy SQLite przed usunięciem..."
+            ProcessManager.update_cache_only(job_id, message=DUP_DELETE_STATE["phase"])
 
-        def _on_bkp_progress(msg: str, done: int, total: int) -> None:
-            pct = int((done * 100) / max(1, total))
-            DUP_DELETE_STATE["bkp_pct"] = min(100, max(0, pct))
-            full_msg = f"Etap 1/2 (Kopia bazy): {msg}"
-            DUP_DELETE_STATE["phase"] = full_msg
-            # RAM-only update: NEVER write to SQLite during sqlite3.Connection.backup()
-            ProcessManager.update_cache_only(job_id, message=f"{full_msg} ({pct}%)")
+            def _on_bkp_progress(msg: str, done: int, total: int) -> None:
+                pct = int((done * 100) / max(1, total))
+                DUP_DELETE_STATE["bkp_pct"] = min(100, max(0, pct))
+                full_msg = f"Etap 1/2 (Kopia bazy): {msg}"
+                DUP_DELETE_STATE["phase"] = full_msg
+                # RAM-only update: NEVER write to SQLite during sqlite3.Connection.backup()
+                ProcessManager.update_cache_only(job_id, message=f"{full_msg} ({pct}%)")
 
-        BackupManager().create_backup(
-            "pre_trash_move" if delete_mode == "trash" else "pre_permanent_disk_delete",
-            progress_callback=_on_bkp_progress,
-        )
+            BackupManager().create_backup(
+                "pre_trash_move" if delete_mode == "trash" else "pre_permanent_disk_delete",
+                progress_callback=_on_bkp_progress,
+            )
 
         DUP_DELETE_STATE["stage"] = "delete"
         DUP_DELETE_STATE["bkp_pct"] = 100
-        DUP_DELETE_STATE["phase"] = f"Etap 2/2: Wczytywanie {len(item_ids)} plików i weryfikacja klastrów..."
+        DUP_DELETE_STATE["phase"] = f"Wczytywanie {len(item_ids)} plików i weryfikacja klastrów..."
         ProcessManager.update_cache_only(job_id, message=DUP_DELETE_STATE["phase"])
 
         with SessionLocal() as db:
@@ -3037,6 +3188,7 @@ def _start_duplicate_removal_async(
     delete_mode: str,
     force_duplicate_verification: bool,
     action_url: str,
+    skip_db_backup: bool = False,
 ) -> HTMLResponse:
     if DUP_DELETE_STATE["running"]:
         return get_dup_delete_status()
@@ -3055,12 +3207,12 @@ def _start_duplicate_removal_async(
             "stop_requested": False,
             "job_id": job_id,
             "delete_mode": delete_mode,
-            "stage": "backup",
-            "bkp_pct": 0,
+            "stage": "delete" if skip_db_backup else "backup",
+            "bkp_pct": 100 if skip_db_backup else 0,
             "processed": 0,
             "total": len(item_ids),
             "current_drive": "",
-            "phase": "Etap 1/2: Przygotowanie kopii zapasowej bazy SQLite...",
+            "phase": "Kontynuacja na kolejnym dysku..." if skip_db_backup else "Etap 1/2: Przygotowanie kopii zapasowej bazy SQLite...",
             "final_html": "",
             "error_msg": "",
         }
@@ -3072,6 +3224,7 @@ def _start_duplicate_removal_async(
         delete_mode,
         force_duplicate_verification,
         action_url,
+        skip_db_backup,
     )
     return get_dup_delete_status()
 
@@ -3154,6 +3307,7 @@ async def move_items_to_local_trash(
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
     run_sync = _form_bool(form, "run_sync")
+    skip_db_backup = _form_bool(form, "skip_db_backup")
     is_htmx = request.headers.get("HX-Request") == "true"
 
     if t_gid:
@@ -3190,9 +3344,11 @@ async def move_items_to_local_trash(
             delete_mode="trash",
             force_duplicate_verification=bool(duplicates_only),
             action_url="/actions/move-to-trash",
+            skip_db_backup=skip_db_backup,
         )
 
-    BackupManager().create_backup("pre_trash_move")
+    if not skip_db_backup:
+        BackupManager().create_backup("pre_trash_move")
     job_id = ProcessManager.create_job(
         job_type="move_to_trash",
         title=f"Przenoszenie do Kosza ({len(item_ids)} poz.)",
@@ -3590,6 +3746,7 @@ async def delete_files_permanently_from_disk(
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
     run_sync = _form_bool(form, "run_sync")
+    skip_db_backup = _form_bool(form, "skip_db_backup")
     is_htmx = request.headers.get("HX-Request") == "true"
 
     grp_to_delete = None
@@ -3622,9 +3779,11 @@ async def delete_files_permanently_from_disk(
             delete_mode="permanent",
             force_duplicate_verification=bool(duplicates_only),
             action_url="/actions/delete-permanently",
+            skip_db_backup=skip_db_backup,
         )
 
-    BackupManager().create_backup("pre_permanent_disk_delete")
+    if not skip_db_backup:
+        BackupManager().create_backup("pre_permanent_disk_delete")
     job_id = ProcessManager.create_job(
         job_type="delete_permanently",
         title=f"Trwałe usuwanie plików z dysku ({len(item_ids)} poz.)",

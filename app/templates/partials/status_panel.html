@@ -97,6 +97,11 @@
         {% endif %}
     </div>
 
+    <!-- Konserwacja bazy danych (VACUUM) i czyszczenie osieroconych miniatur -->
+    {% with maint_prefix='status' %}
+        {% include "partials/maintenance_tools.html" %}
+    {% endwith %}
+
     <!-- Sekcja 2: Log operacji zapisany na dysku (data/logs/operations.log - Req 3d) -->
     <div class="bg-slate-900/60 border border-borderBg rounded-xl p-4 space-y-2">
         <div class="flex items-center justify-between">

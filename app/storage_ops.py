@@ -1366,7 +1366,16 @@ class StorageAutomationService:
             )
 
         self.refresh_volumes_online_status()
-        self.flag_duplicate_clusters()
+        needs_initial_flag = (
+            self.db.scalar(
+                select(MediaItem.id)
+                .where(MediaItem.is_trashed == False, MediaItem.duplicate_role.is_(None))
+                .limit(1)
+            )
+            is not None
+        )
+        if needs_initial_flag:
+            self.flag_duplicate_clusters()
 
         target_items: List[MediaItem] = []
         for idx in range(0, len(item_ids), 5000):
@@ -1449,12 +1458,15 @@ class StorageAutomationService:
         missing_on_disk = 0
         offline_items: List[MediaItem] = []
         offline_vol_order: List[int] = []
+        offline_ref_counts: Dict[int, int] = defaultdict(int)
         processed_drives: List[str] = []
 
-        def _mark_offline(it_obj: MediaItem, needed_vid: int):
+        def _mark_offline(it_obj: MediaItem, needed_vid: int, is_ref_only: bool = False):
             offline_items.append(it_obj)
             if needed_vid not in offline_vol_order:
                 offline_vol_order.append(needed_vid)
+            if is_ref_only:
+                offline_ref_counts[needed_vid] += 1
 
         for vid in sorted_vids:
             if stopped_by_user:
@@ -1533,9 +1545,15 @@ class StorageAutomationService:
                                 break
 
                     if ref_item is None or ref_path is None:
-                        # Reference drive (Original/Backup) is offline -> prompt user to connect it
-                        needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
-                        _mark_offline(cand, needed_vid)
+                        # Reference drive (Original/Backup) is offline; prefer a drive that also has pending duplicates
+                        ref_vols = [
+                            rc.volume_id for rc in ref_candidates
+                            if volumes.get(rc.volume_id) and not volumes[rc.volume_id].is_online
+                        ]
+                        needed_vid = next((rv_id for rv_id in ref_vols if rv_id in items_by_vol), None)
+                        if needed_vid is None:
+                            needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
+                        _mark_offline(cand, needed_vid, is_ref_only=True)
                         continue
 
                     # If backup is currently online, verify its file actually exists on disk before trusting it
@@ -1649,22 +1667,34 @@ class StorageAutomationService:
                 )
             self.flag_duplicate_clusters()
 
+        offline_delete_counts: Dict[int, int] = defaultdict(int)
+        for x in offline_items:
+            offline_delete_counts[x.volume_id] += 1
+
         offline_drives_info: List[Dict[str, Any]] = []
-        for ovid in offline_vol_order:
+        seen_ovids = set(offline_vol_order) | set(offline_delete_counts.keys())
+        for ovid in seen_ovids:
             ov = volumes.get(ovid)
-            cnt = sum(1 for x in offline_items if x.volume_id == ovid)
-            if cnt == 0:
-                # Items needing this volume as reference
-                cnt = len(offline_items)
+            if ov and ov.is_online:
+                continue
+            del_cnt = offline_delete_counts.get(ovid, 0)
+            ref_cnt = offline_ref_counts.get(ovid, 0)
+            if del_cnt == 0 and ref_cnt == 0:
+                continue
             offline_drives_info.append(
                 {
                     "volume_id": ovid,
                     "vol_label": ov.volume_label if ov else f"#{ovid}",
                     "drive_letter": ov.last_known_drive_letter if ov else "?",
                     "vsn": ov.volume_serial_number if ov else "?",
-                    "count": cnt,
+                    "count": del_cnt if del_cnt > 0 else ref_cnt,
+                    "delete_count": del_cnt,
+                    "verify_only_count": ref_cnt,
                 }
             )
+        # Prioritize drives that actually hold duplicates to delete (most duplicates first),
+        # never requesting a 0-duplicate reference drive ahead of a drive with duplicates.
+        offline_drives_info.sort(key=lambda d: (d["delete_count"] == 0, -d["delete_count"], -d["verify_only_count"], d["volume_id"]))
 
         next_offline_prompt = offline_drives_info[0] if offline_drives_info else None
         return {
