@@ -148,6 +148,11 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
                     )
             if "verified_sha256" not in m_cols:
                 cur.execute("ALTER TABLE media_items ADD COLUMN verified_sha256 VARCHAR(64);")
+            if "original_relative_path" not in m_cols:
+                cur.execute("ALTER TABLE media_items ADD COLUMN original_relative_path VARCHAR(1024);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_orig_rel_path ON media_items (original_relative_path);"
+            )
 
         cur.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS media_tags_fts USING fts5(media_id UNINDEXED, tag, source_model UNINDEXED);"

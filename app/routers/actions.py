@@ -118,6 +118,10 @@ def _resolve_bulk_ids_fast(
     selected_ids_json: Optional[str] = None,
     redundant_clusters_only: bool = False,
     backups_to_move_only: bool = False,
+    backup_filter: str = "none",
+    backup_types: Optional[List[str]] = None,
+    backup_mode: str = "hide",
+    anomaly_type: str = "all",
 ) -> List[str]:
     """Fast ID-only resolution that avoids loading tens of thousands of ORM rows on HTTP POST."""
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
@@ -150,6 +154,10 @@ def _resolve_bulk_ids_fast(
             unanalyzed_quality_only=unanalyzed_quality_only,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
+            backup_filter=backup_filter,
+            backup_types=backup_types,
+            backup_mode=backup_mode,
+            anomaly_type=anomaly_type,
         ).distinct()
     return [str(x) for x in db.scalars(stmt).all()]
 
@@ -177,6 +185,10 @@ def resolve_target_items(
     selected_ids_json: Optional[str] = None,
     redundant_clusters_only: bool = False,
     backups_to_move_only: bool = False,
+    backup_filter: str = "none",
+    backup_types: Optional[List[str]] = None,
+    backup_mode: str = "hide",
+    anomaly_type: str = "all",
 ) -> List[MediaItem]:
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
     if scope == "selected" and eff_ids:
@@ -210,6 +222,10 @@ def resolve_target_items(
             unanalyzed_quality_only=unanalyzed_quality_only,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
+            backup_filter=backup_filter,
+            backup_types=backup_types,
+            backup_mode=backup_mode,
+            anomaly_type=anomaly_type,
         ).distinct()
     if limit:
         stmt = stmt.limit(limit)
@@ -309,20 +325,29 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                 db.commit()
 
             existing_rows = db.execute(
-                select(MediaItem.relative_path, MediaItem.id, MediaItem.thumbnail_relative_path)
+                select(MediaItem.relative_path, MediaItem.id, MediaItem.thumbnail_relative_path, MediaItem.is_trashed, MediaItem.is_backup_copy)
                 .where(MediaItem.volume_id == vol.id)
             ).all()
-            existing_map = {r[0]: (r[1], r[2]) for r in existing_rows}
-            existing_map_lower = {r[0].lower(): (r[0], r[1], r[2]) for r in existing_rows}
+            existing_map = {r[0]: (r[1], r[2], bool(r[3]), bool(r[4])) for r in existing_rows}
+            existing_map_lower = {r[0].lower(): (r[0], r[1], r[2], bool(r[3]), bool(r[4])) for r in existing_rows}
 
             candidates_to_add = []
+            existing_to_refresh: List[Tuple[Path, str]] = []
             queued_rels_lower: set[str] = set()
-            ids_to_delete: List[str] = []
+            seen_rels_lower: set[str] = set()
             found_total = 0
             already_in_db = 0
             repaired_thumbs = 0
+            updated_existing = 0
 
-            for r, _, files in os.walk(target):
+            # Exclude daf_albums/ and daf_backup/ when walking top-level folders
+            scan_target_low = target.name.lower()
+            skip_dir_names = {"daf_albums"}
+            if scan_target_low not in ("daf_backup", "backup"):
+                skip_dir_names.add("daf_backup")
+
+            for r, dirs, files in os.walk(target):
+                dirs[:] = [d for d in dirs if d.lower() not in skip_dir_names]
                 for f in files:
                     ext = os.path.splitext(f)[1].lower()
                     if ext not in IMAGE_EXTS and ext not in VIDEO_EXTS:
@@ -332,14 +357,16 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                     found_total += 1
                     rel = _compute_scan_relative_path(full, abs_root, root_path, abs_target)
                     rel_low = rel.lower()
+                    seen_rels_lower.add(rel_low)
 
                     if rel_low in queued_rels_lower:
                         continue
 
                     in_existing = rel in existing_map or rel_low in existing_map_lower
-                    if in_existing and not force_rescan:
+                    if in_existing:
                         already_in_db += 1
-                        item_id, thumb_name = existing_map.get(rel) or existing_map_lower[rel_low][1:]
+                        ex_info = existing_map.get(rel) or existing_map_lower[rel_low][1:]
+                        item_id, thumb_name = ex_info[0], ex_info[1]
                         thumb_file = THUMBNAILS_DIR / thumb_name
                         if not thumb_file.exists() or thumb_file.stat().st_size == 0:
                             try:
@@ -347,17 +374,64 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                                 repaired_thumbs += 1
                             except Exception as exc:
                                 logger.debug("Thumbnail repair failed for %s: %s", full, exc)
+                        if force_rescan:
+                            # Non-destructive rescan: preserve AI tags, embeddings, quality scores, albums, rotation
+                            queued_rels_lower.add(rel_low)
+                            existing_to_refresh.append((full, item_id))
                     else:
-                        if in_existing and force_rescan:
-                            del_id = existing_map[rel][0] if rel in existing_map else existing_map_lower[rel_low][1]
-                            ids_to_delete.append(del_id)
                         queued_rels_lower.add(rel_low)
                         candidates_to_add.append((full, rel))
 
-            if ids_to_delete:
-                for i in range(0, len(ids_to_delete), 500):
-                    db.execute(delete(MediaItem).where(MediaItem.id.in_(ids_to_delete[i : i + 500])))
+            if existing_to_refresh:
+                for full_p, ex_id in existing_to_refresh:
+                    ex_item = db.get(MediaItem, ex_id)
+                    if not ex_item:
+                        continue
+                    try:
+                        st = full_p.stat()
+                        is_img_f = full_p.suffix.lower() in IMAGE_EXTS
+                        exif_dt, fn_dt, ct, mt, eff, anom, reason = MetadataDateResolver.resolve_dates(
+                            full_p, is_img_f, rel_path=ex_item.relative_path
+                        )
+                        ex_item.file_size_bytes = st.st_size
+                        ex_item.exif_date = exif_dt
+                        ex_item.filename_date = fn_dt
+                        ex_item.fs_ctime = ct
+                        ex_item.fs_mtime = mt
+                        ex_item.effective_date = eff
+                        ex_item.has_date_anomaly = anom
+                        ex_item.date_anomaly_reason = reason
+                        if not ex_item.embedding:
+                            t_full = THUMBNAILS_DIR / ex_item.thumbnail_relative_path
+                            if t_full.exists() and t_full.stat().st_size > 0:
+                                blob = OnDemandClipEmbedder.generate_image_embedding(t_full)
+                                ex_item.embedding = MediaEmbedding(
+                                    media_id=ex_item.id, model_name=OnDemandClipEmbedder.MODEL_NAME, dimensions=512, vector=blob
+                                )
+                        updated_existing += 1
+                    except Exception as exc:
+                        logger.debug("Non-destructive rescan refresh skipped for %s: %s", full_p, exc)
                 db.commit()
+
+            # Check DB records under the scanned path prefix that are missing physically on disk
+            scan_prefix_rel = ""
+            if abs_target != abs_root:
+                try:
+                    scan_prefix_rel = abs_target.relative_to(abs_root).as_posix().rstrip("/").lower()
+                except ValueError:
+                    scan_prefix_rel = ""
+
+            missing_on_disk = 0
+            for rel_k, (ex_id, _th, ex_trashed, ex_bkp) in existing_map.items():
+                if ex_trashed or ex_bkp:
+                    continue
+                rel_k_low = rel_k.lower()
+                if rel_k_low.startswith("daf_backup/") or rel_k_low.startswith("backup/") or rel_k_low.startswith("daf_albums/"):
+                    continue
+                if scan_prefix_rel and not (rel_k_low.startswith(scan_prefix_rel + "/") or rel_k_low == scan_prefix_rel):
+                    continue
+                if rel_k_low not in seen_rels_lower:
+                    missing_on_disk += 1
 
             if job_id is None and candidates_to_add:
                 job_id = ProcessManager.create_job(
@@ -421,8 +495,8 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
             elif not job_id:
                 OperationLogger.log(
                     "SCAN",
-                    f"Skanowanie {label} ({vsn}): znaleziono {found_total}, nowych: 0, już w bazie: {already_in_db}",
-                    status="OK",
+                    f"Skanowanie {label} ({vsn}): znaleziono {found_total}, nowych: {indexed}, w bazie: {already_in_db}, brak na dysku: {missing_on_disk}",
+                    status="OK" if missing_on_disk == 0 else "WARN",
                     db=db,
                 )
 
@@ -431,6 +505,8 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
                 "found_total": found_total,
                 "indexed": indexed,
                 "already_in_db": already_in_db,
+                "updated_existing": updated_existing,
+                "missing_on_disk": missing_on_disk,
                 "repaired_thumbs": repaired_thumbs,
                 "dup_total": dup_total,
                 "volume": label,
@@ -456,13 +532,22 @@ def trigger_scan(path: str = Form(...), force_rescan: bool = Form(False)):
 
     msg = (
         f"Wolumen {res['volume']} ({res['vsn']}): znaleziono {res['found_total']} plików | "
-        f"Dodano nowych: {res['indexed']} | Już w bazie: {res['already_in_db']}"
+        f"Dodano nowych: {res['indexed']} | Już w bazie (zachowane dane AI/albumy): {res['already_in_db']}"
     )
+    if res.get("updated_existing", 0) > 0:
+        msg += f" | Odświeżono metadane: {res['updated_existing']}"
     if res["repaired_thumbs"] > 0:
         msg += f" | Odświeżono miniatur: {res['repaired_thumbs']}"
+    extra_btn = ""
+    if res.get("missing_on_disk", 0) > 0:
+        msg += f" | ⚠️ Brakujących plików na dysku (w bazie): {res['missing_on_disk']}"
+        extra_btn = (
+            " <button type='button' onclick='openStatusModal()' "
+            "class='ml-2 underline text-amber-300 font-bold'>Sprawdź spójność / Usuń brakujące &rarr;</button>"
+        )
 
     return HTMLResponse(
-        f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>",
+        f"<span class='text-emerald-400 text-xs font-semibold'>{msg}</span>{extra_btn}",
         headers={"HX-Trigger": "refresh-all"},
     )
 
@@ -1274,6 +1359,10 @@ def get_redundant_duplicate_ids(
     quality_defect: Optional[str] = None,
     redundant_clusters_only: bool = False,
     backups_to_move_only: bool = False,
+    backup_filter: str = "none",
+    backup_types: List[str] = Query(default=[]),
+    backup_mode: str = "hide",
+    anomaly_type: str = "all",
     db: Session = Depends(get_db),
 ):
     """Returns IDs of all redundant copies (duplicate_role == 'duplicate', i.e. 3rd+ copy) across ALL pages for the current filter."""
@@ -1300,6 +1389,10 @@ def get_redundant_duplicate_ids(
         quality_defect=quality_defect,
         redundant_clusters_only=redundant_clusters_only,
         backups_to_move_only=backups_to_move_only,
+        backup_filter=backup_filter,
+        backup_types=backup_types,
+        backup_mode=backup_mode,
+        anomaly_type=anomaly_type,
     ).where(MediaItem.duplicate_role == "duplicate").distinct()
     ids = [str(x) for x in db.scalars(stmt).all()]
     return JSONResponse({"ids": ids, "count": len(ids)})
@@ -1669,13 +1762,26 @@ def get_move_backups_panel(
     target_volume_id: Optional[str] = Form(None),
     src_vid: Optional[str] = Query(None),
     dst_vid: Optional[str] = Query(None),
+    include_in_vault: Optional[str] = Form(None),
+    include_green_outside: Optional[str] = Form(None),
+    include_orange_same_disk: Optional[str] = Form(None),
+    types_submitted: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """Displays and recalculates backup transfers between a user-selected pair of devices."""
     svc = StorageAutomationService(db)
     s_id = to_int(source_volume_id) or to_int(src_vid)
     t_id = to_int(target_volume_id) or to_int(dst_vid)
-    analysis = svc.analyze_move_backups(source_volume_id=s_id, target_volume_id=t_id)
+    inc_vault = to_bool(include_in_vault) if types_submitted else True
+    inc_green = to_bool(include_green_outside) if types_submitted else True
+    inc_orange = to_bool(include_orange_same_disk) if types_submitted else True
+    analysis = svc.analyze_move_backups(
+        source_volume_id=s_id,
+        target_volume_id=t_id,
+        include_in_vault=inc_vault,
+        include_green_outside=inc_green,
+        include_orange_same_disk=inc_orange,
+    )
     return render_template(
         request,
         "partials/move_backups_panel.html",
@@ -1688,14 +1794,33 @@ def execute_move_backups_action(
     request: Request,
     source_volume_id: Optional[str] = Form(None),
     target_volume_id: Optional[str] = Form(None),
+    include_in_vault: Optional[str] = Form(None),
+    include_green_outside: Optional[str] = Form(None),
+    include_orange_same_disk: Optional[str] = Form(None),
+    types_submitted: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     """Moves verified backups between two online devices while keeping Original and Backup separated."""
     svc = StorageAutomationService(db)
     s_id = to_int(source_volume_id)
     t_id = to_int(target_volume_id)
-    exec_res = svc.execute_move_backups(s_id or 0, t_id or 0)
-    analysis = svc.analyze_move_backups(source_volume_id=s_id, target_volume_id=t_id)
+    inc_vault = to_bool(include_in_vault) if types_submitted else True
+    inc_green = to_bool(include_green_outside) if types_submitted else True
+    inc_orange = to_bool(include_orange_same_disk) if types_submitted else True
+    exec_res = svc.execute_move_backups(
+        s_id or 0,
+        t_id or 0,
+        include_in_vault=inc_vault,
+        include_green_outside=inc_green,
+        include_orange_same_disk=inc_orange,
+    )
+    analysis = svc.analyze_move_backups(
+        source_volume_id=s_id,
+        target_volume_id=t_id,
+        include_in_vault=inc_vault,
+        include_green_outside=inc_green,
+        include_orange_same_disk=inc_orange,
+    )
     resp = render_template(
         request,
         "partials/move_backups_panel.html",
@@ -2978,10 +3103,8 @@ def move_physical_files_action(
 
 
 def _execute_move_to_trash_items(db: Session, item_ids: List[str], job_id: Optional[int] = None) -> Tuple[int, int]:
-    trash_dir = DATA_DIR / "kosz"
-    trash_dir.mkdir(parents=True, exist_ok=True)
+    """Sets logical KOSZ attribute (is_trashed=True) in SQLite without touching or moving physical files on disk."""
     items = _fetch_items_by_ids_chunked(db, item_ids)
-    moved_files = 0
     processed = 0
 
     for idx, it in enumerate(items):
@@ -2994,18 +3117,8 @@ def _execute_move_to_trash_items(db: Session, item_ids: List[str], job_id: Optio
                 db=db,
             )
             db.commit()
-            return processed, moved_files
+            return processed, 0
 
-        vol = db.get(WindowsVolume, it.volume_id)
-        if vol:
-            src_p = Path(vol.last_known_drive_letter) / it.relative_path
-            if src_p.exists():
-                dest_p = trash_dir / f"{it.id}_{it.file_name}"
-                try:
-                    shutil.move(str(src_p), str(dest_p))
-                    moved_files += 1
-                except Exception as exc:
-                    logger.debug("Move to trash physical warning: %s", exc)
         it.is_trashed = True
         processed += 1
 
@@ -3013,11 +3126,11 @@ def _execute_move_to_trash_items(db: Session, item_ids: List[str], job_id: Optio
         ProcessManager.finish_job(
             job_id,
             status="COMPLETED",
-            message=f"Przeniesiono do Kosza: {processed} pozycji (fizycznie: {moved_files}).",
+            message=f"Oznaczono jako KOSZ w bazie (bez ruszania plików na dysku): {processed} pozycji.",
             db=db,
         )
     db.commit()
-    return processed, moved_files
+    return processed, 0
 
 
 def _build_safe_removal_html_response(
@@ -3070,7 +3183,7 @@ def _build_safe_removal_html_response(
     parts: List[str] = []
     if delete_mode == "trash":
         parts.append(
-            f"<span class='text-amber-300 font-semibold'>🗑️ Przeniesiono do Kosza: {processed} (fizycznie: {physical})"
+            f"<span class='text-amber-300 font-semibold'>🗑️ Oznaczono jako KOSZ (baza, pliki fizyczne nietknięte): {processed}"
         )
     else:
         parts.append(
@@ -3353,6 +3466,10 @@ async def move_items_to_local_trash(
     untagged_only = _form_bool(form, "untagged_only")
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
+    backup_filter = _form_str(form, "backup_filter", "none") or "none"
+    backup_types = [str(x) for x in form.getlist("backup_types")]
+    backup_mode = _form_str(form, "backup_mode", "hide") or "hide"
+    anomaly_type = _form_str(form, "anomaly_type", "all") or "all"
     run_sync = _form_bool(form, "run_sync")
     skip_db_backup = _form_bool(form, "skip_db_backup")
     continue_job_id = to_int(_form_str(form, "continue_job_id"))
@@ -3380,6 +3497,10 @@ async def move_items_to_local_trash(
             selected_ids_json=selected_ids_json,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
+            backup_filter=backup_filter,
+            backup_types=backup_types,
+            backup_mode=backup_mode,
+            anomaly_type=anomaly_type,
         )
 
     if not item_ids and not t_gid:
@@ -3421,7 +3542,7 @@ async def move_items_to_local_trash(
 
     return HTMLResponse(
         f"<span class='text-amber-300 text-xs font-semibold'>"
-        f"🗑️ Przeniesiono do Kosza: {processed} pozycji (fizycznie przeniesiono do data/kosz: {moved_files}). Możesz je przywrócić z widoku Kosza."
+        f"🗑️ Oznaczono jako KOSZ w bazie (atrybut KOSZ, pliki fizyczne na dysku nietknięte): {processed} pozycji. Możesz przywrócić z widoku Kosza."
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
@@ -3798,6 +3919,10 @@ async def delete_files_permanently_from_disk(
     untagged_only = _form_bool(form, "untagged_only")
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
+    backup_filter = _form_str(form, "backup_filter", "none") or "none"
+    backup_types = [str(x) for x in form.getlist("backup_types")]
+    backup_mode = _form_str(form, "backup_mode", "hide") or "hide"
+    anomaly_type = _form_str(form, "anomaly_type", "all") or "all"
     run_sync = _form_bool(form, "run_sync")
     skip_db_backup = _form_bool(form, "skip_db_backup")
     continue_job_id = to_int(_form_str(form, "continue_job_id"))
@@ -3821,6 +3946,10 @@ async def delete_files_permanently_from_disk(
             selected_ids_json=selected_ids_json,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
+            backup_filter=backup_filter,
+            backup_types=backup_types,
+            backup_mode=backup_mode,
+            anomaly_type=anomaly_type,
         )
 
     if not item_ids and not grp_to_delete:
@@ -3869,4 +3998,194 @@ async def delete_files_permanently_from_disk(
         f"🔥 Trwale usunięto fizycznie z dysku: {deleted_disk} plików (usunięto z bazy: {removed_db})."
         f"</span>",
         headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/verify-db-disk-consistency")
+def verify_db_disk_consistency_action(
+    volume_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Checks all online, VSN-verified drives against SQLite records without altering existing AI/album metadata."""
+    import html as html_mod
+
+    svc = StorageAutomationService(db)
+    res = svc.verify_db_disk_consistency(volume_id=to_int(volume_id))
+    missing = res["missing_items"]
+    online_vols = res["checked_online_volumes"]
+    offline_vols = res["offline_volumes"]
+
+    vols_html = "".join(
+        f"<div class='px-2.5 py-1.5 rounded bg-slate-950/70 border border-borderBg text-[11px] flex justify-between'>"
+        f"<span>🟢 <strong>{html_mod.escape(v['label'])}</strong> ({html_mod.escape(v['drive_letter'])}, VSN: {html_mod.escape(v['vsn'])})</span>"
+        f"<span class='font-mono'>OK: <strong class='text-emerald-400'>{v['valid_count']}</strong> | Brak: <strong class='text-rose-400'>{v['missing_count']}</strong></span>"
+        f"</div>"
+        for v in online_vols
+    )
+    if offline_vols:
+        vols_html += "".join(
+            f"<div class='px-2.5 py-1.5 rounded bg-slate-950/40 border border-amber-800/50 text-[11px] flex justify-between text-amber-300'>"
+            f"<span>🔴 OFFLINE (pominięto weryfikację plików): {html_mod.escape(v['label'])} ({html_mod.escape(v['drive_letter'])})</span>"
+            f"<span class='font-mono'>W bazie: {v['db_count']} szt.</span>"
+            f"</div>"
+            for v in offline_vols
+        )
+
+    preview_rows = ""
+    if missing:
+        rows_str = "".join(
+            f"<tr class='border-b border-borderBg/40'>"
+            f"<td class='py-1 px-2 text-slate-200 truncate max-w-[160px]'>{html_mod.escape(m['file_name'])}</td>"
+            f"<td class='py-1 px-2 text-amber-300'>{html_mod.escape(m['volume_label'])}</td>"
+            f"<td class='py-1 px-2 text-slate-400 truncate max-w-[220px]'>{html_mod.escape(m['relative_path'])}</td>"
+            f"<td class='py-1 px-2 font-mono'>{'✅ Ma kopię (' + str(m['other_copies_count']) + ')' if m['other_copies_count'] > 0 else '⚠️ Jedyna kopia w bazie'}</td>"
+            f"</tr>"
+            for m in missing[:200]
+        )
+        preview_rows = (
+            "<div class='max-h-48 overflow-y-auto border border-borderBg rounded-lg mt-2'>"
+            "<table class='w-full text-left text-[10px] font-mono'>"
+            "<thead><tr class='bg-slate-950 text-slate-400 border-b border-borderBg'>"
+            "<th class='py-1 px-2'>Plik</th><th class='py-1 px-2'>Dysk</th><th class='py-1 px-2'>Ścieżka</th><th class='py-1 px-2'>Kopie w bazie</th>"
+            "</tr></thead><tbody>" + rows_str + "</tbody></table></div>"
+        )
+
+    cleanup_btn = ""
+    if res["missing_count"] > 0:
+        cleanup_btn = (
+            f"<button type='button' "
+            f"hx-post='/actions/cleanup-missing-db-items' "
+            f"hx-confirm='Czy na pewno usunąć z bazy {res['missing_count']} rekordów plików, których fizycznie NIE MA na podłączonych dyskach? Pozostałe pliki i dane AI pozostaną nietknięte.' "
+            f"hx-target='#maint-result-status' "
+            f"class='mt-2 bg-rose-700 hover:bg-rose-600 text-white px-3.5 py-2 rounded-lg font-bold shadow'>"
+            f"🗑️ Decyzja: Usuń z bazy {res['missing_count']} brakujących rekordów</button>"
+        )
+
+    return HTMLResponse(
+        f"<div class='p-3 rounded-xl bg-slate-950/90 border border-sky-700/70 space-y-2 text-xs'>"
+        f"<div class='font-bold text-sky-300'>🔍 Raport spójności Baza ↔ Dyski (dane AI i albumy zachowane)</div>"
+        f"<div class='grid grid-cols-2 md:grid-cols-4 gap-2 font-mono text-[11px]'>"
+        f"<div class='p-2 rounded bg-slate-900 border border-borderBg'>Zweryfikowano na dyskach: <strong class='text-emerald-400'>{res['valid_online_count']}</strong></div>"
+        f"<div class='p-2 rounded bg-slate-900 border border-borderBg'>Brakuje fizycznie: <strong class='text-rose-400'>{res['missing_count']}</strong></div>"
+        f"<div class='p-2 rounded bg-slate-900 border border-borderBg'>Brakujących z kopią w bazie: <strong class='text-teal-300'>{res['missing_with_backup_count']}</strong></div>"
+        f"<div class='p-2 rounded bg-slate-900 border border-borderBg'>Różny rozmiar na dysku: <strong class='text-amber-300'>{res['size_mismatch_count']}</strong></div>"
+        f"</div>"
+        f"<div class='space-y-1'>{vols_html}</div>"
+        f"{preview_rows}{cleanup_btn}"
+        f"</div>"
+    )
+
+
+@router.post("/cleanup-missing-db-items")
+def cleanup_missing_db_items_action(
+    volume_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Deletes SQLite records for files verified missing on VSN-verified online volumes."""
+    res = StorageAutomationService(db).cleanup_missing_db_items(volume_id=to_int(volume_id))
+    return HTMLResponse(
+        f"<div class='p-2.5 rounded-lg bg-emerald-950/70 border border-emerald-600 text-emerald-100'>"
+        f"✅ Usunięto z bazy <strong>{res['removed_count']}</strong> rekordów brakujących plików "
+        f"(pominięto istniejące lub na dyskach offline: {res['skipped_exists_or_offline']})."
+        f"</div>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/organize-originals")
+def organize_originals_action(
+    volume_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Moves ungrouped Originals into daf_oryginal/YYYY/MM/DD on the same disk while preserving original_relative_path."""
+    res = StorageAutomationService(db).organize_ungrouped_originals(volume_id=to_int(volume_id))
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>🗂️ {res['message']}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/export-physical-album")
+async def export_physical_album_action(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Copies album/filtered/selected photos to daf_albums/<AlbumName>/ on a chosen disk without indexing copies."""
+    form = await _read_large_form(request)
+    album_id = to_int(_form_str(form, "album_id"))
+    target_volume_id = to_int(_form_str(form, "target_volume_id"))
+    custom_name = _form_str(form, "custom_album_name")
+
+    if not target_volume_id:
+        return HTMLResponse("<span class='text-rose-400 text-xs font-semibold'>Wybierz urządzenie docelowe dla fizycznego eksportu albumu.</span>")
+
+    if album_id:
+        svc = StorageAutomationService(db)
+        grp = db.get(MediaGroup, album_id)
+        subtree_ids = svc.get_group_subtree_ids(album_id)
+        items = list(
+            db.scalars(
+                select(MediaItem).where(
+                    MediaItem.group_id.in_(subtree_ids),
+                    MediaItem.is_trashed == False,
+                    MediaItem.is_backup_copy == False,
+                )
+            ).all()
+        )
+        eff_name = (custom_name or "").strip() or (grp.name if grp else f"Album_{album_id}")
+    else:
+        scope = _form_str(form, "scope", "selected") or "selected"
+        selected_ids = [str(x) for x in form.getlist("selected_ids")]
+        selected_ids_json = _form_str(form, "selected_ids_json")
+        q = _form_str(form, "q")
+        media_type = _form_str(form, "media_type", "all") or "all"
+        volume_id = _form_str(form, "volume_id")
+        folder_prefix = _form_str(form, "folder_prefix")
+        group_id = _form_str(form, "group_id")
+        tag = _form_str(form, "tag")
+        year = _form_str(form, "year")
+        anomaly_only = _form_bool(form, "anomaly_only")
+        blurry_only = _form_bool(form, "blurry_only")
+        duplicates_only = _form_bool(form, "duplicates_only")
+        untagged_only = _form_bool(form, "untagged_only")
+        unvectored_only = _form_bool(form, "unvectored_only")
+        unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
+        backup_filter = _form_str(form, "backup_filter", "none") or "none"
+        backup_types = [str(x) for x in form.getlist("backup_types")]
+        backup_mode = _form_str(form, "backup_mode", "hide") or "hide"
+        anomaly_type = _form_str(form, "anomaly_type", "all") or "all"
+        items = resolve_target_items(
+            db, scope, selected_ids, q, media_type, volume_id, folder_prefix,
+            group_id, tag, year, anomaly_only, blurry_only, duplicates_only,
+            untagged_only=untagged_only, unvectored_only=unvectored_only,
+            unanalyzed_quality_only=unanalyzed_quality_only,
+            selected_ids_json=selected_ids_json,
+            backup_filter=backup_filter, backup_types=backup_types, backup_mode=backup_mode,
+            anomaly_type=anomaly_type,
+        )
+        grp_cur = db.get(MediaGroup, to_int(group_id)) if to_int(group_id) else None
+        eff_name = (custom_name or "").strip() or (grp_cur.name if grp_cur else "Wybrany_Album")
+
+    if not items:
+        return HTMLResponse("<span class='text-amber-400 text-xs font-semibold'>Brak plików do wyeksportowania do daf_albums/.</span>")
+
+    res = StorageAutomationService(db).export_physical_album(items, target_volume_id, eff_name)
+    color_cls = "text-emerald-400" if res["status"] == "ok" else "text-amber-300"
+    return HTMLResponse(f"<span class='{color_cls} text-xs font-semibold'>📤 {res['message']}</span>")
+
+
+@router.post("/verify-deleted-duplicates")
+def verify_deleted_duplicates_action(db: Session = Depends(get_db)):
+    """Displays post-deduplication SQL verification proving every deleted duplicate has an active Original."""
+    import html as html_mod
+
+    res = StorageAutomationService(db).verify_deleted_duplicates_integrity()
+    ok_cls = "bg-emerald-950/70 border-emerald-600 text-emerald-100" if res["missing_orig_count"] == 0 else "bg-amber-950/70 border-amber-600 text-amber-100"
+    snap_note = f"<div class='text-[10px] text-slate-400 font-mono'>Kopia referencyjna: {html_mod.escape(res['snapshot_name'])}</div>" if res.get("snapshot_name") else ""
+    return HTMLResponse(
+        f"<div class='p-3 rounded-xl border {ok_cls} text-xs space-y-1'>"
+        f"<div class='font-bold'>✅ Weryfikacja spójności po usunięciu duplikatów:</div>"
+        f"<div>{html_mod.escape(res['report_text'])}</div>"
+        f"{snap_note}"
+        f"</div>"
     )

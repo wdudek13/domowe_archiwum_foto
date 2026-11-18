@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 import numpy as np
 from PIL import Image, JpegImagePlugin
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker, Session
 
 from app.database import Base, ensure_schema_migrations, get_db, set_sqlite_pragma
@@ -3847,13 +3847,15 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertIn("Zablokowano", r_blk.text)
             self.assertTrue(p_orange_2.exists())
 
-            # Test Safe Duplicate Removal on 3rd copy (to Kosz) when Volume A is online, and Offline prompt when Volume is offline
+            # Test Safe Duplicate Removal on 3rd copy (to Kosz: logical-only, physical file untouched!) when Volume A is online
             r_ok_tr = self.client.post(
                 "/actions/move-to-trash",
                 data={"scope": "selected", "duplicates_only": "true", "selected_ids": [it_tr3.id]},
             )
             self.assertEqual(r_ok_tr.status_code, 200)
-            self.assertFalse(p_trip_3.exists())
+            db.expire_all()
+            self.assertTrue(p_trip_3.exists(), "Logical Kosz must NOT delete or move physical file on disk")
+            self.assertTrue(db.get(MediaItem, it_tr3.id).is_trashed)
 
             # Simulate an offline volume holding a duplicate -> must prompt user to connect the offline disk
             vol_a_db = db.get(WindowsVolume, va_id)
@@ -4598,6 +4600,353 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             r_vac = self.client.post("/actions/vacuum-db")
             self.assertEqual(r_vac.status_code, 200)
             self.assertIn("Zakończono kompaktowanie bazy (VACUUM)", r_vac.text)
+
+    def test_vsn_guard_consistency_organize_physical_albums_filters_and_offline_video(self):
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA11-2233",
+                volume_label="OrigDiskA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=60 * 1024**3,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB44-5566",
+                volume_label="BackupDiskB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=200 * 1024**3,
+                free_space_bytes=150 * 1024**3,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            vol_a_id, vol_b_id = vol_a.id, vol_b.id
+
+            svc = StorageAutomationService(db)
+
+            # 1) Item 2: Live VSN mismatch guard & drive-letter reassignment
+            # Different connected VSN occupies E:\ -> must block (return None)
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"9999-8888": ("E:\\", "WrongUSB")}):
+                vol_e_swap = WindowsVolume(
+                    volume_serial_number="1234-ABCD",
+                    volume_label="ExpectedUSB",
+                    last_known_drive_letter="E:\\",
+                    is_online=True,
+                )
+                self.assertIsNone(svc.verify_and_resolve_online_volume_root(vol_e_swap))
+                self.assertFalse(vol_e_swap.is_online)
+
+            # Matching VSN mounted under a new drive letter G:\ -> resolves G:\ and updates vol_e_swap
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"1234-ABCD": ("G:\\", "ExpectedUSB")}):
+                resolved = svc.verify_and_resolve_online_volume_root(vol_e_swap)
+                self.assertEqual(resolved, Path("G:\\"))
+                self.assertEqual(vol_e_swap.last_known_drive_letter, "G:\\")
+                self.assertTrue(vol_e_swap.is_online)
+
+            # 2) Item 1 & Item 6: Non-destructive force_rescan preserves AI tags, quality, albums; daf_albums/ skipped;
+            #    verify_db_disk_consistency detects missing physical files & cleanup_missing_db_items removes them cleanly
+            trip_dir = self.drive_a / "Wakacje_2022"
+            trip_dir.mkdir(parents=True, exist_ok=True)
+            p_keep = create_synthetic_jpeg(trip_dir / "IMG_20220710_120000.jpg", color=(30, 120, 210))
+            p_missing_later = create_synthetic_jpeg(trip_dir / "IMG_20220710_120500.jpg", color=(210, 60, 40))
+
+            grp = MediaGroup(name="Grecja_Test")
+            db.add(grp)
+            db.commit()
+            db.refresh(grp)
+            grp_id = grp.id
+
+            it_keep = FileScannerService.process_file(p_keep, vol_a)
+            it_missing = FileScannerService.process_file(p_missing_later, vol_a)
+            it_keep_id, it_missing_id = it_keep.id, it_missing.id
+            it_keep_hash = it_keep.file_hash
+            it_keep.group_id = grp_id
+            it_keep.blur_score = 123.4
+            it_keep.rotation_angle = 90
+            it_keep.tags.append(MediaTag(tag="plaża", confidence=0.95, source_model="test_ai"))
+            it_keep.has_date_anomaly = True
+            it_keep.date_anomaly_reason = "Niezgodność dat: utworzenie pliku (2024-01-01) zmodyfikowane przy kopiowaniu vs modyfikacja (2022-07-10)"
+            db.add_all([it_keep, it_missing])
+            db.commit()
+
+            # Force rescan via execute_scan must NOT wipe AI tags, blur_score, rotation_angle, or album
+            with patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("AA11-2233", "OrigDiskA", str(self.drive_a))):
+                # Delete one file before scanning to verify missing_on_disk detection
+                p_missing_later.unlink()
+                r_rescan = self.client.post("/actions/scan", data={"path": str(self.drive_a), "force_rescan": "true"})
+                self.assertEqual(r_rescan.status_code, 200)
+                self.assertIn("Brakujących plików na dysku", r_rescan.text)
+
+            db.expire_all()
+            it_keep_after = db.get(MediaItem, it_keep_id)
+            self.assertEqual(it_keep_after.group_id, grp_id)
+            self.assertEqual(it_keep_after.rotation_angle, 90)
+            self.assertEqual(it_keep_after.blur_score, 123.4)
+            self.assertTrue(any(t.tag == "plaża" for t in it_keep_after.tags))
+
+            # Explicit DB-disk consistency report & cleanup
+            with patch.object(
+                WindowsVolumeInspector,
+                "get_connected_vsn_map",
+                return_value={"AA11-2233": (str(self.drive_a), "OrigDiskA"), "BB44-5566": (str(self.drive_b), "BackupDiskB")},
+            ):
+                r_cons = self.client.post("/actions/verify-db-disk-consistency")
+                self.assertEqual(r_cons.status_code, 200)
+                self.assertIn("IMG_20220710_120500.jpg", r_cons.text)
+                self.assertIn("Decyzja: Usuń z bazy 1 brakujących rekordów", r_cons.text)
+
+                r_cln = self.client.post("/actions/cleanup-missing-db-items")
+                self.assertEqual(r_cln.status_code, 200)
+                self.assertIn("Usunięto z bazy <strong>1</strong>", r_cln.text)
+                db.expire_all()
+                self.assertIsNone(db.get(MediaItem, it_missing_id))
+
+            # 3) Item 6: Physical album export -> daf_albums/<AlbumName>/ & skipped by scanner
+            with patch.object(
+                WindowsVolumeInspector,
+                "get_connected_vsn_map",
+                return_value={"AA11-2233": (str(self.drive_a), "OrigDiskA"), "BB44-5566": (str(self.drive_b), "BackupDiskB")},
+            ), patch.object(WindowsVolumeInspector, "get_volume_info", return_value=("BB44-5566", "BackupDiskB", str(self.drive_b))):
+                r_exp = self.client.post(
+                    "/actions/export-physical-album",
+                    data={"album_id": str(grp_id), "target_volume_id": str(vol_b_id)},
+                )
+                self.assertEqual(r_exp.status_code, 200)
+                exported_f = self.drive_b / "daf_albums" / "Grecja_Test" / "IMG_20220710_120000.jpg"
+                self.assertTrue(exported_f.exists())
+                # FileScannerService & /actions/scan must completely ignore daf_albums/
+                self.assertIsNone(FileScannerService.process_file(exported_f, db.get(WindowsVolume, vol_b_id)))
+                r_scan_b = self.client.post("/actions/scan", data={"path": str(self.drive_b), "force_rescan": "false"})
+                self.assertEqual(r_scan_b.status_code, 200)
+                self.assertEqual(
+                    db.scalar(select(func.count(MediaItem.id)).where(MediaItem.relative_path.ilike("%daf_albums%"))),
+                    0,
+                )
+
+            # 4) Item 5: Organize ungrouped Originals -> daf_oryginal/YYYY/MM/DD/ preserving original_relative_path
+            ungrouped_dir = self.drive_a / "StaryKatalog_2021"
+            ungrouped_dir.mkdir(parents=True, exist_ok=True)
+            p_ungrp = create_synthetic_jpeg(ungrouped_dir / "IMG_20210815_100000.jpg", color=(80, 180, 90))
+            it_ungrp = FileScannerService.process_file(p_ungrp, db.get(WindowsVolume, vol_a_id))
+            it_ungrp_id = it_ungrp.id
+            it_ungrp.has_date_anomaly = True
+            it_ungrp.date_anomaly_reason = "Niezgodność dat: utworzenie pliku (2023-01-01) z folderem '2020_Wyjazd'"
+            db.add(it_ungrp)
+            db.commit()
+
+            with patch.object(
+                WindowsVolumeInspector,
+                "get_connected_vsn_map",
+                return_value={"AA11-2233": (str(self.drive_a), "OrigDiskA"), "BB44-5566": (str(self.drive_b), "BackupDiskB")},
+            ):
+                r_org = self.client.post("/actions/organize-originals")
+                self.assertEqual(r_org.status_code, 200)
+                self.assertIn("Uporządkowano oryginałów", r_org.text)
+
+            db.expire_all()
+            it_ungrp_after = db.get(MediaItem, it_ungrp_id)
+            self.assertTrue(it_ungrp_after.relative_path.startswith("daf_oryginal/"))
+            self.assertEqual(it_ungrp_after.original_relative_path, "OrigDiskA/StaryKatalog_2021/IMG_20210815_100000.jpg")
+            self.assertTrue((self.drive_a / it_ungrp_after.relative_path).exists())
+            # Must still be findable by original folder name & prefix!
+            r_find_orig_folder = self.client.get("/media/search?q=StaryKatalog_2021")
+            self.assertIn("IMG_20210815_100000.jpg", r_find_orig_folder.text)
+            r_find_folder_pref = self.client.get(f"/media/search?volume_id={vol_a_id}&folder_prefix=StaryKatalog_2021/")
+            self.assertIn("IMG_20210815_100000.jpg", r_find_folder_pref.text)
+
+            # 5) Item 4: Date anomaly type filter (folder vs copy_ctime)
+            it_keep_anom = db.get(MediaItem, it_keep_id)
+            it_keep_anom.has_date_anomaly = True
+            it_keep_anom.date_anomaly_reason = "Niezgodność dat: utworzenie pliku (2024-01-01) zmodyfikowane przy kopiowaniu vs modyfikacja (2022-07-10)"
+            db.commit()
+
+            r_anom_all = self.client.get("/media/search?anomaly_only=true")
+            self.assertEqual(r_anom_all.status_code, 200)
+            self.assertIn("IMG_20210815_100000.jpg", r_anom_all.text)
+            self.assertIn("IMG_20220710_120000.jpg", r_anom_all.text)
+            r_anom_folder = self.client.get("/media/search?anomaly_only=true&anomaly_type=folder")
+            self.assertIn("IMG_20210815_100000.jpg", r_anom_folder.text)
+            self.assertNotIn("IMG_20220710_120000.jpg", r_anom_folder.text)
+            r_anom_copy = self.client.get("/media/search?anomaly_only=true&anomaly_type=copy_ctime")
+            self.assertIn("IMG_20220710_120000.jpg", r_anom_copy.text)
+            self.assertNotIn("IMG_20210815_100000.jpg", r_anom_copy.text)
+
+            # 6) Item 3 & Item 10: Backup visibility filter (default hides all backups, including inside albums!)
+            #    and Move Backups checkboxes (in_vault, green_outside, orange)
+            bkp_vault_f = self.drive_b / "daf_backup" / "2022" / "07" / "10" / "IMG_20220710_120000.jpg"
+            bkp_vault_f.parent.mkdir(parents=True, exist_ok=True)
+            bkp_vault_f.write_bytes(p_keep.read_bytes())
+            it_bkp_vault = FileScannerService.process_file(bkp_vault_f, db.get(WindowsVolume, vol_b_id))
+            # Also an orange backup on DiskA for it_ungrp
+            orange_f = self.drive_a / "orange_copy.jpg"
+            orange_f.write_bytes((self.drive_a / it_ungrp_after.relative_path).read_bytes())
+            it_orange = FileScannerService.process_file(orange_f, db.get(WindowsVolume, vol_a_id))
+            it_orange_day = it_orange.effective_date.strftime("%Y/%m/%d")
+            db.add_all([it_bkp_vault, it_orange])
+            db.commit()
+            svc.flag_duplicate_clusters()
+
+            # Default album & gallery hide backups (neither daf_backup nor orange_copy visible)
+            r_def_gal = self.client.get("/media/search")
+            self.assertNotIn("orange_copy.jpg", r_def_gal.text)
+            self.assertNotIn("daf_backup/2022/07/10/IMG_20220710_120000.jpg", r_def_gal.text)
+            r_def_alb = self.client.get(f"/media/search?group_id={grp_id}")
+            self.assertIn("IMG_20220710_120000.jpg", r_def_alb.text)
+            self.assertNotIn("daf_backup/2022/07/10/IMG_20220710_120000.jpg", r_def_alb.text)
+            # Enabling backup_filter=only_daf_backup in album shows daf_backup copy linked to that album!
+            r_alb_bkp = self.client.get(f"/media/search?group_id={grp_id}&backup_filter=only_daf_backup")
+            self.assertIn("daf_backup/2022/07/10/IMG_20220710_120000.jpg", r_alb_bkp.text)
+            # Enabling backup_filter=only_orange in gallery shows orange backup
+            r_gal_or = self.client.get("/media/search?backup_filter=only_orange")
+            self.assertIn("orange_copy.jpg", r_gal_or.text)
+
+            # Item 10: Move Backups modal shows per-type breakdown & moves orange backup on DiskA -> DiskB/daf_backup/YYYY/MM/DD
+            with patch.object(
+                WindowsVolumeInspector,
+                "get_connected_vsn_map",
+                return_value={"AA11-2233": (str(self.drive_a), "OrigDiskA"), "BB44-5566": (str(self.drive_b), "BackupDiskB")},
+            ):
+                r_mbp = self.client.post(
+                    "/actions/move-backups-panel",
+                    data={
+                        "source_volume_id": str(vol_a_id),
+                        "target_volume_id": str(vol_b_id),
+                        "types_submitted": "1",
+                        "include_orange_same_disk": "true",
+                    },
+                )
+                self.assertEqual(r_mbp.status_code, 200)
+                self.assertIn("orange_copy.jpg", r_mbp.text)
+                self.assertIn(f"daf_backup/{it_orange_day}/orange_copy.jpg", r_mbp.text)
+
+                r_exec_mb = self.client.post(
+                    "/actions/execute-move-backups",
+                    data={
+                        "source_volume_id": str(vol_a_id),
+                        "target_volume_id": str(vol_b_id),
+                        "types_submitted": "1",
+                        "include_orange_same_disk": "true",
+                    },
+                )
+                self.assertEqual(r_exec_mb.status_code, 200)
+                self.assertIn("Przeniesiono backupów z OrigDiskA -&gt; BackupDiskB", r_exec_mb.text)
+                self.assertTrue((self.drive_b / "daf_backup" / it_orange_day / "orange_copy.jpg").exists())
+
+            # 7) Item 8: Verification query after duplicate removal
+            hist_rec = DeletedDuplicateHistory(
+                deleted_item_id="old-dup-uuid-1",
+                original_item_id=it_keep_id,
+                file_hash=it_keep_hash,
+                volume_id=vol_a_id,
+                volume_label="OrigDiskA",
+                drive_letter=str(self.drive_a),
+                relative_path="old_dup/IMG_20220710_120000_copy.jpg",
+                file_name="IMG_20220710_120000_copy.jpg",
+            )
+            db.add(hist_rec)
+            db.commit()
+            r_ver_dups = self.client.post("/actions/verify-deleted-duplicates")
+            self.assertEqual(r_ver_dups.status_code, 200)
+            self.assertIn("Liczba usuniętych duplikatów: 1", r_ver_dups.text)
+            self.assertIn("1 z 1 (100.0%)", r_ver_dups.text)
+
+            # 8) Item 9: Offline video detail preview renders cached .webp thumbnail instead of video playback error
+            off_vid_id = str(uuid.uuid4())
+            off_vid = MediaItem(
+                id=off_vid_id,
+                volume_id=vol_a_id,
+                relative_path="DJI_20260829155141_0016_D.MP4",
+                file_name="DJI_20260829155141_0016_D.MP4",
+                file_size_bytes=5000,
+                media_type="video",
+                mime_type="video/mp4",
+                file_hash="dji_vid_hash_016",
+                hash_algorithm="partial_3x64k",
+                fs_ctime=datetime.datetime(2026, 8, 29, 15, 51, 41),
+                fs_mtime=datetime.datetime(2026, 8, 29, 15, 51, 41),
+                effective_date=datetime.datetime(2026, 8, 29, 15, 51, 41),
+                thumbnail_relative_path="dji_016.webp",
+            )
+            (self.thumbs_dir / "dji_016.webp").write_bytes(b"RIFF1234WEBPdummy_thumb_bytes")
+            db.add(off_vid)
+            vol_a_db = db.get(WindowsVolume, vol_a_id)
+            vol_a_db.is_online = False
+            db.commit()
+
+            r_vid_det = self.client.get(f"/media/{off_vid_id}/detail")
+            self.assertEqual(r_vid_det.status_code, 200)
+            self.assertIn("/media/thumbnails/dji_016.webp", r_vid_det.text)
+            self.assertIn("Nośnik offline", r_vid_det.text)
+            self.assertNotIn("<video src=", r_vid_det.text)
+
+            # 9) Item 7: Logical-only Kosz on regular photo keeps file physically on disk
+            p_keep_path = self.drive_a / db.get(MediaItem, it_keep_id).relative_path
+            self.assertTrue(p_keep_path.exists())
+            r_tr_reg = self.client.post(
+                "/actions/move-to-trash",
+                data={"scope": "selected", "selected_ids": [it_keep_id]},
+            )
+            self.assertEqual(r_tr_reg.status_code, 200)
+            db.expire_all()
+            self.assertTrue(db.get(MediaItem, it_keep_id).is_trashed)
+            self.assertTrue(p_keep_path.exists())
+
+            # 10) Item 0: Mid-batch partial duplicate removal across online/offline drives must NOT
+            #     call flag_duplicate_clusters() while offline drives remain pending
+            vol_a_db.is_online = True
+            vol_b_db = db.get(WindowsVolume, vol_b_id)
+            vol_b_db.is_online = False
+            vol_b_db.last_known_drive_letter = str(self.root / "OfflineMissingB_Item0")
+            db.commit()
+            with patch.object(
+                WindowsVolumeInspector,
+                "get_connected_vsn_map",
+                return_value={"AA11-2233": (str(self.drive_a), "OrigDiskA")},
+            ), patch.object(StorageAutomationService, "flag_duplicate_clusters") as spy_flag:
+                p_i0 = create_synthetic_jpeg(self.drive_a / "i0_orig.jpg", color=(15, 25, 35))
+                p_i0_bkp = self.drive_a / "daf_backup" / "2024" / "01" / "01" / "i0_orig.jpg"
+                p_i0_bkp.parent.mkdir(parents=True, exist_ok=True)
+                p_i0_bkp.write_bytes(p_i0.read_bytes())
+                p_i0_on_dup = self.drive_a / "i0_on_dup.jpg"
+                p_i0_on_dup.write_bytes(p_i0.read_bytes())
+                it_i0_1 = FileScannerService.process_file(p_i0, db.get(WindowsVolume, vol_a_id))
+                it_i0_2 = FileScannerService.process_file(p_i0_bkp, db.get(WindowsVolume, vol_a_id))
+                it_i0_3 = FileScannerService.process_file(p_i0_on_dup, db.get(WindowsVolume, vol_a_id))
+                it_i0_4 = MediaItem(
+                    id=str(uuid.uuid4()),
+                    volume_id=vol_b_id,
+                    relative_path="i0_off_dup.jpg",
+                    file_name="i0_off_dup.jpg",
+                    file_size_bytes=it_i0_1.file_size_bytes,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash=it_i0_1.file_hash,
+                    hash_algorithm="sha256",
+                    fs_ctime=datetime.datetime(2024, 1, 1),
+                    fs_mtime=datetime.datetime(2024, 1, 1),
+                    effective_date=datetime.datetime(2024, 1, 1),
+                    thumbnail_relative_path="i0_off.webp",
+                    duplicate_role="duplicate",
+                    is_primary_duplicate=False,
+                )
+                it_i0_1.duplicate_role = "original"
+                it_i0_2.duplicate_role = "backup_orange"
+                it_i0_3.duplicate_role = "duplicate"
+                it_i0_3.is_primary_duplicate = False
+                db.add_all([it_i0_1, it_i0_2, it_i0_3, it_i0_4])
+                db.commit()
+                res_i0 = svc.execute_safe_duplicate_removal(
+                    [it_i0_3.id, it_i0_4.id],
+                    delete_mode="permanent",
+                    force_duplicate_verification=True,
+                )
+                self.assertEqual(res_i0["processed_count"], 1)
+                self.assertEqual(len(res_i0["offline_items"]), 1)
+                self.assertEqual(res_i0["offline_ids"], [it_i0_4.id])
+                spy_flag.assert_not_called()
 
 
 if __name__ == "__main__":

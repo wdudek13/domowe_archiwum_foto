@@ -124,10 +124,10 @@
             <button type="button" onclick="prevLightbox()" class="lightbox-nav-btn text-white/80 hover:text-indigo-400 text-5xl px-5 py-10 z-50 transition">&#10094;</button>
             <div id="lightbox-viewport" class="flex-1 h-full w-full flex items-center justify-center overflow-hidden relative">
                 <img id="lightbox-img" src="" draggable="false"
-                     onerror="this.classList.add('hidden'); document.getElementById('lightbox-error').classList.remove('hidden');"
+                     onerror="handleLightboxImgError()"
                      class="hidden max-w-full max-h-[84vh] object-contain rounded shadow-2xl cursor-grab select-none">
                 <video id="lightbox-video" controls autoplay
-                       onerror="this.classList.add('hidden'); document.getElementById('lightbox-error').classList.remove('hidden');"
+                       onerror="handleLightboxVideoError()"
                        class="hidden max-w-full max-h-[84vh] rounded shadow-2xl bg-black outline-none"></video>
                 <div id="lightbox-error" class="hidden text-center text-slate-300 bg-slate-900/90 border border-rose-800/70 rounded-2xl p-6 max-w-md space-y-2">
                     <div class="text-3xl">⚠️</div>
@@ -353,6 +353,13 @@
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.value = '';
                 });
+                const bfEl = form.querySelector("[name='backup_filter']");
+                if (bfEl) bfEl.value = 'none';
+                const bmEl = form.querySelector("[name='backup_mode']");
+                if (bmEl) bmEl.value = 'hide';
+                form.querySelectorAll("input[name='backup_types']").forEach(cb => cb.checked = false);
+                const atEl = form.querySelector("[name='anomaly_type']");
+                if (atEl) atEl.value = 'all';
                 [
                     'anomaly_only', 'blurry_only', 'duplicates_only',
                     'untagged_only', 'unvectored_only', 'unanalyzed_quality_only',
@@ -481,10 +488,42 @@
             }
         }
 
+        function handleLightboxImgError() {
+            const imgEl = document.getElementById('lightbox-img');
+            const item = lightboxItems[currentLightboxIndex];
+            if (item && item.thumbUrl && imgEl.dataset.triedThumb !== '1') {
+                imgEl.dataset.triedThumb = '1';
+                imgEl.src = item.thumbUrl;
+                return;
+            }
+            imgEl.classList.add('hidden');
+            document.getElementById('lightbox-error').classList.remove('hidden');
+        }
+
+        function handleLightboxVideoError() {
+            const vidEl = document.getElementById('lightbox-video');
+            const imgEl = document.getElementById('lightbox-img');
+            const errEl = document.getElementById('lightbox-error');
+            const item = lightboxItems[currentLightboxIndex];
+            vidEl.classList.add('hidden');
+            if (item && item.thumbUrl) {
+                imgEl.dataset.triedThumb = '1';
+                imgEl.src = item.thumbUrl;
+                imgEl.classList.remove('hidden');
+                applyLightboxTransform();
+                document.getElementById('lightbox-caption').textContent =
+                    `${currentLightboxIndex + 1} / ${lightboxItems.length} — ${item.title} [📴 Miniatura wideo]`;
+                return;
+            }
+            if (errEl) errEl.classList.remove('hidden');
+        }
+
         function openLightboxById(mediaId) {
             lightboxItems = Array.from(document.querySelectorAll('.gallery-media-item')).map(el => ({
                 id: el.getAttribute('data-id'),
                 rawUrl: el.getAttribute('data-raw'),
+                thumbUrl: el.getAttribute('data-thumb') || '',
+                isOnline: el.getAttribute('data-online') !== 'false',
                 mediaType: el.getAttribute('data-type'),
                 title: el.getAttribute('data-title') || '',
                 rotation: parseInt(el.getAttribute('data-rotation') || '0', 10)
@@ -503,6 +542,7 @@
             const vidEl = document.getElementById('lightbox-video');
             const errEl = document.getElementById('lightbox-error');
             if (errEl) errEl.classList.add('hidden');
+            imgEl.dataset.triedThumb = '0';
 
             lbZoom = 1.0;
             lbPanX = 0;
@@ -511,20 +551,36 @@
 
             vidEl.pause();
             vidEl.removeAttribute('src');
+            vidEl.removeAttribute('poster');
 
+            let captionNote = '';
             if (item.mediaType === 'video') {
-                imgEl.classList.add('hidden');
-                vidEl.classList.remove('hidden');
-                vidEl.src = item.rawUrl;
-                vidEl.load();
+                if (!item.isOnline && item.thumbUrl) {
+                    vidEl.classList.add('hidden');
+                    imgEl.dataset.triedThumb = '1';
+                    imgEl.src = item.thumbUrl;
+                    imgEl.classList.remove('hidden');
+                    applyLightboxTransform();
+                    captionNote = ' [📴 Nośnik offline — miniatura wideo]';
+                } else {
+                    imgEl.classList.add('hidden');
+                    vidEl.classList.remove('hidden');
+                    if (item.thumbUrl) vidEl.poster = item.thumbUrl;
+                    vidEl.src = item.rawUrl;
+                    vidEl.load();
+                }
             } else {
                 vidEl.classList.add('hidden');
                 imgEl.classList.remove('hidden');
-                imgEl.src = item.rawUrl;
+                imgEl.src = (!item.isOnline && item.thumbUrl) ? item.thumbUrl : item.rawUrl;
+                if (!item.isOnline && item.thumbUrl) {
+                    imgEl.dataset.triedThumb = '1';
+                    captionNote = ' [📴 Offline — miniatura]';
+                }
                 applyLightboxTransform();
             }
 
-            document.getElementById('lightbox-caption').textContent = `${currentLightboxIndex + 1} / ${lightboxItems.length} — ${item.title}`;
+            document.getElementById('lightbox-caption').textContent = `${currentLightboxIndex + 1} / ${lightboxItems.length} — ${item.title}${captionNote}`;
             document.getElementById('lightbox-download').href = item.rawUrl;
         }
 

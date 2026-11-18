@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import stat
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from sqlalchemy import select, text, update, delete, func
+from sqlalchemy import select, text, update, delete, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.backup import BackupManager
@@ -43,10 +43,55 @@ class StorageAutomationService:
 
     MIN_FREE_SPACE_BUFFER_BYTES = 20 * 1024 * 1024  # 20 MB safety reserve on target drives
     BACKUP_DIR_NAME = "daf_backup"
+    ORIGINAL_DIR_NAME = "daf_oryginal"
+    ALBUMS_EXPORT_DIR_NAME = "daf_albums"
 
     def __init__(self, db: Session):
         self.db = db
         self.backup_mgr = BackupManager()
+
+    def verify_and_resolve_online_volume_root(
+        self,
+        vol: Optional[WindowsVolume],
+        connected_map: Optional[Dict[str, Tuple[str, str]]] = None,
+    ) -> Optional[Path]:
+        """
+        Verifies via live OS VSN enumeration that `vol` is truly mounted right now and resolves
+        its current drive root. Prevents accidental disk operations if Windows reassigned drive letters.
+        """
+        if vol is None:
+            return None
+        if connected_map is None:
+            connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+
+        vsn = (vol.volume_serial_number or "").strip()
+        if vsn in connected_map:
+            mount_root, _ = connected_map[vsn]
+            if vol.last_known_drive_letter != mount_root or not vol.is_online:
+                vol.last_known_drive_letter = mount_root
+                vol.is_online = True
+            return Path(mount_root)
+
+        dl = (vol.last_known_drive_letter or "").strip()
+        norm_dl = dl.rstrip("\\/").upper()
+        for other_vsn, (other_root, _) in connected_map.items():
+            if other_root.rstrip("\\/").upper() == norm_dl and other_vsn != vsn:
+                vol.is_online = False
+                logger.warning(
+                    "VSN mismatch on %s: expected %s (%s), found %s. Disk operation blocked.",
+                    dl, vsn, vol.volume_label, other_vsn,
+                )
+                return None
+
+        is_drive_root = bool(re.fullmatch(r"[A-Za-z]:\\?", dl))
+        is_hw_vsn = bool(re.fullmatch(r"[0-9A-F]{4}-[0-9A-F]{4}", vsn))
+        if connected_map and (is_drive_root or is_hw_vsn):
+            vol.is_online = False
+            return None
+
+        if not vol.is_online or not dl or not Path(dl).exists():
+            return None
+        return Path(dl)
 
     def refresh_volumes_online_status(self) -> List[WindowsVolume]:
         """Updates online status, drive letters, and persisted free/total disk capacity for all tracked volumes."""
@@ -1191,6 +1236,7 @@ class StorageAutomationService:
         if important_assigned > 0:
             self.db.commit()
 
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
         backups_created = 0
         backups_relocated = 0
         backups_remote_moved = 0
@@ -1217,9 +1263,9 @@ class StorageAutomationService:
             for reloc_task in tasks["backups_to_relocate"]:
                 bkp_item = self.db.get(MediaItem, reloc_task["backup_item_id"])
                 bkp_vol = volumes.get(reloc_task["vol_id"])
-                if not bkp_item or not bkp_vol or not bkp_vol.is_online:
+                vol_root = self.verify_and_resolve_online_volume_root(bkp_vol, connected_map=connected_map)
+                if not bkp_item or not bkp_vol or vol_root is None:
                     continue
-                vol_root = Path(bkp_vol.last_known_drive_letter)
                 curr_path = vol_root / bkp_item.relative_path
                 if not curr_path.exists():
                     continue
@@ -1232,7 +1278,7 @@ class StorageAutomationService:
                     while target_bkp_path.exists():
                         target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
                         c += 1
-                    shutil.move(str(curr_path), str(target_bkp_path))
+                    _safe_move(curr_path, target_bkp_path)
                     bkp_item.file_name = target_bkp_path.name
                     bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
                 bkp_item.is_backup_copy = True
@@ -1241,8 +1287,10 @@ class StorageAutomationService:
                 backups_relocated += 1
                 local_done_in_pair += 1
 
+            va_root = self.verify_and_resolve_online_volume_root(va, connected_map=connected_map)
+            vb_root = self.verify_and_resolve_online_volume_root(vb, connected_map=connected_map)
             has_cross_work = bool(tasks["backups_to_copy"] or tasks["backups_remote_move"])
-            if not (va and vb and va.is_online and vb.is_online):
+            if va_root is None or vb_root is None:
                 if has_cross_work or (len(tasks["backups_to_relocate"]) > local_done_in_pair):
                     pending_offline_pairs.append(pair_entry)
                 if local_done_in_pair > 0:
@@ -1256,21 +1304,22 @@ class StorageAutomationService:
                 bkp_item = self.db.get(MediaItem, rmove["backup_item_id"])
                 src_vol = volumes.get(rmove["src_vol_id"])
                 dst_vol = volumes.get(rmove["dst_vol_id"])
-                if not bkp_item or not src_vol or not dst_vol or not src_vol.is_online or not dst_vol.is_online:
+                src_root_v = self.verify_and_resolve_online_volume_root(src_vol, connected_map=connected_map)
+                dst_root = self.verify_and_resolve_online_volume_root(dst_vol, connected_map=connected_map)
+                if not bkp_item or not src_vol or not dst_vol or src_root_v is None or dst_root is None:
                     continue
-                src_path = Path(src_vol.last_known_drive_letter) / bkp_item.relative_path
+                src_path = src_root_v / bkp_item.relative_path
                 if not src_path.exists():
                     continue
                 has_space, free_bytes = self.check_volume_free_space(
-                    dst_vol.last_known_drive_letter, bkp_item.file_size_bytes
+                    str(dst_root), bkp_item.file_size_bytes
                 )
                 if not has_space:
                     space_warnings.append(
-                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_vol.last_known_drive_letter}): "
+                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_root}): "
                         f"wymagane {bkp_item.file_size_bytes / (1024*1024):.1f} MB, wolne {free_bytes / (1024*1024):.1f} MB."
                     )
                     continue
-                dst_root = Path(dst_vol.last_known_drive_letter)
                 sub_day = bkp_item.effective_date.strftime("%Y/%m/%d")
                 backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_day
                 backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1283,13 +1332,13 @@ class StorageAutomationService:
                 verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
                 if not verified:
                     try:
-                        dest_path.unlink()
+                        _safe_unlink(dest_path)
                     except OSError as exc:
                         logger.debug("Cleanup failed remote backup move %s: %s", dest_path, exc)
                     verification_blocks += 1
                     continue
                 try:
-                    src_path.unlink()
+                    _safe_unlink(src_path)
                 except OSError as exc:
                     logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
                 bkp_item.volume_id = dst_vol.id
@@ -1312,24 +1361,24 @@ class StorageAutomationService:
                 orig_item = self.db.get(MediaItem, copy_task["orig_item_id"])
                 src_vol = volumes.get(copy_task["src_vol_id"])
                 dst_vol = volumes.get(copy_task["dst_vol_id"])
-                if not orig_item or not src_vol or not dst_vol:
+                src_root_v = self.verify_and_resolve_online_volume_root(src_vol, connected_map=connected_map)
+                dst_root = self.verify_and_resolve_online_volume_root(dst_vol, connected_map=connected_map)
+                if not orig_item or not src_vol or not dst_vol or src_root_v is None or dst_root is None:
                     continue
 
-                src_path = Path(src_vol.last_known_drive_letter) / orig_item.relative_path
+                src_path = src_root_v / orig_item.relative_path
                 if not src_path.exists():
                     continue
 
                 has_space, free_bytes = self.check_volume_free_space(
-                    dst_vol.last_known_drive_letter, orig_item.file_size_bytes
+                    str(dst_root), orig_item.file_size_bytes
                 )
                 if not has_space:
                     space_warnings.append(
-                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_vol.last_known_drive_letter}): "
+                        f"Brak miejsca na dysku {dst_vol.volume_label} ({dst_root}): "
                         f"wymagane {orig_item.file_size_bytes / (1024*1024):.1f} MB, wolne {free_bytes / (1024*1024):.1f} MB."
                     )
                     continue
-
-                dst_root = Path(dst_vol.last_known_drive_letter)
                 sub_day = orig_item.effective_date.strftime("%Y/%m/%d")
                 backup_dir = dst_root / self.BACKUP_DIR_NAME / sub_day
                 backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1570,8 +1619,6 @@ class StorageAutomationService:
 
         eff_trash_dir = trash_dir or (db_module.DATA_DIR / "kosz")
         eff_thumbs_dir = thumbnails_dir or db_module.THUMBNAILS_DIR
-        if delete_mode == "trash":
-            eff_trash_dir.mkdir(parents=True, exist_ok=True)
 
         if progress_cb:
             progress_cb(0, len(item_ids), "Weryfikacja dysków i aktualizacja klastrów duplikatów...", "")
@@ -1644,6 +1691,7 @@ class StorageAutomationService:
                 db=self.db,
             )
 
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
         volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
         touched_hashes = list({it.file_hash for it in target_items})
         cluster_members: List[MediaItem] = []
@@ -1660,6 +1708,12 @@ class StorageAutomationService:
         for m in cluster_members:
             by_hash[m.file_hash].append(m)
 
+        # Resolve VSN-verified live roots before sorting ONLINE drives first
+        verified_roots: Dict[int, Optional[Path]] = {
+            vid: self.verify_and_resolve_online_volume_root(v, connected_map=connected_map)
+            for vid, v in volumes.items()
+        }
+
         # Group items by volume_id and process ONLINE volumes first (disk-by-disk)
         items_by_vol: Dict[int, List[MediaItem]] = defaultdict(list)
         for it in target_items:
@@ -1667,7 +1721,7 @@ class StorageAutomationService:
 
         sorted_vids = sorted(
             items_by_vol.keys(),
-            key=lambda vid: (not (volumes.get(vid) and volumes[vid].is_online), vid),
+            key=lambda vid: (verified_roots.get(vid) is None, vid),
         )
 
         removed_ids: Set[str] = set()
@@ -1692,10 +1746,11 @@ class StorageAutomationService:
             if stopped_by_user:
                 break
             vol = volumes.get(vid)
+            vol_root = verified_roots.get(vid)
             vol_items = items_by_vol[vid]
-            drive_label = f"{vol.volume_label} ({vol.last_known_drive_letter})" if vol else f"#{vid}"
+            drive_label = f"{vol.volume_label} ({vol_root or vol.last_known_drive_letter})" if vol else f"#{vid}"
 
-            if not vol or not vol.is_online:
+            if not vol or vol_root is None:
                 for it in vol_items:
                     if job_id and ProcessManager.is_stop_requested(job_id):
                         stopped_by_user = True
@@ -1721,7 +1776,6 @@ class StorageAutomationService:
                             continue
                         _mark_offline(it, vid)
                     else:
-                        # Non-duplicate logical trash/delete for offline volume preserves existing behavior
                         if delete_mode == "trash":
                             it.is_trashed = True
                         else:
@@ -1763,10 +1817,10 @@ class StorageAutomationService:
                         blocked_safety += 1
                         continue
 
-                    cand_path = Path(vol.last_known_drive_letter) / cand.relative_path
+                    cand_path = vol_root / cand.relative_path
                     if not cand_path.exists():
-                        if Path(vol.last_known_drive_letter).exists():
-                            # Duplicate file was already physically deleted before previous session was interrupted -> reconcile DB record
+                        if vol_root.exists():
+                            # Duplicate file was already physically deleted before previous session -> reconcile DB record
                             if delete_mode == "trash":
                                 cand.is_trashed = True
                             else:
@@ -1779,23 +1833,23 @@ class StorageAutomationService:
                         missing_on_disk += 1
                         continue
 
-                    # Safety gate 2: Need an ONLINE surviving reference file to perform 100% binary verification
+                    # Safety gate 2: Need an ONLINE VSN-verified reference file to perform 100% binary verification
                     ref_candidates = [orig, bkp] + [x for x in surviving if x.id not in (orig.id, bkp.id)]
                     ref_item: Optional[MediaItem] = None
                     ref_path: Optional[Path] = None
                     for rc in ref_candidates:
-                        rv = volumes.get(rc.volume_id)
-                        if rv and rv.is_online:
-                            rp = Path(rv.last_known_drive_letter) / rc.relative_path
+                        rv_root = verified_roots.get(rc.volume_id)
+                        if rv_root is not None:
+                            rp = rv_root / rc.relative_path
                             if rp.exists() and rp.resolve() != cand_path.resolve():
                                 ref_item = rc
                                 ref_path = rp
                                 break
 
                     # If backup is currently online, verify its file actually exists on disk before trusting it
-                    bkp_v = volumes.get(bkp.volume_id)
-                    if bkp_v and bkp_v.is_online:
-                        bkp_p = Path(bkp_v.last_known_drive_letter) / bkp.relative_path
+                    bkp_root = verified_roots.get(bkp.volume_id)
+                    if bkp_root is not None:
+                        bkp_p = bkp_root / bkp.relative_path
                         if not bkp_p.exists() and len(surviving) == 2:
                             blocked_safety += 1
                             continue
@@ -1812,14 +1866,8 @@ class StorageAutomationService:
                             )
                         )
                         if not can_verify_from_meta:
-                            ref_vols = [
-                                rc.volume_id for rc in ref_candidates
-                                if volumes.get(rc.volume_id) and not volumes[rc.volume_id].is_online
-                            ]
-                            needed_vid = next((rv_id for rv_id in ref_vols if rv_id in items_by_vol), None)
-                            if needed_vid is None:
-                                needed_vid = orig.volume_id if (volumes.get(orig.volume_id) and not volumes[orig.volume_id].is_online) else bkp.volume_id
-                            _mark_offline(cand, needed_vid, is_ref_only=True)
+                            # Do NOT push an ONLINE drive's file back into offline_items (prevents disk ping-pong).
+                            blocked_verify += 1
                             continue
                         expected_vsha = orig.verified_sha256 or bkp.verified_sha256
                         is_identical, verify_msg, full_sha = FastHasher.verify_candidate_against_cluster_metadata(
@@ -1854,21 +1902,8 @@ class StorageAutomationService:
                         orig.verified_sha256 = full_sha
 
                     if delete_mode == "trash":
-                        dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
-                        try:
-                            _safe_move(cand_path, dest_p)
-                        except OSError as exc:
-                            blocked_verify += 1
-                            OperationLogger.log(
-                                "DUP_DELETE_LOCKED",
-                                f"Pominięto zablokowany plik {cand_path}: {exc}",
-                                status="WARN",
-                                db=self.db,
-                                commit=True,
-                            )
-                            continue
+                        # Logical-only KOSZ attribute: physical file stays completely untouched on disk
                         cand.is_trashed = True
-                        physical_count += 1
                     else:
                         try:
                             _safe_unlink(cand_path)
@@ -1902,15 +1937,9 @@ class StorageAutomationService:
                     drive_processed_cnt += 1
                 else:
                     # Standard non-duplicate removal
-                    src_p = Path(vol.last_known_drive_letter) / cand.relative_path
+                    src_p = vol_root / cand.relative_path
                     if delete_mode == "trash":
-                        if src_p.exists():
-                            dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
-                            try:
-                                _safe_move(src_p, dest_p)
-                                physical_count += 1
-                            except Exception as exc:
-                                logger.debug("Move to trash physical warning: %s", exc)
+                        # Logical-only KOSZ attribute: physical file stays untouched on disk
                         cand.is_trashed = True
                     else:
                         if src_p.exists():
@@ -1942,10 +1971,10 @@ class StorageAutomationService:
                 self.db.commit()
 
             if drive_processed_cnt > 0:
-                processed_drives.append(f"{vol.volume_label} ({vol.last_known_drive_letter}): {drive_processed_cnt} szt.")
+                processed_drives.append(f"{vol.volume_label} ({vol_root}): {drive_processed_cnt} szt.")
 
         self.db.commit()
-        if removed_ids or blocked_verify > 0:
+        if (removed_ids or blocked_verify > 0) and not offline_items and not stopped_by_user:
             if progress_cb:
                 progress_cb(step_idx, total_candidates, "Aktualizacja tagów klastrów duplikatów...", "")
             if job_id:
@@ -2008,11 +2037,14 @@ class StorageAutomationService:
         self,
         source_volume_id: Optional[int] = None,
         target_volume_id: Optional[int] = None,
+        include_in_vault: bool = True,
+        include_green_outside: bool = True,
+        include_orange_same_disk: bool = True,
     ) -> Dict[str, Any]:
         """
-        Analyzes backups across all volumes and evaluates how many backup files can be safely
-        moved from source_volume_id -> target_volume_id while guaranteeing that each Original
-        stays on a DIFFERENT physical device than its backup.
+        Analyzes backups across all volumes (in daf_backup/, green outside vault, orange same-disk)
+        and evaluates how many selected backup files can be safely moved from source_volume_id ->
+        target_volume_id/daf_backup/YYYY/MM/DD while keeping Original on a DIFFERENT physical device.
         """
         self.refresh_volumes_online_status()
         self.flag_duplicate_clusters()
@@ -2027,29 +2059,64 @@ class StorageAutomationService:
         )
         by_hash: Dict[str, List[MediaItem]] = defaultdict(list)
         bkp_stats_by_vol: Dict[int, Dict[str, int]] = {
-            vid: {"count": 0, "bytes": 0} for vid in volumes
+            vid: {
+                "count": 0,
+                "bytes": 0,
+                "in_vault_count": 0,
+                "in_vault_bytes": 0,
+                "green_outside_count": 0,
+                "green_outside_bytes": 0,
+                "orange_count": 0,
+                "orange_bytes": 0,
+            }
+            for vid in volumes
         }
+
+        def _classify_bkp(item_obj: MediaItem) -> Optional[str]:
+            if item_obj.is_backup_copy:
+                return "in_vault"
+            if item_obj.duplicate_role == "backup_green":
+                return "green_outside"
+            if item_obj.duplicate_role == "backup_orange":
+                return "orange"
+            return None
+
         for it in all_items:
             by_hash[it.file_hash].append(it)
-            if it.is_backup_copy or it.duplicate_role in ("backup_green", "backup_orange"):
-                if it.volume_id in bkp_stats_by_vol:
-                    bkp_stats_by_vol[it.volume_id]["count"] += 1
-                    bkp_stats_by_vol[it.volume_id]["bytes"] += int(it.file_size_bytes or 0)
+            bkind = _classify_bkp(it)
+            if bkind and it.volume_id in bkp_stats_by_vol:
+                sz = int(it.file_size_bytes or 0)
+                st = bkp_stats_by_vol[it.volume_id]
+                st["count"] += 1
+                st["bytes"] += sz
+                st[f"{bkind}_count"] += 1
+                st[f"{bkind}_bytes"] += sz
 
         movable_rows: List[Dict[str, Any]] = []
         movable_bytes = 0
         blocked_same_device_count = 0
         blocked_same_device_bytes = 0
         already_on_target_count = 0
+        filtered_out_by_type_count = 0
+        movable_counts_by_kind = {"in_vault": 0, "green_outside": 0, "orange": 0}
         src_vol = volumes.get(source_volume_id) if source_volume_id else None
         dst_vol = volumes.get(target_volume_id) if target_volume_id else None
 
         if src_vol and dst_vol and src_vol.id != dst_vol.id:
             src_backups = [
                 it for it in all_items
-                if it.volume_id == src_vol.id and (it.is_backup_copy or it.duplicate_role in ("backup_green", "backup_orange"))
+                if it.volume_id == src_vol.id and _classify_bkp(it) is not None
             ]
             for bkp in src_backups:
+                bkind = _classify_bkp(bkp)
+                if (
+                    (bkind == "in_vault" and not include_in_vault)
+                    or (bkind == "green_outside" and not include_green_outside)
+                    or (bkind == "orange" and not include_orange_same_disk)
+                ):
+                    filtered_out_by_type_count += 1
+                    continue
+
                 cluster = by_hash.get(bkp.file_hash, [])
                 fsize = int(bkp.file_size_bytes or 0)
                 # Ensure Original / non-backup copy is NOT on dst_vol (otherwise Original & Backup would share one disk!)
@@ -2074,11 +2141,14 @@ class StorageAutomationService:
                 orig_vol = volumes.get(orig.volume_id)
                 dst_rel = f"{self.BACKUP_DIR_NAME}/{bkp.effective_date.strftime('%Y/%m/%d')}/{bkp.file_name}"
                 movable_bytes += fsize
+                if bkind in movable_counts_by_kind:
+                    movable_counts_by_kind[bkind] += 1
                 movable_rows.append(
                     {
                         "item_id": bkp.id,
                         "file_name": bkp.file_name,
                         "file_size": fsize,
+                        "backup_kind": bkind,
                         "src_relative_path": bkp.relative_path,
                         "dst_relative_path": dst_rel,
                         "orig_vol_label": orig_vol.volume_label if orig_vol else "?",
@@ -2101,11 +2171,16 @@ class StorageAutomationService:
             "bkp_stats_by_vol": bkp_stats_by_vol,
             "source_volume_id": source_volume_id,
             "target_volume_id": target_volume_id,
+            "include_in_vault": include_in_vault,
+            "include_green_outside": include_green_outside,
+            "include_orange_same_disk": include_orange_same_disk,
             "src_vol": src_vol,
             "dst_vol": dst_vol,
             "movable_rows": movable_rows,
             "movable_count": len(movable_rows),
             "movable_bytes": movable_bytes,
+            "movable_counts_by_kind": movable_counts_by_kind,
+            "filtered_out_by_type_count": filtered_out_by_type_count,
             "blocked_same_device_count": blocked_same_device_count,
             "blocked_same_device_bytes": blocked_same_device_bytes,
             "already_on_target_count": already_on_target_count,
@@ -2120,23 +2195,35 @@ class StorageAutomationService:
         self,
         source_volume_id: int,
         target_volume_id: int,
+        include_in_vault: bool = True,
+        include_green_outside: bool = True,
+        include_orange_same_disk: bool = True,
     ) -> Dict[str, Any]:
         """Moves verified backup files physically from source_volume_id to target_volume_id/daf_backup/YYYY/MM/DD."""
-        analysis = self.analyze_move_backups(source_volume_id, target_volume_id)
+        analysis = self.analyze_move_backups(
+            source_volume_id,
+            target_volume_id,
+            include_in_vault=include_in_vault,
+            include_green_outside=include_green_outside,
+            include_orange_same_disk=include_orange_same_disk,
+        )
         src_vol: Optional[WindowsVolume] = analysis["src_vol"]
         dst_vol: Optional[WindowsVolume] = analysis["dst_vol"]
 
         if not src_vol or not dst_vol or src_vol.id == dst_vol.id:
             return {"status": "error", "message": "Wybierz dwa różne urządzenia (źródłowe i docelowe).", "moved_count": 0}
 
-        if not src_vol.is_online or not dst_vol.is_online:
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        src_root = self.verify_and_resolve_online_volume_root(src_vol, connected_map=connected_map)
+        dst_root = self.verify_and_resolve_online_volume_root(dst_vol, connected_map=connected_map)
+        if src_root is None or dst_root is None:
             offline_names = [
                 f"{v.volume_label} ({v.last_known_drive_letter})"
-                for v in (src_vol, dst_vol) if not v.is_online
+                for v, rt in ((src_vol, src_root), (dst_vol, dst_root)) if rt is None
             ]
             return {
                 "status": "offline",
-                "message": f"Podłącz dyski offline przed przeniesieniem backupów: {', '.join(offline_names)}.",
+                "message": f"Podłącz dyski offline / zweryfikuj VSN przed przeniesieniem backupów: {', '.join(offline_names)}.",
                 "moved_count": 0,
             }
 
@@ -2145,8 +2232,6 @@ class StorageAutomationService:
             return {"status": "empty", "message": "Brak backupów możliwych do przeniesienia między wybraną parą dysków.", "moved_count": 0}
 
         self.backup_mgr.create_backup("pre_move_backups")
-        src_root = Path(src_vol.last_known_drive_letter)
-        dst_root = Path(dst_vol.last_known_drive_letter)
 
         moved_count = 0
         moved_bytes = 0
@@ -2161,7 +2246,7 @@ class StorageAutomationService:
             if not src_path.exists():
                 continue
 
-            has_space, _ = self.check_volume_free_space(dst_vol.last_known_drive_letter, item.file_size_bytes)
+            has_space, _ = self.check_volume_free_space(str(dst_root), item.file_size_bytes)
             if not has_space:
                 space_stopped = True
                 break
@@ -2179,14 +2264,14 @@ class StorageAutomationService:
             verified, _, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
             if not verified:
                 try:
-                    dest_path.unlink()
+                    _safe_unlink(dest_path)
                 except OSError as exc:
                     logger.debug("Cleanup failed backup transfer %s: %s", dest_path, exc)
                 verification_blocks += 1
                 continue
 
             try:
-                src_path.unlink()
+                _safe_unlink(src_path)
             except OSError as exc:
                 logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
 
@@ -2204,7 +2289,7 @@ class StorageAutomationService:
         self.flag_duplicate_clusters()
 
         msg = (
-            f"Przeniesiono backupów z {src_vol.volume_label} -> {dst_vol.volume_label}: "
+            f"Przeniesiono backupów z {src_vol.volume_label} -> {dst_vol.volume_label} (do {self.BACKUP_DIR_NAME}/RRRR/MM/DD/): "
             f"{moved_count} plików ({moved_bytes / (1024*1024):.2f} MB)."
         )
         if space_stopped:
@@ -2227,35 +2312,36 @@ class StorageAutomationService:
         target_subfolder: str = "",
     ) -> Dict[str, Any]:
         """
-        Physically moves files between online devices or directories.
-        Skips items whose source or target device is currently offline.
+        Physically moves files between online devices or directories with live VSN verification.
+        Skips items whose source or target device is currently offline or VSN-mismatched.
         """
         self.refresh_volumes_online_status()
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
         target_vol = self.db.get(WindowsVolume, target_volume_id)
         if not target_vol:
             raise ValueError("Dysk docelowy nie istnieje w bazie.")
 
+        dst_root = self.verify_and_resolve_online_volume_root(target_vol, connected_map=connected_map)
         clean_sub = target_subfolder.strip().strip("/\\")
         moved_physically = 0
         skipped_offline = 0
 
-        if target_vol.is_online:
+        if dst_root is not None:
             self.backup_mgr.create_backup("pre_move_files")
 
         for it in items:
             src_vol = self.db.get(WindowsVolume, it.volume_id)
+            src_root = self.verify_and_resolve_online_volume_root(src_vol, connected_map=connected_map)
             can_move_physically = (
-                src_vol is not None
-                and src_vol.is_online
-                and target_vol.is_online
-                and (Path(src_vol.last_known_drive_letter) / it.relative_path).exists()
+                src_root is not None
+                and dst_root is not None
+                and (src_root / it.relative_path).exists()
             )
             if not can_move_physically:
                 skipped_offline += 1
                 continue
 
-            src_file = Path(src_vol.last_known_drive_letter) / it.relative_path
-            dst_root = Path(target_vol.last_known_drive_letter)
+            src_file = src_root / it.relative_path
             dst_dir = (dst_root / clean_sub) if clean_sub else dst_root
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst_file = dst_dir / it.file_name
@@ -2265,7 +2351,7 @@ class StorageAutomationService:
                 while dst_file.exists():
                     dst_file = dst_dir / f"{src_file.stem}_{c}{src_file.suffix}"
                     c += 1
-                shutil.move(str(src_file), str(dst_file))
+                _safe_move(src_file, dst_file)
 
             it.volume_id = target_vol.id
             it.file_name = dst_file.name
@@ -2419,4 +2505,476 @@ class StorageAutomationService:
             "evaluated": evaluated,
             "anomalies_found": anomalies_found,
             "dates_updated": dates_updated,
+        }
+
+    def verify_db_disk_consistency(self, volume_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Checks all online, VSN-verified drives against non-trashed SQLite MediaItem records
+        without altering any existing AI tags, embeddings, quality scores, or album assignments.
+        Reports missing physical files so the user can inspect and decide whether to clean up DB rows.
+        """
+        self.refresh_volumes_online_status()
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        stmt = select(WindowsVolume).order_by(WindowsVolume.id.asc())
+        if volume_id is not None:
+            stmt = stmt.where(WindowsVolume.id == volume_id)
+        volumes = list(self.db.scalars(stmt).all())
+
+        hash_counts = dict(
+            self.db.execute(
+                select(MediaItem.file_hash, func.count(MediaItem.id))
+                .where(MediaItem.is_trashed == False)
+                .group_by(MediaItem.file_hash)
+            ).all()
+        )
+
+        checked_online_volumes: List[Dict[str, Any]] = []
+        offline_volumes: List[Dict[str, Any]] = []
+        missing_items: List[Dict[str, Any]] = []
+        valid_online_count = 0
+        size_mismatch_count = 0
+        missing_with_backup_count = 0
+        missing_without_backup_count = 0
+
+        for vol in volumes:
+            root = self.verify_and_resolve_online_volume_root(vol, connected_map=connected_map)
+            if root is None:
+                db_cnt = int(
+                    self.db.scalar(
+                        select(func.count(MediaItem.id)).where(
+                            MediaItem.volume_id == vol.id, MediaItem.is_trashed == False
+                        )
+                    )
+                    or 0
+                )
+                offline_volumes.append({
+                    "id": vol.id,
+                    "label": vol.volume_label,
+                    "drive_letter": vol.last_known_drive_letter,
+                    "vsn": vol.volume_serial_number,
+                    "db_count": db_cnt,
+                })
+                continue
+
+            items = list(
+                self.db.scalars(
+                    select(MediaItem).where(
+                        MediaItem.volume_id == vol.id, MediaItem.is_trashed == False
+                    )
+                ).all()
+            )
+            vol_valid = 0
+            vol_missing = 0
+            for it in items:
+                fp = root / it.relative_path
+                if not fp.exists() or not fp.is_file():
+                    vol_missing += 1
+                    other_copies = max(0, int(hash_counts.get(it.file_hash, 1)) - 1)
+                    if other_copies > 0:
+                        missing_with_backup_count += 1
+                    else:
+                        missing_without_backup_count += 1
+                    missing_items.append({
+                        "id": it.id,
+                        "file_name": it.file_name,
+                        "relative_path": it.relative_path,
+                        "volume_id": vol.id,
+                        "volume_label": vol.volume_label,
+                        "drive_letter": str(root),
+                        "duplicate_role": it.duplicate_role,
+                        "is_backup_copy": it.is_backup_copy,
+                        "file_size_bytes": int(it.file_size_bytes or 0),
+                        "other_copies_count": other_copies,
+                    })
+                else:
+                    vol_valid += 1
+                    valid_online_count += 1
+                    try:
+                        if fp.stat().st_size != it.file_size_bytes:
+                            size_mismatch_count += 1
+                    except OSError:
+                        size_mismatch_count += 1
+
+            checked_online_volumes.append({
+                "id": vol.id,
+                "label": vol.volume_label,
+                "drive_letter": str(root),
+                "vsn": vol.volume_serial_number,
+                "db_count": len(items),
+                "valid_count": vol_valid,
+                "missing_count": vol_missing,
+            })
+
+        OperationLogger.log(
+            "CONSISTENCY_CHECK",
+            f"Sprawdzenie spójności baza↔dysk: OK na dysku={valid_online_count}, "
+            f"brakujące na dysku={len(missing_items)}, inny rozmiar={size_mismatch_count}, dyski offline={len(offline_volumes)}.",
+            status="OK" if not missing_items else "WARN",
+            db=self.db,
+        )
+        return {
+            "checked_online_volumes": checked_online_volumes,
+            "offline_volumes": offline_volumes,
+            "valid_online_count": valid_online_count,
+            "size_mismatch_count": size_mismatch_count,
+            "missing_count": len(missing_items),
+            "missing_with_backup_count": missing_with_backup_count,
+            "missing_without_backup_count": missing_without_backup_count,
+            "missing_items": missing_items,
+            "missing_ids": [x["id"] for x in missing_items],
+        }
+
+    def cleanup_missing_db_items(
+        self,
+        item_ids: Optional[List[str]] = None,
+        volume_id: Optional[int] = None,
+        thumbnails_dir: Optional[Path] = None,
+    ) -> Dict[str, int]:
+        """
+        Removes DB records whose physical files are confirmed missing on VSN-verified ONLINE drives.
+        Never touches records on offline or VSN-mismatched drives.
+        """
+        self.refresh_volumes_online_status()
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        verified_roots: Dict[int, Optional[Path]] = {
+            vid: self.verify_and_resolve_online_volume_root(v, connected_map=connected_map)
+            for vid, v in volumes.items()
+        }
+
+        if item_ids is None:
+            check = self.verify_db_disk_consistency(volume_id=volume_id)
+            item_ids = check["missing_ids"]
+
+        if not item_ids:
+            return {"removed_count": 0, "skipped_exists_or_offline": 0}
+
+        eff_thumbs_dir = thumbnails_dir or db_module.THUMBNAILS_DIR
+        self.backup_mgr.create_backup("pre_missing_cleanup")
+
+        targets: List[MediaItem] = []
+        for idx in range(0, len(item_ids), 2000):
+            chunk = item_ids[idx : idx + 2000]
+            stmt = select(MediaItem).where(MediaItem.id.in_(chunk), MediaItem.is_trashed == False)
+            if volume_id is not None:
+                stmt = stmt.where(MediaItem.volume_id == volume_id)
+            targets.extend(self.db.scalars(stmt).all())
+
+        hash_counts = dict(
+            self.db.execute(
+                select(MediaItem.file_hash, func.count(MediaItem.id))
+                .where(MediaItem.is_trashed == False)
+                .group_by(MediaItem.file_hash)
+            ).all()
+        )
+        removed_count = 0
+        skipped = 0
+        for it in targets:
+            root = verified_roots.get(it.volume_id)
+            if root is None:
+                skipped += 1
+                continue
+            fp = root / it.relative_path
+            if fp.exists():
+                skipped += 1
+                continue
+            vol = volumes.get(it.volume_id)
+            if hash_counts.get(it.file_hash, 0) > 1:
+                self._record_deleted_duplicate_history(it, vol)
+                hash_counts[it.file_hash] = hash_counts[it.file_hash] - 1
+            if it.thumbnail_relative_path:
+                other_same_thumb = self.db.scalar(
+                    select(MediaItem.id).where(
+                        MediaItem.thumbnail_relative_path == it.thumbnail_relative_path,
+                        MediaItem.id != it.id,
+                    ).limit(1)
+                )
+                if not other_same_thumb:
+                    tp = eff_thumbs_dir / it.thumbnail_relative_path
+                    if tp.exists():
+                        try:
+                            _safe_unlink(tp)
+                        except OSError as exc:
+                            logger.debug("Cleanup missing item thumb warning: %s", exc)
+            self.db.delete(it)
+            removed_count += 1
+
+        self.db.commit()
+        if removed_count > 0:
+            self.flag_duplicate_clusters()
+        OperationLogger.log(
+            "DB_DISK_CLEANUP",
+            f"Usunięto z bazy {removed_count} osieroconych rekordów brakujących na dysku (pominięto: {skipped}).",
+            status="OK",
+            db=self.db,
+        )
+        return {"removed_count": removed_count, "skipped_exists_or_offline": skipped}
+
+    def organize_ungrouped_originals(self, volume_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Groups ungrouped non-trashed Originals (group_id IS NULL) into daf_oryginal/YYYY/MM/DD/
+        on their own VSN-verified device while preserving `original_relative_path` with drive label
+        for search and folder filtering. Skips clusters already having a file in daf_oryginal/ on any disk.
+        """
+        self.refresh_volumes_online_status()
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        verified_roots: Dict[int, Optional[Path]] = {
+            vid: self.verify_and_resolve_online_volume_root(v, connected_map=connected_map)
+            for vid, v in volumes.items()
+        }
+
+        already_organized_hashes = set(
+            self.db.scalars(
+                select(MediaItem.file_hash).where(
+                    MediaItem.is_trashed == False,
+                    or_(
+                        func.lower(MediaItem.relative_path).like(f"{self.ORIGINAL_DIR_NAME}/%"),
+                        func.lower(MediaItem.relative_path).like(f"{self.ORIGINAL_DIR_NAME}\\%"),
+                    ),
+                )
+            ).all()
+        )
+
+        stmt = (
+            select(MediaItem)
+            .where(
+                MediaItem.is_trashed == False,
+                MediaItem.group_id.is_(None),
+                MediaItem.is_backup_copy == False,
+                MediaItem.duplicate_role == "original",
+            )
+            .order_by(MediaItem.effective_date.asc(), MediaItem.id.asc())
+        )
+        if volume_id is not None:
+            stmt = stmt.where(MediaItem.volume_id == volume_id)
+        candidates = list(self.db.scalars(stmt).all())
+
+        moved_count = 0
+        skipped_already_organized = 0
+        skipped_offline = 0
+        missing_on_disk = 0
+        errors = 0
+
+        if candidates:
+            self.backup_mgr.create_backup("pre_organize_originals")
+
+        for it in candidates:
+            rel_norm = (it.relative_path or "").replace("\\", "/").lstrip("/")
+            if rel_norm.lower().startswith(f"{self.ORIGINAL_DIR_NAME}/") or it.file_hash in already_organized_hashes:
+                skipped_already_organized += 1
+                continue
+
+            vol = volumes.get(it.volume_id)
+            root = verified_roots.get(it.volume_id)
+            if not vol or root is None:
+                skipped_offline += 1
+                continue
+
+            src_path = root / it.relative_path
+            if not src_path.exists() or not src_path.is_file():
+                missing_on_disk += 1
+                continue
+
+            sub_day = it.effective_date.strftime("%Y/%m/%d")
+            dst_dir = root / self.ORIGINAL_DIR_NAME / sub_day
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst_path = dst_dir / it.file_name
+            if src_path.resolve() != dst_path.resolve():
+                c = 1
+                while dst_path.exists():
+                    dst_path = dst_dir / f"{src_path.stem}_{c}{src_path.suffix}"
+                    c += 1
+                try:
+                    _safe_move(src_path, dst_path)
+                except OSError as exc:
+                    logger.debug("Organize original move error for %s: %s", src_path, exc)
+                    errors += 1
+                    continue
+
+            if not it.original_relative_path:
+                it.original_relative_path = f"{vol.volume_label}/{rel_norm}"
+            it.file_name = dst_path.name
+            it.relative_path = dst_path.resolve().relative_to(root.resolve()).as_posix()
+            already_organized_hashes.add(it.file_hash)
+            moved_count += 1
+            if moved_count % 200 == 0:
+                self.db.commit()
+
+        self.db.commit()
+        msg = (
+            f"Uporządkowano oryginałów (bez albumu) do {self.ORIGINAL_DIR_NAME}/RRRR/MM/DD/: {moved_count} szt. "
+            f"| Już w {self.ORIGINAL_DIR_NAME}/: {skipped_already_organized} | Offline: {skipped_offline} | Brak na dysku: {missing_on_disk}."
+        )
+        OperationLogger.log("ORGANIZE_ORIGINALS", msg, status="OK" if errors == 0 else "WARN", db=self.db)
+        return {
+            "moved_count": moved_count,
+            "skipped_already_organized": skipped_already_organized,
+            "skipped_offline": skipped_offline,
+            "missing_on_disk": missing_on_disk,
+            "errors": errors,
+            "message": msg,
+        }
+
+    def export_physical_album(
+        self,
+        items: List[MediaItem],
+        target_volume_id: int,
+        album_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Copies selected/album photos physically into daf_albums/<AlbumName>/ on a chosen
+        VSN-verified online device without registering copies in media_items.
+        """
+        self.refresh_volumes_online_status()
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        target_vol = self.db.get(WindowsVolume, target_volume_id)
+        if not target_vol:
+            return {"status": "error", "message": "Wybrany dysk docelowy nie istnieje.", "copied_count": 0}
+
+        dst_root = self.verify_and_resolve_online_volume_root(target_vol, connected_map=connected_map)
+        if dst_root is None:
+            return {
+                "status": "offline",
+                "message": f"Dysk docelowy {target_vol.volume_label} ({target_vol.last_known_drive_letter}) jest offline lub niezgodny VSN.",
+                "copied_count": 0,
+            }
+
+        clean_name = re.sub(r'[<>:"/\\|?*]+', "_", (album_name or "").strip()).strip(". ")
+        if not clean_name:
+            clean_name = f"Album_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+        export_dir = dst_root / self.ALBUMS_EXPORT_DIR_NAME / clean_name
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        verified_roots: Dict[int, Optional[Path]] = {
+            vid: self.verify_and_resolve_online_volume_root(v, connected_map=connected_map)
+            for vid, v in volumes.items()
+        }
+
+        copied_count = 0
+        copied_bytes = 0
+        skipped_offline = 0
+        space_stopped = False
+
+        for it in items:
+            src_root = verified_roots.get(it.volume_id)
+            if src_root is None:
+                skipped_offline += 1
+                continue
+            src_file = src_root / it.relative_path
+            if not src_file.exists() or not src_file.is_file():
+                skipped_offline += 1
+                continue
+
+            has_space, _ = self.check_volume_free_space(str(dst_root), int(it.file_size_bytes or 0))
+            if not has_space:
+                space_stopped = True
+                break
+
+            dst_file = export_dir / it.file_name
+            c = 1
+            while dst_file.exists():
+                dst_file = export_dir / f"{src_file.stem}_{c}{src_file.suffix}"
+                c += 1
+            shutil.copy2(str(src_file), str(dst_file))
+            copied_count += 1
+            copied_bytes += int(it.file_size_bytes or 0)
+
+        msg = (
+            f"Wyeksportowano fizycznie {copied_count} plików albumu ({copied_bytes / (1024*1024):.2f} MB) "
+            f"do {export_dir} (pomijane przez skaner jako katalog eksportu)."
+        )
+        if skipped_offline > 0:
+            msg += f" Pominięto offline/brak pliku: {skipped_offline}."
+        if space_stopped:
+            msg += " Zatrzymano z powodu zapełnienia dysku docelowego."
+        OperationLogger.log("EXPORT_PHYSICAL_ALBUM", msg, status="OK" if not space_stopped else "WARN", db=self.db)
+        return {
+            "status": "ok" if not space_stopped else "partial_space",
+            "copied_count": copied_count,
+            "copied_bytes": copied_bytes,
+            "skipped_offline": skipped_offline,
+            "export_path": str(export_dir),
+            "message": msg,
+        }
+
+    def verify_deleted_duplicates_integrity(self) -> Dict[str, Any]:
+        """
+        Verifies across media_vault.db and deleted_duplicate_history / pre-delete snapshots
+        that every permanently deleted duplicate retains an active Original with matching file_hash.
+        """
+        active_count = int(
+            self.db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False)) or 0
+        )
+        deleted_count = int(self.db.scalar(select(func.count(DeletedDuplicateHistory.id))) or 0)
+
+        active_hashes_subq = select(MediaItem.file_hash).where(MediaItem.is_trashed == False)
+        orig_hashes_subq = select(MediaItem.file_hash).where(
+            MediaItem.is_trashed == False,
+            or_(MediaItem.duplicate_role == "original", MediaItem.is_primary_duplicate == True),
+        )
+        with_active_copy_count = int(
+            self.db.scalar(
+                select(func.count(DeletedDuplicateHistory.id)).where(
+                    DeletedDuplicateHistory.file_hash.in_(active_hashes_subq)
+                )
+            )
+            or 0
+        )
+        with_active_original_count = int(
+            self.db.scalar(
+                select(func.count(DeletedDuplicateHistory.id)).where(
+                    DeletedDuplicateHistory.file_hash.in_(orig_hashes_subq)
+                )
+            )
+            or 0
+        )
+
+        # Inspect largest pre-deletion snapshot if present in data/backups
+        snapshot_name: Optional[str] = None
+        snapshot_total: Optional[int] = None
+        if db_module.BACKUP_DIR.exists():
+            db_candidates = sorted(
+                db_module.BACKUP_DIR.rglob("*.db"),
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            for snap in db_candidates[:3]:
+                try:
+                    sc = sqlite3.connect(snap.as_posix(), timeout=5.0)
+                    cnt_row = sc.execute("SELECT COUNT(*) FROM media_items WHERE is_trashed = 0").fetchone()
+                    sc.close()
+                    if cnt_row and int(cnt_row[0]) >= active_count + deleted_count:
+                        snapshot_name = snap.name
+                        snapshot_total = int(cnt_row[0])
+                        break
+                except Exception:
+                    continue
+
+        pre_delete_total = snapshot_total if snapshot_total is not None else (active_count + deleted_count)
+        pct = (with_active_original_count / deleted_count * 100.0) if deleted_count > 0 else 100.0
+        missing_orig_count = max(0, deleted_count - with_active_original_count)
+
+        def _fmt(n: int) -> str:
+            return f"{n:,}".replace(",", " ")
+
+        report_text = (
+            f"Wykonałem zapytanie łączące bieżącą bazę {db_module.DB_PATH.name} ({_fmt(active_count)} aktywnych plików) "
+            f"z historią/kopią sprzed usuwania ({_fmt(pre_delete_total)} plików): "
+            f"Liczba usuniętych duplikatów: {_fmt(deleted_count)} | "
+            f"Liczba usuniętych duplikatów, które mają w bieżącej bazie zachowany aktywny Oryginał o tym samym file_hash: "
+            f"{_fmt(with_active_original_count)} z {_fmt(deleted_count)} ({pct:.1f}%)."
+        )
+        return {
+            "active_count": active_count,
+            "pre_delete_total": pre_delete_total,
+            "snapshot_name": snapshot_name,
+            "deleted_count": deleted_count,
+            "with_active_copy_count": with_active_copy_count,
+            "with_active_original_count": with_active_original_count,
+            "missing_orig_count": missing_orig_count,
+            "pct": pct,
+            "report_text": report_text,
         }

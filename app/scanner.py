@@ -616,6 +616,12 @@ class FileScannerService:
         parts = [p.lower() for p in Path(rel_path).parts if p not in ("", ".", "/", "\\")]
         return bool(parts and parts[0] in ("daf_backup", "backup"))
 
+    @staticmethod
+    def is_in_excluded_album_export_folder(rel_path: str) -> bool:
+        """Excludes physical album export folders (daf_albums/) from indexing so exported copies never look like duplicates/backups."""
+        parts = [p.lower() for p in Path(rel_path).parts if p not in ("", ".", "/", "\\")]
+        return bool(parts and parts[0] == "daf_albums")
+
     @classmethod
     def process_file(cls, path: Path, volume: WindowsVolume, rel_override: Optional[str] = None) -> Optional[MediaItem]:
         ext = path.suffix.lower()
@@ -640,6 +646,9 @@ class FileScannerService:
                 rel_path = path.resolve().relative_to(drive_root.resolve()).as_posix()
             except ValueError:
                 rel_path = path.name
+
+        if cls.is_in_excluded_album_export_folder(rel_path):
+            return None
 
         media_id = str(uuid.uuid4())
         file_hash = FastHasher.hash_image_full(path) if is_img else FastHasher.hash_video_partial(path, stat.st_size)

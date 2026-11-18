@@ -169,6 +169,32 @@ def _build_deleted_dup_history_map(db: Session, items: List[MediaItem], q: Optio
     return counts_by_hash, dict(matches_by_hash)
 
 
+def _anomaly_type_clause(anomaly_type: Optional[str]):
+    at = (anomaly_type or "all").strip().lower()
+    if at == "folder":
+        return MediaItem.date_anomaly_reason.ilike("%folder%")
+    if at == "filename":
+        return MediaItem.date_anomaly_reason.ilike("%nazwa pliku%")
+    if at == "copy_ctime":
+        return or_(
+            MediaItem.date_anomaly_reason.ilike("%zmodyfikowane przy kopiowaniu%"),
+            MediaItem.date_anomaly_reason.ilike("%mtime%"),
+        )
+    if at == "exif":
+        return MediaItem.date_anomaly_reason.ilike("%EXIF%")
+    if at == "other":
+        return or_(
+            MediaItem.date_anomaly_reason.is_(None),
+            and_(
+                ~MediaItem.date_anomaly_reason.ilike("%folder%"),
+                ~MediaItem.date_anomaly_reason.ilike("%nazwa pliku%"),
+                ~MediaItem.date_anomaly_reason.ilike("%zmodyfikowane przy kopiowaniu%"),
+                ~MediaItem.date_anomaly_reason.ilike("%EXIF%"),
+            ),
+        )
+    return None
+
+
 def apply_media_filters(
     stmt,
     db: Session,
@@ -191,25 +217,92 @@ def apply_media_filters(
     quality_defect: Optional[str] = None,
     redundant_clusters_only: bool = False,
     backups_to_move_only: bool = False,
+    backup_filter: str = "none",
+    backup_types: Optional[List[str]] = None,
+    backup_mode: str = "hide",
+    anomaly_type: str = "all",
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
     else:
         stmt = stmt.where(MediaItem.is_trashed == False)
 
-    # Exclude backup copies from media browsing/displaying (Req 2: daf_backup is a backup vault, not a media collection)
-    stmt = stmt.where(MediaItem.is_backup_copy == False)
+    # Backup visibility filtering (default hides ALL backup types across gallery & album views)
+    eff_bkp_filter = (backup_filter or "none").strip()
+    eff_bkp_types = [t.strip() for t in (backup_types or []) if t and t.strip()]
+    eff_bkp_mode = (backup_mode or "hide").strip()
+
+    if eff_bkp_filter == "all_with_backups":
+        eff_bkp_mode = "include"
+        eff_bkp_types = ["daf_backup", "green", "orange"]
+    elif eff_bkp_filter == "only_backups":
+        eff_bkp_mode = "only"
+        eff_bkp_types = ["daf_backup", "green", "orange"]
+    elif eff_bkp_filter == "only_daf_backup":
+        eff_bkp_mode = "only"
+        eff_bkp_types = ["daf_backup"]
+    elif eff_bkp_filter == "only_green":
+        eff_bkp_mode = "only"
+        eff_bkp_types = ["green"]
+    elif eff_bkp_filter == "only_orange":
+        eff_bkp_mode = "only"
+        eff_bkp_types = ["orange"]
+    elif eff_bkp_types and eff_bkp_mode == "hide":
+        eff_bkp_mode = "include"
+
+    type_clauses = []
+    if "daf_backup" in eff_bkp_types:
+        type_clauses.append(MediaItem.is_backup_copy == True)
+    if "green" in eff_bkp_types:
+        type_clauses.append(and_(MediaItem.is_backup_copy == False, MediaItem.duplicate_role == "backup_green"))
+    if "orange" in eff_bkp_types:
+        type_clauses.append(and_(MediaItem.is_backup_copy == False, MediaItem.duplicate_role == "backup_orange"))
+
+    is_not_any_backup = and_(
+        MediaItem.is_backup_copy == False,
+        MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+    )
+
+    if eff_bkp_mode == "only" and type_clauses:
+        stmt = stmt.where(or_(*type_clauses))
+    elif eff_bkp_mode == "only":
+        stmt = stmt.where(
+            or_(MediaItem.is_backup_copy == True, MediaItem.duplicate_role.in_(["backup_green", "backup_orange"]))
+        )
+    elif eff_bkp_mode == "include" and type_clauses:
+        stmt = stmt.where(or_(is_not_any_backup, *type_clauses))
+    elif duplicates_only or redundant_clusters_only or backups_to_move_only:
+        stmt = stmt.where(MediaItem.is_backup_copy == False)
+    else:
+        stmt = stmt.where(is_not_any_backup)
 
     if media_type in ("image", "video"):
         stmt = stmt.where(MediaItem.media_type == media_type)
     if volume_id:
         stmt = stmt.where(MediaItem.volume_id == volume_id)
     if folder_prefix and folder_prefix.strip():
-        stmt = stmt.where(MediaItem.relative_path.ilike(f"{folder_prefix.strip()}%"))
+        fp_clean = folder_prefix.strip()
+        stmt = stmt.where(
+            or_(
+                MediaItem.relative_path.ilike(f"{fp_clean}%"),
+                MediaItem.original_relative_path.ilike(f"%/{fp_clean}%"),
+                MediaItem.original_relative_path.ilike(f"{fp_clean}%"),
+            )
+        )
     if group_id:
         svc = StorageAutomationService(db)
         subtree_ids = svc.get_group_subtree_ids(group_id)
-        stmt = stmt.where(MediaItem.group_id.in_(subtree_ids))
+        if eff_bkp_mode in ("include", "only") and type_clauses:
+            album_hashes_subq = select(MediaItem.file_hash).where(
+                MediaItem.group_id.in_(subtree_ids),
+                MediaItem.is_trashed == False,
+            )
+            if eff_bkp_mode == "only":
+                stmt = stmt.where(MediaItem.file_hash.in_(album_hashes_subq))
+            else:
+                stmt = stmt.where(or_(MediaItem.group_id.in_(subtree_ids), MediaItem.file_hash.in_(album_hashes_subq)))
+        else:
+            stmt = stmt.where(MediaItem.group_id.in_(subtree_ids))
     if ungrouped_only:
         stmt = stmt.where(MediaItem.group_id.is_(None))
     if quality_defect and quality_defect.strip():
@@ -235,6 +328,9 @@ def apply_media_filters(
         stmt = stmt.where(extract("year", MediaItem.effective_date) == year)
     if anomaly_only:
         stmt = stmt.where(MediaItem.has_date_anomaly == True)
+        at_clause = _anomaly_type_clause(anomaly_type)
+        if at_clause is not None:
+            stmt = stmt.where(at_clause)
     if blurry_only:
         stmt = stmt.where(or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True))
     if duplicates_only:
@@ -277,6 +373,7 @@ def apply_media_filters(
             or_(
                 MediaItem.file_name.ilike(f"%{clean_q}%"),
                 MediaItem.relative_path.ilike(f"%{clean_q}%"),
+                MediaItem.original_relative_path.ilike(f"%{clean_q}%"),
                 MediaTag.tag.ilike(f"%{clean_q}%"),
                 MediaItem.file_hash.in_(del_hist_hashes),
             )
@@ -554,6 +651,10 @@ def build_search_context(request: Request, db: Session) -> dict:
     unvectored_only = to_bool(qp.get("unvectored_only"))
     unanalyzed_quality_only = to_bool(qp.get("unanalyzed_quality_only"))
     quality_defect = qp.get("quality_defect")
+    backup_filter = qp.get("backup_filter", "none")
+    backup_types = qp.getlist("backup_types") if hasattr(qp, "getlist") else []
+    backup_mode = qp.get("backup_mode", "hide")
+    anomaly_type = qp.get("anomaly_type", "all")
     sort_by = qp.get("sort_by", "date_desc")
     view_mode = qp.get("view_mode", "grid")
     page_int = max(1, to_int(qp.get("page")) or 1)
@@ -565,6 +666,8 @@ def build_search_context(request: Request, db: Session) -> dict:
         anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only,
         unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect,
         redundant_clusters_only=redundant_clusters_only, backups_to_move_only=backups_to_move_only,
+        backup_filter=backup_filter, backup_types=backup_types, backup_mode=backup_mode,
+        anomaly_type=anomaly_type,
     )
     joins_tags = bool((q and q.strip()) or (tag and tag.strip()) or (quality_defect and quality_defect.strip()))
     if joins_tags:
@@ -641,16 +744,19 @@ def build_search_context(request: Request, db: Session) -> dict:
 
     subfolders = []
     if vol_id_int and not trashed_only:
-        paths = db.scalars(
-            select(MediaItem.relative_path).where(
+        paths = db.execute(
+            select(MediaItem.relative_path, MediaItem.original_relative_path).where(
                 MediaItem.volume_id == vol_id_int,
                 MediaItem.is_trashed == False,
                 MediaItem.is_backup_copy == False,
             )
         ).all()
         folder_counts = defaultdict(int)
-        for p in paths:
-            parent_str = Path(p).parent.as_posix()
+        for p, orig_p in paths:
+            eff_p = p
+            if orig_p and "/" in orig_p:
+                eff_p = orig_p.split("/", 1)[1]
+            parent_str = Path(eff_p).parent.as_posix()
             if parent_str != ".":
                 top_part = parent_str.split("/")[0]
                 if top_part.lower() in ("daf_backup", "backup"):
@@ -659,6 +765,23 @@ def build_search_context(request: Request, db: Session) -> dict:
             else:
                 folder_counts["."] += 1
         subfolders = sorted(folder_counts.items(), key=lambda x: x[1], reverse=True)[:25]
+
+    anomaly_breakdown = {}
+    if anomaly_only:
+        anom_base = and_(
+            MediaItem.is_trashed == False,
+            MediaItem.has_date_anomaly == True,
+            MediaItem.is_backup_copy == False,
+            MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+        )
+        anomaly_breakdown = {
+            "all": db.scalar(select(func.count(MediaItem.id)).where(anom_base)) or 0,
+            "folder": db.scalar(select(func.count(MediaItem.id)).where(anom_base, _anomaly_type_clause("folder"))) or 0,
+            "filename": db.scalar(select(func.count(MediaItem.id)).where(anom_base, _anomaly_type_clause("filename"))) or 0,
+            "copy_ctime": db.scalar(select(func.count(MediaItem.id)).where(anom_base, _anomaly_type_clause("copy_ctime"))) or 0,
+            "exif": db.scalar(select(func.count(MediaItem.id)).where(anom_base, _anomaly_type_clause("exif"))) or 0,
+            "other": db.scalar(select(func.count(MediaItem.id)).where(anom_base, _anomaly_type_clause("other"))) or 0,
+        }
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
     deleted_dup_counts_by_hash, deleted_dup_matches_by_hash = _build_deleted_dup_history_map(db, items, q)
@@ -687,7 +810,12 @@ def build_search_context(request: Request, db: Session) -> dict:
         "duplicates_only": duplicates_only,
         "redundant_clusters_only": redundant_clusters_only,
         "backups_to_move_only": backups_to_move_only,
+        "backup_filter": backup_filter,
+        "backup_types": list(backup_types or []),
+        "backup_mode": backup_mode,
         "anomaly_only": anomaly_only,
+        "anomaly_type": anomaly_type,
+        "anomaly_breakdown": anomaly_breakdown,
         "unbacked_only": unbacked_only,
         "untagged_only": untagged_only,
         "unvectored_only": unvectored_only,

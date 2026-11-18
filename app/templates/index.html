@@ -21,6 +21,8 @@
             <input type="hidden" name="tag" value="">
             <input type="hidden" name="quality_defect" value="">
             <input type="hidden" name="year" value="">
+            <input type="hidden" name="anomaly_type" value="all">
+            <input type="hidden" name="backup_filter" value="none">
             <input type="hidden" name="page" value="1">
             <input type="checkbox" name="trashed_only" value="true" class="hidden">
             <input type="checkbox" name="anomaly_only" value="true" class="hidden">
@@ -37,7 +39,34 @@
             <div class="flex items-center space-x-1">
                 <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
                        hx-get="/semantic/search" hx-target="#media-grid" hx-trigger="keyup changed delay:250ms" hx-include="#filter-form"
-                       class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-64 focus:outline-none focus:border-indigo-500">
+                       class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-60 focus:outline-none focus:border-indigo-500">
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1.5 bg-slate-900/90 border border-borderBg rounded-lg px-2 py-1 text-[11px]"
+                 title="Domyślnie wszystkie backupy są ukryte (także w albumach). Zaznacz rodzaje backupów, aby je wyświetlić.">
+                <select name="backup_mode" id="filter-backup-mode" class="bg-slate-950 border border-borderBg rounded px-1.5 py-0.5 text-teal-300 font-medium">
+                    <option value="hide">🛡️ Backupy: Ukryte</option>
+                    <option value="include">🛡️ Pokaż + backupy</option>
+                    <option value="only">🛡️ Tylko backupy</option>
+                </select>
+                <label class="flex items-center space-x-1 cursor-pointer text-slate-300">
+                    <input type="checkbox" name="backup_types" value="daf_backup"
+                           onchange="const m=document.getElementById('filter-backup-mode'); if(this.checked && m && m.value==='hide') m.value='include';"
+                           class="rounded bg-slate-950 border-borderBg text-emerald-500">
+                    <span>daf_backup/</span>
+                </label>
+                <label class="flex items-center space-x-1 cursor-pointer text-emerald-300">
+                    <input type="checkbox" name="backup_types" value="green"
+                           onchange="const m=document.getElementById('filter-backup-mode'); if(this.checked && m && m.value==='hide') m.value='include';"
+                           class="rounded bg-slate-950 border-borderBg text-emerald-500">
+                    <span>Zielone</span>
+                </label>
+                <label class="flex items-center space-x-1 cursor-pointer text-orange-300">
+                    <input type="checkbox" name="backup_types" value="orange"
+                           onchange="const m=document.getElementById('filter-backup-mode'); if(this.checked && m && m.value==='hide') m.value='include';"
+                           class="rounded bg-slate-950 border-borderBg text-orange-500">
+                    <span>Pomarańczowe</span>
+                </label>
             </div>
 
             <select name="media_type" class="bg-slate-900 border border-borderBg rounded-lg px-2 py-1.5">
@@ -105,6 +134,18 @@
                 🚚 Przenieś pliki
             </button>
             <button type="button"
+                    hx-post="/actions/organize-originals"
+                    hx-confirm="Uporządkować wszystkie nieprzypisane do albumów Oryginały (bez plików będących już w daf_oryginal/ na jakimkolwiek dysku) do kartoteki daf_oryginal/RRRR/MM/DD/ na ich macierzystym dysku? Oryginalne ścieżki z nazwą dysku pozostaną zachowane w bazie do wyszukiwania."
+                    hx-target="#global-notification"
+                    class="bg-teal-800 hover:bg-teal-700 border border-teal-600/60 text-white px-3 py-1.5 rounded-lg font-medium transition">
+                🗂️ Uporządkuj oryginały
+            </button>
+            <button type="button"
+                    onclick="document.getElementById('export-album-modal').classList.remove('hidden')"
+                    class="bg-sky-800 hover:bg-sky-700 border border-sky-600/60 text-white px-3 py-1.5 rounded-lg font-medium transition">
+                📤 Eksportuj album fizycznie
+            </button>
+            <button type="button"
                     hx-post="/actions/export-json-disk"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
                     hx-target="#global-notification"
@@ -122,7 +163,7 @@
             <button type="button"
                     hx-post="/actions/move-to-trash"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-confirm="Czy na pewno przenieść wybrane zdjęcia do lokalnego katalogu kosza (data/kosz)?"
+                    hx-confirm="Oznaczyć wybrane zdjęcia atrybutem KOSZ w bazie? Fizyczne pliki na dyskach NIE zostaną ruszone ani przeniesione."
                     hx-target="#global-notification"
                     class="bg-rose-900/80 hover:bg-rose-800 border border-rose-700 text-rose-200 px-3 py-1.5 rounded-lg transition">
                 🗑️ Do Kosza
@@ -316,6 +357,51 @@
             <div class="flex justify-end space-x-2 pt-2">
                 <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
                 <button type="submit" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg font-semibold text-white">🚚 Przenieś pliki</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Export Physical Album Modal (daf_albums/<NazwaAlbumu>/) -->
+<div id="export-album-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
+        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+            <h3 class="font-bold text-sm text-sky-400">📤 Eksportuj album fizycznie (<code>daf_albums/</code>)</h3>
+            <button type="button" onclick="document.getElementById('export-album-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+        </div>
+        <form hx-post="/actions/export-physical-album"
+              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              onsubmit="document.getElementById('export-album-modal').classList.add('hidden');"
+              class="space-y-4">
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">1. Wybierz album (opcjonalnie, lub użyje zaznaczenia/filtra):</label>
+                <select name="album_id" class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="">-- Użyj aktualnego zaznaczenia / aktywnego filtra --</option>
+                    {% for ch in flat_album_choices %}
+                    <option value="{{ ch.id }}">📁 {{ ch.full_label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">2. Nazwa katalogu w <code>daf_albums/</code> (opcjonalnie własna):</label>
+                <input type="text" name="custom_album_name" placeholder="np. DoWywołania_2026"
+                       class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+            </div>
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">3. Urządzenie docelowe (Online):</label>
+                <select name="target_volume_id" required class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
+                    {% for v in all_volumes %}
+                    <option value="{{ v.id }}">
+                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} ({{ v.last_known_drive_letter }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <p class="text-[11px] text-slate-400">Kopie zostaną zapisane w <code>daf_albums/&lt;NazwaAlbumu&gt;/</code>. Katalog <code>daf_albums/</code> jest całkowicie pomijany podczas skanowania i nigdy nie pojawia się jako kopie/duplikaty.</p>
+            <div class="flex justify-end space-x-2 pt-2">
+                <button type="button" onclick="document.getElementById('export-album-modal').classList.add('hidden')" class="px-4 py-2 bg-slate-800 rounded-lg">Anuluj</button>
+                <button type="submit" class="px-4 py-2 bg-sky-700 hover:bg-sky-600 rounded-lg font-semibold text-white">📤 Utwórz kopię fizyczną</button>
             </div>
         </form>
     </div>

@@ -44,6 +44,11 @@
             {% if unanalyzed_quality_only %}
                 <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🔍 Niezbadana jakość / ostrość</span>
             {% endif %}
+            {% if backup_mode is defined and backup_mode != 'hide' %}
+                <span class="bg-teal-950 text-teal-300 border border-teal-700 px-2 py-0.5 rounded-full">
+                    🛡️ Backupy ({{ 'Tylko backupy' if backup_mode == 'only' else 'Wraz z oryginałami' }}{% if backup_types %}: {{ backup_types|join(', ') }}{% endif %})
+                </span>
+            {% endif %}
         </div>
 
         {% if total_pages > 1 %}
@@ -98,34 +103,79 @@
 
     <!-- Pasek narzędzi Niezgodności Dat (Rozbieżności folder / plik / EXIF / kopiowanie) -->
     {% if anomaly_only %}
-    <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div>
-            <div class="font-bold text-amber-300 text-sm">⚠️ Niezgodność dat — wykryte rozbieżności (folder / nazwa pliku / EXIF / data pliku) ({{ total_matching }} szt.)</div>
-            <div class="text-slate-300 text-[11px]">Oznacza pliki z niezgodnością dat między folderem, nazwą pliku, EXIF lub datą zmodyfikowaną podczas kopiowania (ustawiono datę najbardziej prawdopodobną).</div>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-            <button type="button"
-                    hx-post="/actions/recalculate-date-anomalies"
-                    hx-target="#global-notification"
-                    class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-semibold">
-                🔄 Przelicz źródła dat
-            </button>
-            <form hx-post="/actions/change-date"
-                  hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                  hx-target="#global-notification"
-                  class="flex items-center space-x-1.5">
-                <input type="text" name="new_date" placeholder="RRRR-MM-DD GG:MM" required
-                       class="bg-slate-900 border border-borderBg rounded-lg px-2.5 py-1.5 text-white font-mono w-40">
-                <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg font-semibold">
-                    📅 Ustaw nową datę i usuń z listy
+    {% set ab = anomaly_breakdown if anomaly_breakdown is defined else {} %}
+    {% set cur_at = anomaly_type|default('all') %}
+    <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl space-y-2.5 text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+                <div class="font-bold text-amber-300 text-sm">⚠️ Niezgodność dat — wykryte rozbieżności ({{ total_matching }} szt.)</div>
+                <div class="text-slate-300 text-[11px]">
+                    {% if cur_at == 'folder' %}
+                        <strong>Przyczyna:</strong> Rok/miesiąc z nazwy folderu nadrzędnego nie zgadza się z datą pliku lub datą zaszytą w nazwie pliku.
+                    {% elif cur_at == 'filename' %}
+                        <strong>Przyczyna:</strong> Data zapisana w nazwie pliku (np. <code>IMG_20210510</code>) jest starsza lub inna niż data utworzenia/EXIF na dysku.
+                    {% elif cur_at == 'copy_ctime' %}
+                        <strong>Przyczyna (kopiowanie):</strong> System Windows nadał nową datę utworzenia (<code>ctime</code>) podczas kopiowania pliku, podczas gdy data modyfikacji (<code>mtime</code>) jest starsza.
+                    {% elif cur_at == 'exif' %}
+                        <strong>Przyczyna:</strong> Data w nagłówku EXIF/kontenerze różni się od systemu plików lub struktury katalogów.
+                    {% elif cur_at == 'other' %}
+                        <strong>Przyczyna:</strong> Inna lub ręcznie oznaczona niezgodność daty.
+                    {% else %}
+                        Oznacza pliki z niezgodnością dat między folderem, nazwą pliku, EXIF lub datą zmodyfikowaną podczas kopiowania (ustawiono datę najbardziej prawdopodobną).
+                    {% endif %}
+                </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+                <button type="button"
+                        hx-post="/actions/recalculate-date-anomalies"
+                        hx-target="#global-notification"
+                        class="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg font-semibold">
+                    🔄 Przelicz źródła dat
                 </button>
-            </form>
-            <button type="button"
-                    hx-post="/actions/clear-date-anomaly"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-target="#global-notification"
-                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold">
-                ✓ Usuń z listy niezgodności BEZ zmiany daty
+                <form hx-post="/actions/change-date"
+                      hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                      hx-target="#global-notification"
+                      class="flex items-center space-x-1.5">
+                    <input type="text" name="new_date" placeholder="RRRR-MM-DD GG:MM" required
+                           class="bg-slate-900 border border-borderBg rounded-lg px-2.5 py-1.5 text-white font-mono w-40">
+                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg font-semibold">
+                        📅 Ustaw nową datę i usuń z listy
+                    </button>
+                </form>
+                <button type="button"
+                        hx-post="/actions/clear-date-anomaly"
+                        hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                        hx-target="#global-notification"
+                        class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold">
+                    ✓ Usuń z listy niezgodności BEZ zmiany daty
+                </button>
+            </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-1.5 pt-2 border-t border-amber-800/40 text-[11px]">
+            <span class="text-amber-300 font-semibold mr-1">Filtr przyczyny niezgodności:</span>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'all'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'all' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-slate-300 border-borderBg hover:bg-slate-800{% endif %}">
+                Wszystkie ({{ ab.get('all', total_matching) }})
+            </button>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'folder'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'folder' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-amber-200 border-borderBg hover:bg-slate-800{% endif %}">
+                📂 Z nazwą folderu ({{ ab.get('folder', 0) }})
+            </button>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'filename'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'filename' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-sky-200 border-borderBg hover:bg-slate-800{% endif %}">
+                🏷️ Data pliku vs nazwa ({{ ab.get('filename', 0) }})
+            </button>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'copy_ctime'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'copy_ctime' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-orange-200 border-borderBg hover:bg-slate-800{% endif %}">
+                📋 Ślad kopiowania (ctime &gt; mtime) ({{ ab.get('copy_ctime', 0) }})
+            </button>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'exif'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'exif' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-purple-200 border-borderBg hover:bg-slate-800{% endif %}">
+                📷 EXIF ({{ ab.get('exif', 0) }})
+            </button>
+            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'other'})"
+                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'other' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-slate-300 border-borderBg hover:bg-slate-800{% endif %}">
+                ❓ Inne ({{ ab.get('other', 0) }})
             </button>
         </div>
     </div>
@@ -168,8 +218,8 @@
     {% if trashed_only %}
     <div class="bg-rose-950/40 border border-rose-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div>
-            <div class="font-bold text-rose-300 text-sm">🗑️ Widok Kosza (data/kosz)</div>
-            <div class="text-slate-400 text-[11px]">Każdy plik pamięta swój pierwotny dysk, ścieżkę macierzystą oraz album.</div>
+            <div class="font-bold text-rose-300 text-sm">🗑️ Widok Kosza (atrybut KOSZ w bazie — pliki fizyczne nietknięte)</div>
+            <div class="text-slate-400 text-[11px]">Pliki oznaczone jako KOSZ pozostają fizycznie na swoim nośniku dopóki nie klikniesz „Opróżnij Kosz”.</div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
             <button type="button"
@@ -220,6 +270,12 @@
             </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    hx-post="/actions/verify-deleted-duplicates"
+                    hx-target="#global-notification"
+                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
+                ✅ Weryfikuj usunięte duplikaty (100% Oryginałów)
+            </button>
             {% if backups_to_move_only %}
             <button type="button" onclick="openBackupModal()"
                     class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
@@ -281,7 +337,7 @@
                     </button>
                 </form>
                 <form hx-post="/actions/move-to-trash"
-                      hx-confirm="Czy na pewno przenieść cały album '{{ active_group.name }}' WRAZ ZE ZDJĘCIAMI do katalogu data/kosz?"
+                      hx-confirm="Czy na pewno oznaczyć cały album '{{ active_group.name }}' atrybutem KOSZ w bazie? Fizyczne pliki na dyskach nie zostaną ruszone."
                       hx-target="#global-notification">
                     <input type="hidden" name="trash_group_id" value="{{ active_group.id }}">
                     <button type="submit" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-medium">
@@ -372,6 +428,31 @@
                 </select>
                 <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded font-medium">Przenieś na dysk</button>
             </form>
+
+            <!-- Eksport fizyczny albumu do daf_albums/<NazwaAlbumu>/ (bez indeksowania w bazie) -->
+            <form hx-post="/actions/export-physical-album" hx-target="#global-notification" class="flex items-center space-x-1">
+                <input type="hidden" name="album_id" value="{{ active_group.id }}">
+                <select name="target_volume_id" class="bg-slate-900 border border-sky-700/70 rounded px-2 py-1">
+                    {% for v in all_volumes %}
+                    <option value="{{ v.id }}">{{ v.volume_label }} ({{ v.last_known_drive_letter }})</option>
+                    {% endfor %}
+                </select>
+                <button type="submit" class="bg-sky-700 hover:bg-sky-600 text-white px-2.5 py-1 rounded font-semibold">📤 Eksportuj fizycznie (daf_albums/)</button>
+            </form>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-1.5 pt-2 border-t border-indigo-800/40 text-[11px]">
+            <span class="text-slate-400">Widoczność backupów w tym albumie:</span>
+            <button type="button" onclick="applySidebarFilter({group_id: '{{ active_group.id }}', backup_filter: 'none', backup_mode: 'hide'})"
+                    class="px-2 py-0.5 rounded border bg-slate-900 hover:bg-slate-800 border-borderBg text-slate-300">Ukryj backupy (domyślnie)</button>
+            <button type="button" onclick="applySidebarFilter({group_id: '{{ active_group.id }}', backup_filter: 'only_daf_backup'})"
+                    class="px-2 py-0.5 rounded border bg-slate-900 hover:bg-slate-800 border-teal-700/70 text-teal-300">Tylko w daf_backup/</button>
+            <button type="button" onclick="applySidebarFilter({group_id: '{{ active_group.id }}', backup_filter: 'only_green'})"
+                    class="px-2 py-0.5 rounded border bg-slate-900 hover:bg-slate-800 border-emerald-700/70 text-emerald-300">Tylko zielone</button>
+            <button type="button" onclick="applySidebarFilter({group_id: '{{ active_group.id }}', backup_filter: 'only_orange'})"
+                    class="px-2 py-0.5 rounded border bg-slate-900 hover:bg-slate-800 border-orange-700/70 text-orange-300">Tylko pomarańczowe</button>
+            <button type="button" onclick="applySidebarFilter({group_id: '{{ active_group.id }}', backup_filter: 'all_with_backups'})"
+                    class="px-2 py-0.5 rounded border bg-slate-900 hover:bg-slate-800 border-indigo-600/70 text-indigo-200">Pokaż wszystko (+ backupy)</button>
         </div>
     </div>
     {% endif %}
@@ -439,6 +520,8 @@
                 <tr class="gallery-media-item hover:bg-slate-800/50 transition"
                     data-id="{{ item.id }}"
                     data-raw="/media/{{ item.id }}/raw"
+                    data-thumb="/media/thumbnails/{{ item.thumbnail_relative_path }}"
+                    data-online="{{ 'true' if (item.volume and item.volume.is_online) else 'false' }}"
                     data-type="{{ item.media_type }}"
                     data-rotation="{{ item.rotation_angle or 0 }}"
                     data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
@@ -462,6 +545,11 @@
                     </td>
                     <td class="p-2 font-mono text-[11px] text-slate-300 truncate max-w-[200px]" title="{{ item.relative_path }}">
                         <div>{{ item.relative_path }}</div>
+                        {% if item.original_relative_path %}
+                        <div class="text-[9px] text-amber-300 font-mono truncate" title="Pierwotna ścieżka: {{ item.original_relative_path }}">
+                            📁 Pierwotnie: {{ item.original_relative_path }}
+                        </div>
+                        {% endif %}
                         {% if deleted_dup_matches_by_hash is defined and deleted_dup_matches_by_hash.get(item.file_hash) %}
                         <div class="text-[9px] text-sky-300 font-mono truncate cursor-pointer hover:underline"
                              hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container"
@@ -560,6 +648,8 @@
         <div class="gallery-media-item group relative aspect-square bg-slate-900 rounded-lg border border-borderBg overflow-hidden hover:border-indigo-500"
              data-id="{{ item.id }}"
              data-raw="/media/{{ item.id }}/raw"
+             data-thumb="/media/thumbnails/{{ item.thumbnail_relative_path }}"
+             data-online="{{ 'true' if (item.volume and item.volume.is_online) else 'false' }}"
              data-type="{{ item.media_type }}"
              data-rotation="{{ item.rotation_angle or 0 }}"
              data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
@@ -623,6 +713,8 @@
                 <div class="gallery-media-item group relative bg-cardBg rounded-xl border {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}border-emerald-600/80{% elif item.duplicate_role == 'backup_orange' %}border-orange-500/80{% elif duplicates_only and (item.duplicate_role == 'original' or item.is_primary_duplicate) %}border-sky-600/80{% elif item.duplicate_role == 'duplicate' or not item.is_primary_duplicate %}border-rose-700/80{% else %}border-borderBg{% endif %} overflow-hidden shadow hover:border-indigo-500/70 flex flex-col"
                      data-id="{{ item.id }}"
                      data-raw="/media/{{ item.id }}/raw"
+                     data-thumb="/media/thumbnails/{{ item.thumbnail_relative_path }}"
+                     data-online="{{ 'true' if (item.volume and item.volume.is_online) else 'false' }}"
                      data-type="{{ item.media_type }}"
                      data-rotation="{{ item.rotation_angle or 0 }}"
                      data-title="{{ item.file_name }} ({{ item.width or '?' }}x{{ item.height or '?' }}, {{ '%.2f'|format(item.file_size_bytes / (1024*1024)) }} MB)">
@@ -747,6 +839,11 @@
                             <span class="truncate max-w-[110px]" title="{{ item.relative_path }}">{{ item.relative_path }}</span>
                             <span>{{ "%.1f"|format(item.file_size_bytes / (1024*1024)) }} MB</span>
                         </div>
+                        {% if item.original_relative_path %}
+                        <div class="text-[9px] text-amber-300/90 font-mono truncate" title="Pierwotnie: {{ item.original_relative_path }}">
+                            📁 Pierw.: {{ item.original_relative_path }}
+                        </div>
+                        {% endif %}
 
                         {% if deleted_dup_matches_by_hash is defined and deleted_dup_matches_by_hash.get(item.file_hash) %}
                         <div class="text-[9px] text-sky-300 font-mono truncate cursor-pointer hover:underline"

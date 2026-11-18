@@ -51,6 +51,7 @@ class MediaItem(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     volume_id: Mapped[int] = mapped_column(Integer, ForeignKey("windows_volumes.id", ondelete="RESTRICT"), nullable=False, index=True)
     relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    original_relative_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True, index=True)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     media_type: Mapped[str] = mapped_column(String(16), nullable=False)
