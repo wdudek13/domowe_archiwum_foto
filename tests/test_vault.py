@@ -5250,6 +5250,145 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(r_vol_on_sel.status_code, 200)
                 self.assertIn("Wszystkie urządzenia", r_vol_on_sel.text)
 
+    def test_strict_target_writes_only_protection_and_gui_polish(self):
+        drive_c = self.root / "DriveC_Protected"
+        drive_c.mkdir(parents=True, exist_ok=True)
+        with self.TestingSessionLocal() as db:
+            vol_bkp1 = WindowsVolume(
+                volume_serial_number="BK01-1111",
+                volume_label="Backup-1",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=80 * 1024**3,
+            )
+            vol_foto1 = WindowsVolume(
+                volume_serial_number="FT01-2222",
+                volume_label="Foto-1",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_old3 = WindowsVolume(
+                volume_serial_number="OD03-3333",
+                volume_label="OldDisk-3",
+                last_known_drive_letter=str(drive_c),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            db.add_all([vol_bkp1, vol_foto1, vol_old3])
+            db.commit()
+            for v in (vol_bkp1, vol_foto1, vol_old3):
+                db.refresh(v)
+
+            vsn_all3 = {
+                "BK01-1111": (str(self.drive_a), "Backup-1"),
+                "FT01-2222": (str(self.drive_b), "Foto-1"),
+                "OD03-3333": (str(drive_c), "OldDisk-3"),
+            }
+
+            # 1) Unbacked original on OldDisk-3 -> should get new backup on Backup-1/Foto-1 (never OldDisk-3)
+            p_old_unb = create_synthetic_jpeg(drive_c / "old_unbacked.jpg", color=(10, 20, 30))
+            it_old_unb = FileScannerService.process_file(p_old_unb, vol_old3)
+
+            # 2) Orange same-device duplicate pair on OldDisk-3 -> new cross backup on Backup-1/Foto-1, NO 'Ważne' on OldDisk-3
+            p_old_imp1 = create_synthetic_jpeg(drive_c / "old_imp.jpg", color=(30, 40, 50))
+            p_old_imp2 = drive_c / "old_imp_copy.jpg"
+            p_old_imp2.write_bytes(p_old_imp1.read_bytes())
+            it_old_imp1 = FileScannerService.process_file(p_old_imp1, vol_old3)
+            it_old_imp2 = FileScannerService.process_file(p_old_imp2, vol_old3)
+
+            # 3) Orange same-device duplicate pair on Foto-1 (SELECTED!) -> 'Ważne - Foto-1' SHOULD be created & assigned
+            p_foto_imp1 = create_synthetic_jpeg(self.drive_b / "foto_imp.jpg", color=(60, 70, 80))
+            p_foto_imp2 = self.drive_b / "foto_imp_copy.jpg"
+            p_foto_imp2.write_bytes(p_foto_imp1.read_bytes())
+            it_foto_imp1 = FileScannerService.process_file(p_foto_imp1, vol_foto1)
+            it_foto_imp2 = FileScannerService.process_file(p_foto_imp2, vol_foto1)
+
+            # 4) Green outside backup on OldDisk-3 for an original on Foto-1 -> must NOT be moved locally on OldDisk-3
+            p_foto_g_orig = create_synthetic_jpeg(self.drive_b / "foto_with_old_green.jpg", color=(90, 100, 110))
+            p_old_g_bkp = drive_c / "old_green_outside.jpg"
+            p_old_g_bkp.write_bytes(p_foto_g_orig.read_bytes())
+            it_foto_g_orig = FileScannerService.process_file(p_foto_g_orig, vol_foto1)
+            it_old_g_bkp = FileScannerService.process_file(p_old_g_bkp, vol_old3)
+
+            # 5) Green outside backup on Backup-1 (SELECTED!) for an original on Foto-1 -> SHOULD move into Backup-1/daf_backup/
+            p_foto_b1_orig = create_synthetic_jpeg(self.drive_b / "foto_with_bkp1_green.jpg", color=(120, 130, 140))
+            p_bkp1_g_bkp = self.drive_a / "bkp1_green_outside.jpg"
+            p_bkp1_g_bkp.write_bytes(p_foto_b1_orig.read_bytes())
+            it_foto_b1_orig = FileScannerService.process_file(p_foto_b1_orig, vol_foto1)
+            it_bkp1_g_bkp = FileScannerService.process_file(p_bkp1_g_bkp, vol_bkp1)
+
+            db.add_all([
+                it_old_unb, it_old_imp1, it_old_imp2,
+                it_foto_imp1, it_foto_imp2,
+                it_foto_g_orig, it_old_g_bkp,
+                it_foto_b1_orig, it_bkp1_g_bkp,
+            ])
+            db.commit()
+
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_all3):
+                # Check Backup panel UI shows the new strict protection mode toggle & counts
+                r_panel = self.client.post(
+                    "/actions/backup-panel",
+                    data={
+                        "target_vols_submitted": "true",
+                        "target_volume_ids": [str(vol_bkp1.id), str(vol_foto1.id)],
+                        "minimize_submitted": "true",
+                        "minimize_transfers": "true",
+                        "strict_target_submitted": "true",
+                        "strict_target_writes_only": "true",
+                    },
+                )
+                self.assertEqual(r_panel.status_code, 200)
+                self.assertIn("strict_target_writes_only", r_panel.text)
+                self.assertIn("Tryb ochrony dysków aktywny", r_panel.text)
+
+                # Execute backup via HTTP POST with only Backup-1 & Foto-1 allowed for writes
+                r_exec = self.client.post(
+                    "/actions/execute-backup",
+                    data={
+                        "target_vols_submitted": "true",
+                        "target_volume_ids": [str(vol_bkp1.id), str(vol_foto1.id)],
+                        "minimize_submitted": "true",
+                        "minimize_transfers": "true",
+                        "strict_target_submitted": "true",
+                        "strict_target_writes_only": "true",
+                    },
+                )
+                self.assertEqual(r_exec.status_code, 200)
+                self.assertIn("Tryb ochrony: zapisy wyłącznie na wybranych dyskach docelowych", r_exec.text)
+
+                db.expire_all()
+                # OldDisk-3 filesystem MUST have zero daf_backup/ directory created and untouched source files
+                self.assertFalse((drive_c / "daf_backup").exists())
+                self.assertTrue((drive_c / "old_unbacked.jpg").exists())
+                self.assertTrue((drive_c / "old_imp_copy.jpg").exists())
+                self.assertTrue((drive_c / "old_green_outside.jpg").exists())
+                # OldDisk-3 item must NOT be assigned to 'Ważne - OldDisk-3'
+                self.assertIsNone(db.get(MediaItem, it_old_imp1.id).group_id)
+
+                # Selected targets MUST have received new backups, local relocation on Backup-1, and 'Ważne - Foto-1'
+                it_foto_imp1_db = db.get(MediaItem, it_foto_imp1.id)
+                self.assertIsNotNone(it_foto_imp1_db.group_id)
+                self.assertFalse((self.drive_a / "bkp1_green_outside.jpg").exists())
+                self.assertTrue(db.get(MediaItem, it_bkp1_g_bkp.id).is_backup_copy)
+
+                # All new daf_backup files written by this run must exist only on Backup-1 or Foto-1
+                new_bkp_vols = set(
+                    db.scalars(select(MediaItem.volume_id).where(MediaItem.is_backup_copy == True)).all()
+                )
+                self.assertTrue(new_bkp_vols.issubset({vol_bkp1.id, vol_foto1.id}))
+
+                # GUI polish classes present across /, /media/sidebar, /media/search
+                r_home_g = self.client.get("/")
+                self.assertEqual(r_home_g.status_code, 200)
+                self.assertIn("daf-modal-card", r_home_g.text)
+                self.assertIn("daf-modal-header", r_home_g.text)
+                self.assertIn("daf-section-toggle", r_home_g.text)
+
 
 if __name__ == "__main__":
     unittest.main()

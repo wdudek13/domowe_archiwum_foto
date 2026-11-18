@@ -1448,6 +1448,7 @@ def _prepare_backup_panel_context(
     operation_mode: str = "backup_only",
     target_volume_ids: Optional[List[int]] = None,
     minimize_transfers: bool = True,
+    strict_target_writes_only: bool = False,
 ) -> dict:
     svc = StorageAutomationService(db)
     plan = svc.build_backup_and_dedup_plan(
@@ -1455,6 +1456,7 @@ def _prepare_backup_panel_context(
         selected_pair_keys=selected_pairs,
         target_volume_ids=target_volume_ids,
         minimize_transfers=minimize_transfers,
+        strict_target_writes_only=strict_target_writes_only,
     )
     all_pair_key_strs = [p["pair_key_str"] for p in plan["ordered_pairs"]]
     effective_pair_keys = (
@@ -1522,6 +1524,7 @@ def _prepare_backup_panel_context(
         "space_problems": plan["space_problems"],
         "effective_target_volume_ids": plan["effective_target_volume_ids"],
         "minimize_transfers": plan["minimize_transfers"],
+        "strict_target_writes_only": plan["strict_target_writes_only"],
         "unbacked_files": _balanced_sample_unbacked(filtered_unbacked, 300),
         "unbacked_total": filtered_unbacked_count,
         "unbacked_all_total": len(all_unbacked),
@@ -1551,6 +1554,7 @@ def _render_backup_panel_response(
     operation_mode: str = "backup_only",
     target_volume_ids: Optional[List[int]] = None,
     minimize_transfers: bool = True,
+    strict_target_writes_only: bool = False,
     execution_result: Optional[dict] = None,
     offline_report: Optional[dict] = None,
     trigger_refresh: bool = False,
@@ -1563,6 +1567,7 @@ def _render_backup_panel_response(
         operation_mode=operation_mode,
         target_volume_ids=target_volume_ids,
         minimize_transfers=minimize_transfers,
+        strict_target_writes_only=strict_target_writes_only,
     )
     ctx["execution_result"] = execution_result
     ctx["offline_report"] = offline_report
@@ -1579,6 +1584,7 @@ def _render_backup_tables_response(
     selected_pairs: Optional[List[str]] = None,
     target_volume_ids: Optional[List[int]] = None,
     minimize_transfers: bool = True,
+    strict_target_writes_only: bool = False,
 ):
     """Renders only the preview tables container for live pair-checkbox switching."""
     ctx = _prepare_backup_panel_context(
@@ -1587,6 +1593,7 @@ def _render_backup_tables_response(
         selected_pairs=selected_pairs,
         target_volume_ids=target_volume_ids,
         minimize_transfers=minimize_transfers,
+        strict_target_writes_only=strict_target_writes_only,
     )
     return render_template(request, "partials/backup_preview_tables.html", ctx)
 
@@ -1596,7 +1603,9 @@ def _parse_backup_form_controls(
     target_vols_submitted: bool,
     minimize_transfers: Optional[str],
     minimize_submitted: bool,
-) -> Tuple[Optional[List[int]], bool]:
+    strict_target_writes_only: Optional[str] = None,
+    strict_target_submitted: bool = False,
+) -> Tuple[Optional[List[int]], bool, bool]:
     parsed_targets: Optional[List[int]] = None
     if target_vols_submitted:
         parsed_targets = [int(x) for x in target_volume_ids if str(x).isdigit()]
@@ -1605,7 +1614,12 @@ def _parse_backup_form_controls(
         eff_minimize = to_bool(minimize_transfers)
     elif minimize_transfers is not None:
         eff_minimize = to_bool(minimize_transfers)
-    return parsed_targets, eff_minimize
+    eff_strict_target = False
+    if strict_target_submitted:
+        eff_strict_target = to_bool(strict_target_writes_only)
+    elif strict_target_writes_only is not None:
+        eff_strict_target = to_bool(strict_target_writes_only)
+    return parsed_targets, eff_minimize, eff_strict_target
 
 
 @router.post("/backup-panel-tables")
@@ -1618,12 +1632,15 @@ def get_backup_panel_tables(
     target_vols_submitted: bool = Form(False),
     minimize_transfers: Optional[str] = Form(None),
     minimize_submitted: bool = Form(False),
+    strict_target_writes_only: Optional[str] = Form(None),
+    strict_target_submitted: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     pref_vid = to_int(preferred_target_volume_id)
     effective_pairs = selected_pairs if pairs_submitted else (selected_pairs or None)
-    parsed_targets, eff_minimize = _parse_backup_form_controls(
-        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted
+    parsed_targets, eff_minimize, eff_strict_target = _parse_backup_form_controls(
+        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted,
+        strict_target_writes_only, strict_target_submitted,
     )
     return _render_backup_tables_response(
         request,
@@ -1632,6 +1649,7 @@ def get_backup_panel_tables(
         selected_pairs=effective_pairs,
         target_volume_ids=parsed_targets,
         minimize_transfers=eff_minimize,
+        strict_target_writes_only=eff_strict_target,
     )
 
 
@@ -1640,6 +1658,7 @@ def get_backup_panel(
     request: Request,
     target_volume_id: Optional[str] = None,
     selected_pairs: Optional[List[str]] = Query(None),
+    strict_target_writes_only: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     pref_vid = to_int(target_volume_id)
@@ -1648,6 +1667,7 @@ def get_backup_panel(
         db,
         pref_vid=pref_vid,
         selected_pairs=selected_pairs,
+        strict_target_writes_only=strict_target_writes_only,
     )
 
 
@@ -1658,13 +1678,16 @@ def recalculate_backup_panel(
     target_vols_submitted: bool = Form(False),
     minimize_transfers: Optional[str] = Form(None),
     minimize_submitted: bool = Form(False),
+    strict_target_writes_only: Optional[str] = Form(None),
+    strict_target_submitted: bool = Form(False),
     selected_pairs: List[str] = Form(default=[]),
     pairs_submitted: bool = Form(False),
     recalc_pairs: bool = Form(False),
     db: Session = Depends(get_db),
 ):
-    parsed_targets, eff_minimize = _parse_backup_form_controls(
-        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted
+    parsed_targets, eff_minimize, eff_strict_target = _parse_backup_form_controls(
+        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted,
+        strict_target_writes_only, strict_target_submitted,
     )
     effective_pairs = None if recalc_pairs else (selected_pairs if pairs_submitted else (selected_pairs or None))
     return _render_backup_panel_response(
@@ -1673,6 +1696,7 @@ def recalculate_backup_panel(
         selected_pairs=effective_pairs,
         target_volume_ids=parsed_targets,
         minimize_transfers=eff_minimize,
+        strict_target_writes_only=eff_strict_target,
     )
 
 
@@ -1688,11 +1712,14 @@ def execute_backup_action(
     target_vols_submitted: bool = Form(False),
     minimize_transfers: Optional[str] = Form(None),
     minimize_submitted: bool = Form(False),
+    strict_target_writes_only: Optional[str] = Form(None),
+    strict_target_submitted: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     pref_vid = to_int(preferred_target_volume_id)
-    parsed_targets, eff_minimize = _parse_backup_form_controls(
-        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted
+    parsed_targets, eff_minimize, eff_strict_target = _parse_backup_form_controls(
+        target_volume_ids, target_vols_submitted, minimize_transfers, minimize_submitted,
+        strict_target_writes_only, strict_target_submitted,
     )
     if new_backup_drive_path and new_backup_drive_path.strip():
         clean_p = new_backup_drive_path.strip(' \t\n\r"\'')
@@ -1726,6 +1753,7 @@ def execute_backup_action(
             "preferred_target_volume_id": pref_vid,
             "target_volume_ids": parsed_targets,
             "minimize_transfers": eff_minimize,
+            "strict_target_writes_only": eff_strict_target,
             "selected_pairs": effective_pairs,
         },
         db=db,
@@ -1737,6 +1765,7 @@ def execute_backup_action(
         selected_pair_keys=effective_pairs,
         target_volume_ids=parsed_targets,
         minimize_transfers=eff_minimize,
+        strict_target_writes_only=eff_strict_target,
     )
     if exec_result["pending_offline_pairs_count"] > 0:
         ProcessManager.update_progress(
@@ -1757,6 +1786,7 @@ def execute_backup_action(
         operation_mode="backup_only",
         target_volume_ids=parsed_targets,
         minimize_transfers=eff_minimize,
+        strict_target_writes_only=eff_strict_target,
         execution_result=exec_result,
         trigger_refresh=True,
     )

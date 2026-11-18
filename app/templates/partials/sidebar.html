@@ -23,9 +23,14 @@
     {% endfor %}
 {% endmacro %}
 
-<div class="space-y-5 text-xs">
+<div class="space-y-4 text-xs">
     <div>
-        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Zbiory Główne</div>
+        <button type="button"
+                onclick="const b=this.nextElementSibling, c=this.querySelector('[data-chev]'); b.classList.toggle('hidden'); if(c) c.textContent=b.classList.contains('hidden')?'▸':'▾';"
+                class="daf-section-toggle mb-1">
+            <span>Zbiory Główne</span>
+            <span data-chev class="text-slate-500 font-mono">▾</span>
+        </button>
         <div class="space-y-0.5">
             <button onclick="applySidebarFilter({_reset: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200">
                 <span>📷 Wszystkie multimedia</span>
@@ -178,9 +183,14 @@
     </div>
 
     <div>
-        <div class="flex items-center justify-between mb-1.5">
-            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Drzewo Albumów</span>
-            <button onclick="document.getElementById('group-modal').classList.remove('hidden')" class="text-indigo-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800">+</button>
+        <div class="flex items-center justify-between mb-1">
+            <button type="button"
+                    onclick="const b=this.parentElement.nextElementSibling, c=this.querySelector('[data-chev]'); b.classList.toggle('hidden'); if(c) c.textContent=b.classList.contains('hidden')?'▸':'▾';"
+                    class="daf-section-toggle flex-1 mr-1">
+                <span>Drzewo Albumów</span>
+                <span data-chev class="text-slate-500 font-mono">▾</span>
+            </button>
+            <button onclick="document.getElementById('group-modal').classList.remove('hidden')" class="text-indigo-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800" title="Nowy album">+</button>
         </div>
         <div class="max-h-60 overflow-y-auto pr-1 space-y-0.5">
             {% if group_tree %}
@@ -192,7 +202,12 @@
     </div>
 
     <div>
-        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Tagi AI (Kliknij aby filtrować)</div>
+        <button type="button"
+                onclick="const b=this.nextElementSibling, c=this.querySelector('[data-chev]'); b.classList.toggle('hidden'); if(c) c.textContent=b.classList.contains('hidden')?'▸':'▾';"
+                class="daf-section-toggle mb-1">
+            <span>Tagi AI (Kliknij aby filtrować)</span>
+            <span data-chev class="text-slate-500 font-mono">▾</span>
+        </button>
         <div class="flex flex-wrap gap-1 max-h-48 overflow-y-auto">
             {% for t_name, cnt in top_tags %}
             <button onclick="applySidebarFilter({_reset: true, tag: '{{ t_name }}'})"
@@ -206,7 +221,12 @@
     </div>
 
     <div>
-        <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">Nośniki / Dyski USB</div>
+        <button type="button"
+                onclick="const b=this.nextElementSibling, c=this.querySelector('[data-chev]'); b.classList.toggle('hidden'); if(c) c.textContent=b.classList.contains('hidden')?'▸':'▾';"
+                class="daf-section-toggle mb-1">
+            <span>Nośniki / Dyski USB</span>
+            <span data-chev class="text-slate-500 font-mono">▾</span>
+        </button>
         <div class="space-y-1.5">
             {% for v in volumes %}
             {% set sp = vol_space.get(v.id) if vol_space else None %}

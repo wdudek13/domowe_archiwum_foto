@@ -6,17 +6,130 @@
     <title>Domowe Archiwum Foto</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script>
         tailwind.config = {
             darkMode: 'class',
-            theme: { extend: { colors: { darkBg: '#0b0f19', cardBg: '#131b2e', borderBg: '#1f2b48' } } }
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'Segoe UI', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'ui-monospace', 'Consolas', 'monospace'],
+                    },
+                    colors: {
+                        darkBg: '#090c13',
+                        cardBg: '#111725',
+                        borderBg: '#222b3f',
+                        accent: '#7c83ff',
+                    },
+                    boxShadow: {
+                        card: '0 1px 0 0 rgba(255,255,255,0.03) inset, 0 8px 24px -12px rgba(0,0,0,0.6)',
+                        glow: '0 0 0 1px rgba(124,131,255,0.35), 0 8px 30px -8px rgba(124,131,255,0.35)',
+                    },
+                }
+            }
         }
     </script>
     <style>
+        /* ===== Base theme (visual only, no logic) ===== */
+        :root { --accent: #7c83ff; --accent-2: #b46cff; --bg: #090c13; --card: #111725; --border: #222b3f; }
+        html, body { font-feature-settings: "cv02", "cv03", "cv04", "cv11"; }
+        body {
+            background:
+                radial-gradient(1200px 600px at 10% -10%, rgba(124,131,255,0.10), transparent 60%),
+                radial-gradient(900px 500px at 110% 10%, rgba(180,108,255,0.08), transparent 60%),
+                var(--bg) !important;
+        }
         .lightbox-open { overflow: hidden; }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #0b0f19; }
-        ::-webkit-scrollbar-thumb { background: #1f2b48; border-radius: 4px; }
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #263049; border-radius: 999px; border: 2px solid var(--bg); }
+        ::-webkit-scrollbar-thumb:hover { background: #34405f; }
+        ::selection { background: rgba(124,131,255,0.35); }
+
+        /* Cards & panels: softer radius, depth, subtle glass */
+        .rounded-xl { border-radius: 0.9rem; }
+        main .bg-cardBg, main [class*="bg-cardBg/"], main [class*="bg-slate-900/90"] {
+            box-shadow: 0 1px 0 0 rgba(255,255,255,0.03) inset, 0 8px 24px -14px rgba(0,0,0,0.7);
+        }
+        [class*="backdrop-blur"] { -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%); }
+
+        /* Controls */
+        button, a, select, input, label { transition: background-color .15s, border-color .15s, color .15s, box-shadow .15s, transform .08s; }
+        button:not(:disabled):active, a[class*="rounded"]:active { transform: translateY(1px) scale(0.985); }
+        button:disabled { cursor: not-allowed; }
+        :focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 2px; border-radius: 6px; }
+        input[type="text"], input[type="number"], input[type="search"], input[type="date"], select, textarea {
+            border-radius: 0.6rem;
+        }
+        input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus {
+            border-color: var(--accent) !important;
+            box-shadow: 0 0 0 3px rgba(124,131,255,0.18);
+            outline: none;
+        }
+        input[type="checkbox"] { accent-color: var(--accent); }
+
+        /* Sticky glass toolbar inside the gallery */
+        .daf-sticky-toolbar {
+            position: sticky; top: -1rem; z-index: 30;
+            background: rgba(17,23,37,0.82) !important;
+            -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%);
+        }
+
+        /* Sidebar */
+        #sidebar-container { background: linear-gradient(180deg, rgba(17,23,37,0.85), rgba(12,16,26,0.85)); }
+        #sidebar-container button { border-radius: 0.6rem; }
+        #sidebar-container button:hover { box-shadow: inset 2px 0 0 0 var(--accent); }
+
+        /* Gallery tiles: lift on hover, nicer focus on selection */
+        .gallery-media-item { transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
+        .gallery-media-item:hover { transform: translateY(-2px); box-shadow: 0 12px 28px -12px rgba(0,0,0,0.8), 0 0 0 1px rgba(124,131,255,0.45); }
+        .gallery-media-item:has(input[name="selected_ids"]:checked) { box-shadow: 0 0 0 2px var(--accent), 0 10px 26px -12px rgba(124,131,255,0.6); }
+        .gallery-media-item img { transition: transform .35s ease; }
+
+        /* Tables */
+        main table tbody tr { transition: background-color .12s; }
+        main table tbody tr:hover { background: rgba(124,131,255,0.06); }
+        main table thead th { letter-spacing: .02em; }
+
+        /* Content swap animation */
+        @keyframes dafFadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        #media-grid > * { animation: dafFadeUp .22s ease-out; }
+        #media-grid.htmx-request, #media-grid:has(+ .htmx-request) { opacity: .55; transition: opacity .15s; }
+
+        /* Global top loading bar driven by HTMX events */
+        #daf-progress { position: fixed; top: 0; left: 0; height: 2px; width: 0; z-index: 9999;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2)); box-shadow: 0 0 10px var(--accent);
+            transition: width .3s ease, opacity .3s ease; opacity: 0; }
+        body.daf-loading #daf-progress { width: 75%; opacity: 1; transition: width 2.5s cubic-bezier(.1,.7,.2,1), opacity .1s; }
+
+        /* Notification area as a toast pill */
+        #global-notification:empty { display: none; }
+        #global-notification:not(:empty) {
+            background: rgba(17,23,37,0.92); border: 1px solid var(--border);
+            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.8); border-radius: 0.75rem; padding: .45rem .8rem;
+            animation: dafFadeUp .2s ease-out;
+        }
+
+        /* Modals (fixed overlays) get a soft entry animation */
+        @keyframes dafPop { from { opacity: 0; transform: scale(.98); } to { opacity: 1; transform: none; } }
+        .fixed.inset-0:not(.hidden):not(#lightbox) > div { animation: dafPop .16s ease-out; }
+
+        /* Header nav chips & shared modal/sidebar styling */
+        .daf-nav-btn { display: inline-flex; align-items: center; gap: .4rem; padding: .4rem .75rem; border-radius: .65rem;
+            border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: #cbd5e1; font-weight: 500; white-space: nowrap; }
+        .daf-nav-btn:hover { background: rgba(124,131,255,0.10); border-color: rgba(124,131,255,0.45); color: #fff; }
+        .daf-nav-btn .daf-dot { width: .45rem; height: .45rem; border-radius: 999px; }
+        .daf-modal-card { background: linear-gradient(180deg, rgba(19,26,42,0.98), rgba(13,18,30,0.98));
+            border: 1px solid var(--border); box-shadow: 0 24px 60px -15px rgba(0,0,0,0.85), 0 0 0 1px rgba(124,131,255,0.12); }
+        .daf-modal-header { border-bottom: 1px solid var(--border); padding-bottom: .75rem;
+            background: radial-gradient(500px 80px at 0% 0%, rgba(124,131,255,0.08), transparent); }
+        .daf-section-toggle { display: flex; align-items: center; justify-content: space-between; width: 100%;
+            font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: .06em;
+            padding: .25rem .35rem; border-radius: .45rem; }
+        .daf-section-toggle:hover { color: #e2e8f0; background: rgba(124,131,255,0.08); }
         .pure-fullscreen-mode #lightbox-header,
         .pure-fullscreen-mode #lightbox-footer,
         .pure-fullscreen-mode .lightbox-nav-btn {
@@ -40,57 +153,106 @@
     </style>
 </head>
 <body class="bg-darkBg text-slate-100 h-screen flex flex-col font-sans antialiased overflow-hidden">
-    <header class="border-b border-borderBg bg-cardBg/95 backdrop-blur z-40 px-5 py-2.5 flex items-center justify-between flex-shrink-0">
-        <div class="flex items-center space-x-3">
-            <a href="/" class="flex items-center space-x-2.5">
-                <div class="w-8 h-7 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-xs text-white shadow">DAF</div>
-                <span class="font-bold text-base tracking-wide bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Domowe Archiwum Foto</span>
-            </a>
+    <div id="daf-progress"></div>
+    <header class="relative border-b border-borderBg bg-cardBg/80 backdrop-blur z-40 px-4 lg:px-5 py-2 flex items-center gap-3 flex-shrink-0">
+        <button type="button"
+                onclick="toggleDafSidebar()"
+                title="Pokaż / ukryj panel boczny"
+                class="w-9 h-9 rounded-lg border border-borderBg bg-slate-900/60 hover:bg-slate-800 text-slate-300 flex items-center justify-center flex-shrink-0">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        </button>
+        <a href="/" class="flex items-center gap-2.5 flex-shrink-0 group">
+            <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 via-violet-500 to-fuchsia-500 flex items-center justify-center font-bold text-[11px] text-white shadow-glow group-hover:scale-105 transition">DAF</div>
+            <div class="leading-tight hidden sm:block">
+                <div class="font-semibold text-[15px] tracking-tight text-white">Domowe Archiwum Foto</div>
+                <div class="text-[10px] text-slate-400 font-medium">Zdjęcia · Wideo · Backupy · AI</div>
+            </div>
+        </a>
+
+        <div class="flex-1 flex justify-center min-w-0 px-2">
+            <div id="global-notification" class="text-xs max-w-2xl leading-snug"></div>
         </div>
-        <div id="global-notification" class="text-xs px-3 py-1 rounded max-w-2xl leading-snug"></div>
-        <div class="flex items-center space-x-2 text-xs">
-            <button type="button"
-                    onclick="openBackupModal()"
-                    class="bg-emerald-900/80 hover:bg-emerald-800 border border-emerald-600/60 px-3 py-1.5 rounded-lg text-emerald-200 font-semibold transition">
+
+        <nav class="flex items-center gap-1.5 text-xs flex-shrink-0 overflow-x-auto">
+            <button type="button" onclick="openBackupModal()" class="daf-nav-btn !text-emerald-200 !border-emerald-700/60 !bg-emerald-900/30 hover:!bg-emerald-800/50 font-semibold">
+                <span class="daf-dot bg-emerald-400"></span>
                 🛡️ Backup zdjęć/filmów
             </button>
-            <button type="button"
-                    onclick="openMoveBackupsModal()"
-                    class="bg-teal-900/80 hover:bg-teal-800 border border-teal-600/60 px-3 py-1.5 rounded-lg text-teal-200 font-medium transition">
+            <button type="button" onclick="openMoveBackupsModal()" class="daf-nav-btn">
+                <span class="daf-dot bg-teal-400"></span>
                 🚚 Przenieś backupy
             </button>
-            <button type="button"
-                    onclick="openStatusModal()"
-                    class="bg-purple-900/80 hover:bg-purple-800 border border-purple-600/60 px-3 py-1.5 rounded-lg text-purple-200 font-medium transition">
+            <button type="button" onclick="openStatusModal()" class="daf-nav-btn">
+                <span class="daf-dot bg-violet-400"></span>
                 ⚙️ Status i Log Operacji
             </button>
-            <button type="button"
-                    onclick="openGDriveModal()"
-                    class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-sky-300 font-medium transition"
+            <button type="button" onclick="openGDriveModal()" class="daf-nav-btn"
                     title="Kopie bazy danych na nośnikach USB / HDD oraz w chmurze Google Drive">
+                <span class="daf-dot bg-sky-400"></span>
                 💾 Kopia Bazy & Chmura
             </button>
-            <a href="/przewodnik"
-               target="_blank"
-               rel="noopener"
-               class="bg-slate-800 hover:bg-slate-700 border border-borderBg px-3 py-1.5 rounded-lg text-slate-200 font-medium transition">
+            <a href="/przewodnik" target="_blank" rel="noopener" class="daf-nav-btn">
                 📖 Przewodnik
             </a>
-        </div>
+        </nav>
     </header>
 
-    <div class="flex flex-1 overflow-hidden">
+    <div class="flex flex-1 overflow-hidden relative">
+        <div id="daf-sidebar-backdrop" onclick="toggleDafSidebar(false)" class="hidden fixed inset-0 top-[54px] bg-black/60 z-30 md:!hidden"></div>
         <aside id="sidebar-container"
                hx-get="/media/sidebar"
                hx-trigger="refresh-all from:body"
-               class="w-72 border-r border-borderBg bg-cardBg/50 p-3.5 overflow-y-auto flex-shrink-0 hidden md:block">
+               class="w-72 border-r border-borderBg p-3.5 overflow-y-auto flex-shrink-0 hidden md:block z-40 max-md:fixed max-md:top-[54px] max-md:bottom-0 max-md:left-0 max-md:shadow-2xl">
             {% include "partials/sidebar.html" %}
         </aside>
 
-        <main class="flex-1 p-4 overflow-y-auto" id="main-scroll">
-            {% block content %}{% endblock %}
+        <main class="flex-1 px-4 lg:px-6 py-4 overflow-y-auto" id="main-scroll">
+            <div class="max-w-[1800px] mx-auto">
+                {% block content %}{% endblock %}
+            </div>
         </main>
     </div>
+    <script>
+        /* Visual-only helpers: sidebar toggle, HTMX progress bar, "/" focuses search */
+        function toggleDafSidebar(force) {
+            const sb = document.getElementById('sidebar-container');
+            const bd = document.getElementById('daf-sidebar-backdrop');
+            if (!sb) return;
+            if (window.matchMedia('(min-width: 768px)').matches) {
+                const hide = force === undefined ? !sb.classList.contains('md:hidden') : !force;
+                sb.classList.toggle('md:hidden', hide);
+                sb.classList.toggle('md:block', !hide);
+                try { localStorage.setItem('dafSidebarHidden', hide ? '1' : '0'); } catch (e) {}
+            } else {
+                const show = force === undefined ? sb.classList.contains('hidden') : force;
+                sb.classList.toggle('hidden', !show);
+                if (bd) bd.classList.toggle('hidden', !show);
+            }
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            try { if (localStorage.getItem('dafSidebarHidden') === '1' && window.matchMedia('(min-width: 768px)').matches) toggleDafSidebar(false); } catch (e) {}
+        });
+        let dafPending = 0;
+        document.addEventListener('htmx:beforeRequest', () => { dafPending++; document.body.classList.add('daf-loading'); });
+        const dafDone = () => {
+            dafPending = Math.max(0, dafPending - 1);
+            if (dafPending === 0) {
+                const bar = document.getElementById('daf-progress');
+                document.body.classList.remove('daf-loading');
+                if (bar) { bar.style.width = '100%'; bar.style.opacity = '1'; setTimeout(() => { bar.style.width = ''; bar.style.opacity = ''; }, 250); }
+            }
+        };
+        document.addEventListener('htmx:afterRequest', dafDone);
+        document.addEventListener('htmx:sendError', dafDone);
+        document.addEventListener('keydown', (e) => {
+            const t = e.target;
+            const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+            if (e.key === '/' && !typing) {
+                const s = document.getElementById('main-search-input');
+                if (s) { e.preventDefault(); s.focus(); s.select(); }
+            }
+        });
+    </script>
 
     <!-- Fullscreen Gallery Lightbox with Rotation, Zoom/Pan, and Pure Fullscreen Ratio Mode -->
     <div id="lightbox" class="hidden fixed inset-0 z-50 bg-black/95 flex flex-col justify-between p-3 select-none">
@@ -145,13 +307,13 @@
 
     <!-- Backup zdjęć/filmów Modal -->
     <div id="backup-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-5xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
-            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+        <div class="daf-modal-card rounded-2xl max-w-5xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto">
+            <div class="daf-modal-header flex justify-between items-center">
                 <div>
                     <h3 class="font-bold text-sm text-emerald-400">🛡️ Backup zdjęć i filmów (katalog <code>daf_backup/</code>)</h3>
                     <p class="text-[11px] text-slate-400">Wybór urządzeń docelowych • Kopie w strukturze <code>daf_backup/RRRR/MM/DD/</code> na innym dysku niż oryginał • 100% weryfikacja binarna • Albumy „Ważne”.</p>
                 </div>
-                <button type="button" onclick="document.getElementById('backup-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+                <button type="button" onclick="document.getElementById('backup-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl px-1.5">&times;</button>
             </div>
             <div id="backup-panel-body"></div>
         </div>
@@ -159,13 +321,13 @@
 
     <!-- Move Backups Between Devices Modal -->
     <div id="move-backups-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
-            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+        <div class="daf-modal-card rounded-2xl max-w-4xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto">
+            <div class="daf-modal-header flex justify-between items-center">
                 <div>
                     <h3 class="font-bold text-sm text-teal-400">🚚 Przenoszenie backupów między urządzeniami</h3>
                     <p class="text-[11px] text-slate-400">Przenoszenie plików backupu z jednego dysku na drugi z zachowaniem zasady rozdzielenia Oryginału i Backupu na różnych nośnikach.</p>
                 </div>
-                <button type="button" onclick="document.getElementById('move-backups-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+                <button type="button" onclick="document.getElementById('move-backups-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl px-1.5">&times;</button>
             </div>
             <div id="move-backups-panel-body"></div>
         </div>
@@ -173,13 +335,13 @@
 
     <!-- Background Processes Status & Persistent Disk Log Modal -->
     <div id="status-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-4xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
-            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+        <div class="daf-modal-card rounded-2xl max-w-4xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto">
+            <div class="daf-modal-header flex justify-between items-center">
                 <div>
                     <h3 class="font-bold text-sm text-purple-400">⚙️ Kontrola Procesów w Tle oraz Log Operacji (data/logs/operations.log)</h3>
                     <p class="text-[11px] text-slate-400">Zatrzymywanie, wznawianie niedokończonych procesów (AI, usuwanie, backup, skanowanie) oraz pełna historia operacji zapisana na dysku.</p>
                 </div>
-                <button type="button" onclick="document.getElementById('status-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+                <button type="button" onclick="document.getElementById('status-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl px-1.5">&times;</button>
             </div>
             <div id="status-panel-body"></div>
         </div>
@@ -187,13 +349,13 @@
 
     <!-- Google Drive Live Archive Modal -->
     <div id="gdrive-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div class="bg-cardBg border border-borderBg rounded-2xl max-w-3xl w-full p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto">
-            <div class="flex justify-between items-center border-b border-borderBg pb-3">
+        <div class="daf-modal-card rounded-2xl max-w-3xl w-full p-6 space-y-4 text-xs max-h-[90vh] overflow-y-auto">
+            <div class="daf-modal-header flex justify-between items-center">
                 <div>
                     <h3 class="font-bold text-sm text-sky-400">💾 Kopia Zapasowa Bazy Danych (Nośniki USB / HDD & Google Drive)</h3>
                     <p class="text-[11px] text-slate-400">Tworzenie i przywracanie kopii bazy SQLite na wybranym nośniku oraz w chmurze (Google Drive zachowuje zawsze wyłącznie 1 kopię).</p>
                 </div>
-                <button type="button" onclick="document.getElementById('gdrive-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+                <button type="button" onclick="document.getElementById('gdrive-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-2xl px-1.5">&times;</button>
             </div>
             <div id="gdrive-panel-body">
                 <div class="p-8 text-center text-slate-400">Kliknij powyżej, aby załadować kartoteki Google Drive...</div>

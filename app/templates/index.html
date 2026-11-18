@@ -1,10 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="space-y-4">
-    <div class="bg-cardBg border border-borderBg p-3.5 rounded-xl shadow flex flex-wrap gap-3 items-center justify-between">
-        <form hx-post="/actions/scan" hx-target="#global-notification" class="flex flex-wrap items-center gap-2 text-xs">
+    <div class="daf-sticky-toolbar bg-cardBg border border-borderBg p-3 rounded-xl shadow-card flex flex-wrap gap-3 items-center justify-between">
+        <form hx-post="/actions/scan" hx-target="#global-notification" class="flex flex-wrap items-center gap-2 text-xs bg-slate-950/40 border border-borderBg/70 rounded-xl px-2 py-1.5">
+            <span class="text-[10px] uppercase tracking-wider font-semibold text-slate-500 pl-1">Skaner</span>
             <input type="text" name="path" placeholder="Ścieżka dysku/folderu, np. E:\ lub D:\Zdjecia" required
-                   class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-60 focus:outline-none focus:border-indigo-500">
+                   class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-56 focus:outline-none focus:border-indigo-500">
             <label class="flex items-center space-x-1 text-[11px] text-slate-400 cursor-pointer">
                 <input type="checkbox" name="force_rescan" value="true" class="rounded bg-slate-900 border-borderBg text-indigo-600">
                 <span>Re-indeksuj</span>
@@ -37,16 +38,20 @@
             <input type="checkbox" name="backups_to_move_only" value="true" class="hidden">
             <input type="checkbox" name="online_only" value="true" class="hidden">
 
-            <div class="flex items-center space-x-1">
-                <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
-                       onchange="event.stopPropagation()"
-                       onkeydown="if(event.key==='Enter'){event.preventDefault(); const p=this.form.querySelector('[name=page]'); if(p) p.value='1'; htmx.trigger(this.form, 'submit');}"
-                       class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-60 focus:outline-none focus:border-indigo-500">
+            <div class="flex items-center gap-1.5">
+                <div class="relative">
+                    <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                    <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
+                           onchange="event.stopPropagation()"
+                           onkeydown="if(event.key==='Enter'){event.preventDefault(); const p=this.form.querySelector('[name=page]'); if(p) p.value='1'; htmx.trigger(this.form, 'submit');}"
+                           class="bg-slate-900 border border-borderBg rounded-lg pl-8 pr-8 py-1.5 w-64 focus:outline-none focus:border-indigo-500">
+                    <kbd class="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-slate-500 border border-borderBg rounded px-1 leading-4 pointer-events-none" title="Skrót klawiszowy: /">/</kbd>
+                </div>
                 <button type="button"
                         id="search-refresh-btn"
                         onclick="const f=document.getElementById('filter-form'); const p=f.querySelector('[name=page]'); if(p) p.value='1'; htmx.trigger(f, 'submit');"
-                        class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg font-semibold transition flex items-center space-x-1"
-                        title="Wyszukaj i odśwież listę zdjęć">
+                        class="bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white px-3 py-1.5 rounded-lg font-semibold shadow-glow flex items-center space-x-1"
+                        title="Wyszukaj i odśwież listę zdjęć (Enter)">
                     <span>🔄 Odśwież</span>
                 </button>
             </div>
@@ -101,16 +106,17 @@
         </form>
     </div>
 
-    <div class="bg-slate-900/90 border border-borderBg px-4 py-2.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div class="flex items-center space-x-3">
-            <span class="text-slate-400">Zakres akcji:</span>
-            <select id="bulk-scope-select" name="scope" class="bg-cardBg border border-indigo-500/50 text-indigo-300 font-semibold rounded-lg px-2.5 py-1">
+    <div class="bg-cardBg/70 border border-borderBg px-4 py-2.5 rounded-xl shadow-card flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div class="flex flex-wrap items-center gap-2.5">
+            <span class="text-[10px] uppercase tracking-wider font-semibold text-slate-500">Zakres akcji</span>
+            <select id="bulk-scope-select" name="scope" class="bg-slate-950/60 border border-indigo-500/50 text-indigo-200 font-semibold rounded-lg px-2.5 py-1">
                 <option value="filtered">Cały aktualny filtr / zbiór</option>
                 <option value="selected">Tylko zaznaczone kafelki</option>
             </select>
-            <span class="text-slate-400">Zaznaczono: <strong id="selected-counter" class="text-white">0</strong></span>
-            <button type="button" onclick="selectAllVisible(true)" class="text-indigo-400 hover:underline">Zaznacz stronę</button>
-            <button type="button" onclick="selectAllVisible(false)" class="text-slate-400 hover:underline">Odznacz</button>
+            <span class="inline-flex items-center gap-1.5 bg-indigo-950/50 border border-indigo-800/60 rounded-full px-2.5 py-0.5 text-slate-300">Zaznaczono: <strong id="selected-counter" class="text-white font-mono">0</strong></span>
+            <button type="button" onclick="selectAllVisible(true)" class="text-indigo-300 hover:text-white hover:underline">Zaznacz stronę</button>
+            <span class="text-slate-600">·</span>
+            <button type="button" onclick="selectAllVisible(false)" class="text-slate-400 hover:text-white hover:underline">Odznacz</button>
         </div>
 
         <div class="flex flex-wrap items-center gap-2">
@@ -195,10 +201,10 @@
 
 <!-- Granular AI Analysis Modal (Requirement 3b) -->
 <div id="ai-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
-        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+    <div class="daf-modal-card rounded-2xl max-w-md w-full p-6 space-y-4 text-xs">
+        <div class="daf-modal-header flex justify-between items-center">
             <h3 class="font-bold text-sm text-purple-300">⚡ Uruchom Analizę AI (Pojedyncza lub Wszystkie)</h3>
-            <button type="button" onclick="document.getElementById('ai-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+            <button type="button" onclick="document.getElementById('ai-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/analyze-all"
               hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
@@ -239,10 +245,10 @@
 
 <!-- Assign to Album Modal (Requirement 2a, 2c) -->
 <div id="group-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
-        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+    <div class="daf-modal-card rounded-2xl max-w-md w-full p-6 space-y-4 text-xs">
+        <div class="daf-modal-header flex justify-between items-center">
             <h3 class="font-bold text-sm text-white">📁 Przypisz zdjęcia do albumu lub utwórz nowy album</h3>
-            <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+            <button type="button" onclick="document.getElementById('group-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/assign-group"
               hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
@@ -281,10 +287,10 @@
 
 <!-- Change Date & Clear Date Anomaly Modal (Requirement 4a Multimedia) -->
 <div id="date-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
-        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+    <div class="daf-modal-card rounded-2xl max-w-md w-full p-6 space-y-4 text-xs">
+        <div class="daf-modal-header flex justify-between items-center">
             <h3 class="font-bold text-sm text-amber-300">📅 Zmiana daty zdjęć i zarządzanie listą niezgodności dat</h3>
-            <button type="button" onclick="document.getElementById('date-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+            <button type="button" onclick="document.getElementById('date-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/change-date"
               hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
@@ -334,10 +340,10 @@
 
 <!-- Move Files (Physical Online) Modal -->
 <div id="move-files-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
-        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+    <div class="daf-modal-card rounded-2xl max-w-md w-full p-6 space-y-4 text-xs">
+        <div class="daf-modal-header flex justify-between items-center">
             <h3 class="font-bold text-sm text-amber-400">🚚 Przenoszenie plików między urządzeniami (Online)</h3>
-            <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+            <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/move-files"
               hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
@@ -373,10 +379,10 @@
 
 <!-- Export Physical Album Modal (daf_albums/<NazwaAlbumu>/) -->
 <div id="export-album-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-    <div class="bg-cardBg border border-borderBg rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl text-xs">
-        <div class="flex justify-between items-center border-b border-borderBg pb-3">
+    <div class="daf-modal-card rounded-2xl max-w-md w-full p-6 space-y-4 text-xs">
+        <div class="daf-modal-header flex justify-between items-center">
             <h3 class="font-bold text-sm text-sky-400">📤 Eksportuj album fizycznie (<code>daf_albums/</code>)</h3>
-            <button type="button" onclick="document.getElementById('export-album-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg">&times;</button>
+            <button type="button" onclick="document.getElementById('export-album-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/export-physical-album"
               hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"

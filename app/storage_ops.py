@@ -591,6 +591,7 @@ class StorageAutomationService:
         target_volume_ids: Optional[List[int]] = None,
         minimize_transfers: bool = True,
         include_dedup: bool = False,
+        strict_target_writes_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Analyzes the database to build the Backup plan and capacity projection:
@@ -845,6 +846,8 @@ class StorageAutomationService:
         same_vol_dup_by_vol: Dict[int, int] = defaultdict(int)
         redundant_duplicates_count = sum(1 for it in all_items if it.duplicate_role == "duplicate")
         single_device_warning = len(volumes) < 2
+        skipped_non_target_relocs = 0
+        skipped_non_target_important = 0
 
         for cinfo in cluster_infos:
             cluster = cinfo["cluster"]
@@ -853,7 +856,10 @@ class StorageAutomationService:
             fsize = int(best_orig.file_size_bytes or 0)
 
             if cinfo["same_vol_non_bkp_cnt"] >= 2 and orig_vol and not is_in_important_album(best_orig, orig_vol.volume_label or ""):
-                important_candidates.append((best_orig, orig_vol))
+                if strict_target_writes_only and (orig_vol.id not in effective_target_set):
+                    skipped_non_target_important += 1
+                else:
+                    important_candidates.append((best_orig, orig_vol))
 
             other_vol_copies = sorted(
                 cinfo["other_vol_copies"],
@@ -960,28 +966,31 @@ class StorageAutomationService:
                     remote_move_rows.append(task_obj)
                     pair_tasks[pair_key]["backups_remote_move"].append(task_obj)
                 elif not chosen_backup.is_backup_copy:
-                    # Green BACKUP outside daf_backup/ stays on its device -> Kopie lokalne
-                    pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
-                    orig_cluster_pair[best_orig.id] = pair_key
-                    pk_str = f"{pair_key[0]}:{pair_key[1]}"
-                    b_vol = volumes.get(chosen_backup.volume_id)
-                    dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
-                    pair_metrics[pair_key]["local_copies_count"] += 1
-                    pair_metrics[pair_key]["backups_to_relocate_count"] += 1
-                    local_reloc_by_pair[pk_str] += 1
-                    reloc_obj = {
-                        "backup_item_id": chosen_backup.id,
-                        "vol_id": chosen_backup.volume_id,
-                        "vol_label": b_vol.volume_label if b_vol else "?",
-                        "vol_letter": b_vol.last_known_drive_letter if b_vol else "?",
-                        "file_name": chosen_backup.file_name,
-                        "file_size": int(chosen_backup.file_size_bytes or 0),
-                        "src_relative_path": chosen_backup.relative_path,
-                        "dst_relative_path": dst_rel,
-                        "pair_key_str": pk_str,
-                    }
-                    local_reloc_rows.append(reloc_obj)
-                    pair_tasks[pair_key]["backups_to_relocate"].append(reloc_obj)
+                    if strict_target_writes_only and (chosen_backup.volume_id not in effective_target_set):
+                        skipped_non_target_relocs += 1
+                    else:
+                        # Green BACKUP outside daf_backup/ stays on its device -> Kopie lokalne
+                        pair_key = (min(best_orig.volume_id, chosen_backup.volume_id), max(best_orig.volume_id, chosen_backup.volume_id))
+                        orig_cluster_pair[best_orig.id] = pair_key
+                        pk_str = f"{pair_key[0]}:{pair_key[1]}"
+                        b_vol = volumes.get(chosen_backup.volume_id)
+                        dst_rel = f"{self.BACKUP_DIR_NAME}/{chosen_backup.effective_date.strftime('%Y/%m/%d')}/{chosen_backup.file_name}"
+                        pair_metrics[pair_key]["local_copies_count"] += 1
+                        pair_metrics[pair_key]["backups_to_relocate_count"] += 1
+                        local_reloc_by_pair[pk_str] += 1
+                        reloc_obj = {
+                            "backup_item_id": chosen_backup.id,
+                            "vol_id": chosen_backup.volume_id,
+                            "vol_label": b_vol.volume_label if b_vol else "?",
+                            "vol_letter": b_vol.last_known_drive_letter if b_vol else "?",
+                            "file_name": chosen_backup.file_name,
+                            "file_size": int(chosen_backup.file_size_bytes or 0),
+                            "src_relative_path": chosen_backup.relative_path,
+                            "dst_relative_path": dst_rel,
+                            "pair_key_str": pk_str,
+                        }
+                        local_reloc_rows.append(reloc_obj)
+                        pair_tasks[pair_key]["backups_to_relocate"].append(reloc_obj)
 
         important_count_by_vol: Dict[int, int] = defaultdict(int)
         important_by_pair: Dict[str, int] = defaultdict(int)
@@ -1145,6 +1154,8 @@ class StorageAutomationService:
             "unassigned_new_copies": sum(unassigned_unbacked_by_vol.values()),
             "important_pairs_sum": sum(p["metrics"]["important_to_assign_count"] for p in scheduled_pairs),
             "important_plan_total": len(important_candidates),
+            "skipped_non_target_relocs": skipped_non_target_relocs,
+            "skipped_non_target_important": skipped_non_target_important,
         }
 
         return {
@@ -1154,6 +1165,7 @@ class StorageAutomationService:
             "default_target_volume_ids": default_target_ids,
             "effective_target_volume_ids": effective_target_ids,
             "minimize_transfers": bool(minimize_transfers),
+            "strict_target_writes_only": bool(strict_target_writes_only),
             "stats": {
                 "total_unique": total_unique_count,
                 "missing_backups": missing_backup_count,
@@ -1196,6 +1208,7 @@ class StorageAutomationService:
         selected_pair_keys: Optional[List[str]] = None,
         target_volume_ids: Optional[List[int]] = None,
         minimize_transfers: bool = True,
+        strict_target_writes_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes the automated Backup workflow for selected volume pairs and target drives:
@@ -1216,14 +1229,18 @@ class StorageAutomationService:
             selected_pair_keys=selected_pair_keys,
             target_volume_ids=target_volume_ids,
             minimize_transfers=minimize_transfers,
+            strict_target_writes_only=strict_target_writes_only,
         )
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
+        allowed_write_vols: Set[int] = set(plan["effective_target_volume_ids"])
 
         # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> MM -> DD
         # Each candidate is assigned 1-to-1 to a single scheduled pair (or directly when <2 volumes exist).
         important_assigned = 0
         if len(volumes) < 2:
             for orig_item, orig_vol in plan["important_candidates"]:
+                if strict_target_writes_only and orig_vol.id not in allowed_write_vols:
+                    continue
                 self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
                 important_assigned += 1
         else:
@@ -1231,6 +1248,8 @@ class StorageAutomationService:
                 if selected_pairs_set is not None and pair_entry["pair_key"] not in selected_pairs_set:
                     continue
                 for orig_item, orig_vol in pair_entry["tasks"]["important_items"]:
+                    if strict_target_writes_only and orig_vol.id not in allowed_write_vols:
+                        continue
                     self.ensure_important_album_hierarchy(orig_item, orig_vol.volume_label)
                     important_assigned += 1
         if important_assigned > 0:
@@ -1261,6 +1280,8 @@ class StorageAutomationService:
             # Local relocations on an online volume can succeed even if the partner volume is offline
             local_done_in_pair = 0
             for reloc_task in tasks["backups_to_relocate"]:
+                if strict_target_writes_only and reloc_task["vol_id"] not in allowed_write_vols:
+                    continue
                 bkp_item = self.db.get(MediaItem, reloc_task["backup_item_id"])
                 bkp_vol = volumes.get(reloc_task["vol_id"])
                 vol_root = self.verify_and_resolve_online_volume_root(bkp_vol, connected_map=connected_map)
@@ -1301,6 +1322,8 @@ class StorageAutomationService:
             for rmove in tasks["backups_remote_move"]:
                 if job_id and ProcessManager.is_stop_requested(job_id):
                     break
+                if strict_target_writes_only and rmove["dst_vol_id"] not in allowed_write_vols:
+                    continue
                 bkp_item = self.db.get(MediaItem, rmove["backup_item_id"])
                 src_vol = volumes.get(rmove["src_vol_id"])
                 dst_vol = volumes.get(rmove["dst_vol_id"])
@@ -1337,10 +1360,11 @@ class StorageAutomationService:
                         logger.debug("Cleanup failed remote backup move %s: %s", dest_path, exc)
                     verification_blocks += 1
                     continue
-                try:
-                    _safe_unlink(src_path)
-                except OSError as exc:
-                    logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
+                if (not strict_target_writes_only) or (src_vol.id in allowed_write_vols):
+                    try:
+                        _safe_unlink(src_path)
+                    except OSError as exc:
+                        logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
                 bkp_item.volume_id = dst_vol.id
                 bkp_item.file_name = dest_path.name
                 bkp_item.relative_path = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
@@ -1358,6 +1382,8 @@ class StorageAutomationService:
             for copy_task in tasks["backups_to_copy"]:
                 if job_id and ProcessManager.is_stop_requested(job_id):
                     break
+                if strict_target_writes_only and copy_task["dst_vol_id"] not in allowed_write_vols:
+                    continue
                 orig_item = self.db.get(MediaItem, copy_task["orig_item_id"])
                 src_vol = volumes.get(copy_task["src_vol_id"])
                 dst_vol = volumes.get(copy_task["dst_vol_id"])
@@ -1481,6 +1507,8 @@ class StorageAutomationService:
         )
         if skipped_unselected_pairs > 0:
             summary_msg += f" | Pominięto niewybrane pary dysków: {skipped_unselected_pairs}"
+        if strict_target_writes_only:
+            summary_msg += " | Tryb ochrony: zapisy wyłącznie na wybranych dyskach docelowych"
 
         OperationLogger.log(
             "BACKUP_EXEC",

@@ -1,8 +1,8 @@
 <div class="space-y-4">
     <!-- Podsumowanie aktywnego zbioru i paginacja -->
-    <div class="flex flex-wrap items-center justify-between gap-2 bg-cardBg/60 border border-borderBg px-4 py-2 rounded-xl text-xs">
+    <div class="flex flex-wrap items-center justify-between gap-2.5 bg-cardBg/80 border border-borderBg px-4 py-2.5 rounded-xl shadow-card text-xs">
         <div class="flex flex-wrap items-center gap-2">
-            <span class="text-slate-400">Aktywny zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong> plików ({{ "%.1f"|format(total_size_mb) }} MB)</span>
+            <span class="inline-flex items-center gap-1.5 bg-slate-950/70 border border-emerald-800/50 rounded-lg px-2.5 py-1 text-slate-300">Aktywny zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong> plików ({{ "%.1f"|format(total_size_mb) }} MB)</span>
             {% if active_group %}
                 <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Album: {{ active_group.name }} (ID: {{ active_group.id }})</span>
             {% endif %}
