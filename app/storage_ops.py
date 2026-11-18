@@ -1234,6 +1234,22 @@ class StorageAutomationService:
         volumes: Dict[int, WindowsVolume] = plan["volumes"]
         allowed_write_vols: Set[int] = set(plan["effective_target_volume_ids"])
 
+        total_planned_ops = sum(
+            len(pe["tasks"]["backups_to_copy"])
+            + len(pe["tasks"]["backups_to_relocate"])
+            + len(pe["tasks"]["backups_remote_move"])
+            for pe in plan["ordered_pairs"]
+            if (selected_pairs_set is None or pe["pair_key"] in selected_pairs_set)
+        )
+        if job_id:
+            ProcessManager.update_progress(
+                job_id,
+                processed_count=0,
+                total_count=total_planned_ops,
+                message=f"Wykonywanie backupu ({total_planned_ops} operacji)...",
+                db=self.db,
+            )
+
         # Step 1: Assign Originals with same-device duplicates to 'Ważne - <volume_label>' -> YYYY -> MM -> DD
         # Each candidate is assigned 1-to-1 to a single scheduled pair (or directly when <2 volumes exist).
         important_assigned = 0
@@ -1307,6 +1323,10 @@ class StorageAutomationService:
                 bkp_item.duplicate_role = "backup_green"
                 backups_relocated += 1
                 local_done_in_pair += 1
+                if job_id:
+                    ProcessManager.update_progress(
+                        job_id, processed_delta=1, message=f"Przeniesiono lokalnie: {bkp_item.file_name}", db=self.db
+                    )
 
             va_root = self.verify_and_resolve_online_volume_root(va, connected_map=connected_map)
             vb_root = self.verify_and_resolve_online_volume_root(vb, connected_map=connected_map)
@@ -1485,21 +1505,38 @@ class StorageAutomationService:
         self.flag_duplicate_clusters()
         remaining_unbacked = len(self.detect_files_without_backup(recluster=False))
 
+        pending_pairs_summary: List[Dict[str, Any]] = []
+        for p_entry in pending_offline_pairs:
+            p_va = p_entry["vol_a"]
+            p_vb = p_entry["vol_b"]
+            pending_pairs_summary.append(
+                {
+                    "vol_a_label": f"{p_va.volume_label} ({p_va.last_known_drive_letter}, VSN: {p_va.volume_serial_number})" if p_va else "Nieznany",
+                    "vol_b_label": f"{p_vb.volume_label} ({p_vb.last_known_drive_letter}, VSN: {p_vb.volume_serial_number})" if p_vb else "Nieznany",
+                    "vol_a_online": bool(p_va and p_va.is_online),
+                    "vol_b_online": bool(p_vb and p_vb.is_online),
+                    "backups_to_copy": len(p_entry["tasks"]["backups_to_copy"]),
+                    "remote_moves": len(p_entry["tasks"]["backups_remote_move"]),
+                    "local_relocs": len(p_entry["tasks"]["backups_to_relocate"]),
+                }
+            )
+
         next_pair_prompt = None
-        if pending_offline_pairs:
-            nxt = pending_offline_pairs[0]
-            va = nxt["vol_a"]
-            vb = nxt["vol_b"]
+        waiting_message = ""
+        if pending_pairs_summary:
+            first_p = pending_pairs_summary[0]
             next_pair_prompt = {
-                "vol_a_label": f"{va.volume_label} ({va.last_known_drive_letter}, VSN: {va.volume_serial_number})" if va else "Nieznany",
-                "vol_b_label": f"{vb.volume_label} ({vb.last_known_drive_letter}, VSN: {vb.volume_serial_number})" if vb else "Nieznany",
-                "vol_a_online": bool(va and va.is_online),
-                "vol_b_online": bool(vb and vb.is_online),
-                "backups_to_copy": len(nxt["tasks"]["backups_to_copy"]),
-                "remote_moves": len(nxt["tasks"]["backups_remote_move"]),
-                "local_relocs": len(nxt["tasks"]["backups_to_relocate"]),
-                "remaining_pairs_count": len(pending_offline_pairs),
+                **first_p,
+                "remaining_pairs_count": len(pending_pairs_summary),
             }
+            a_st = "ONLINE" if first_p["vol_a_online"] else "PODŁĄCZ DYSK"
+            b_st = "ONLINE" if first_p["vol_b_online"] else "PODŁĄCZ DYSK"
+            waiting_message = (
+                f"🔌 Podłącz parę dysków (pozostało par: {len(pending_pairs_summary)}) — "
+                f"teraz wymagana para: {first_p['vol_a_label']} [{a_st}] ↔ "
+                f"{first_p['vol_b_label']} [{b_st}] "
+                f"(nowe kopie: {first_p['backups_to_copy']}, zdalne: {first_p['remote_moves']}, lokalne: {first_p['local_relocs']})."
+            )
 
         summary_msg = (
             f"Nowe kopie (backupy): {backups_created} | Kopie lokalne do '{self.BACKUP_DIR_NAME}/': {backups_relocated} | "
@@ -1538,8 +1575,10 @@ class StorageAutomationService:
             "space_warnings": space_warnings,
             "completed_pairs": completed_pairs,
             "pending_offline_pairs_count": len(pending_offline_pairs),
+            "pending_pairs_summary": pending_pairs_summary,
             "skipped_unselected_pairs": skipped_unselected_pairs,
             "next_pair_prompt": next_pair_prompt,
+            "waiting_message": waiting_message,
             "remaining_unbacked": remaining_unbacked,
             "single_device_warning": plan["single_device_warning"],
             "summary": summary_msg,

@@ -243,9 +243,10 @@
         </div>
         <p>Zacznij od zbudowania pełnego indeksu wszystkich nośników, na których masz porozrzucane zdjęcia i filmy — nawet jeśli na wielu z nich powtarzają się te same kopie.</p>
         <ul class="checklist">
-            <li>Podłącz pierwszy dysk/pendrive, wpisz jego literę w polu na górze (np. <code>E:\</code>) i kliknij <span class="ui-btn">Skanuj dysk</span>.</li>
+            <li>Podłącz pierwszy dysk/pendrive, wpisz jego literę w polu na górze (np. <code>E:\</code>) i kliknij <span class="ui-btn">Skanuj dysk</span>. Katalogi <code>daf_backup/</code> (poza trybem importu) oraz <code>daf_albums/</code> są pomijane automatycznie.</li>
             <li>W lewym panelu bocznym w sekcji <strong>Nośniki / Dyski USB</strong> kliknij ikonę ołówka <span class="ui-btn">✏️</span> przy nowo dodanym dysku i nadaj mu czytelną nazwę, np. <code>Dysk_Czarny_1TB</code> lub <code>Pendrive_Wakacje</code>.</li>
-            <li>Powtórz tę czynność dla wszystkich posiadanych dysków i pendrive'ów (możesz odłączać poprzednie i podłączać kolejne — system zapamięta ich pojemność, wolne miejsce oraz miniatury).</li>
+            <li>Powtórz tę czynność dla wszystkich posiadanych dysków i pendrive'ów (możesz odłączać poprzednie i podłączać kolejne — system śledzi nośniki po sprzętowym numerze seryjnym <strong>Win32 VSN</strong>, więc rozpoznaje dysk nawet po zmianie litery napędu w Windows).</li>
+            <li><strong>Bezpieczne ponowne skanowanie i spójność:</strong> ponowne skanowanie tego samego dysku nigdy nie kasuje zebranych tagów AI, wektorów 512-D, oceny ostrości, albumów ani dat dla istniejących plików. W oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> możesz kliknąć <span class="ui-btn">🔍 Sprawdź spójność bazy z dyskami</span>, aby wykryć pliki brakujące fizycznie na podłączonym nośniku.</li>
             <li>Jeśli posiadasz jeden duży, pusty (lub prawie pusty) dysk przeznaczony docelowo na kopię zapasową, również podłącz go na chwilę i zeskanuj — system automatycznie wykorzysta go w Kroku 4 jako główny dysk backupowy.</li>
         </ul>
     </section>
@@ -270,7 +271,8 @@
                     <li><code>🌫️ Rozmyte / brak ostrości</code> — posortuj je na górze według <em>Ostrość: Najbardziej rozmyte</em>, aby na samym początku zobaczyć najbardziej nieostre zdjęcia.</li>
                 </ul>
             </li>
-            <li>Zaznacz niechciane zdjęcia i kliknij <span class="ui-btn">🗑️ Do Kosza</span> (trafią bezpiecznie do lokalnego Kosza, skąd w razie wątpliwości zawsze można je przywrócić).</li>
+            <li><strong>Fałszywy alarm? Oznacz jako bez wady:</strong> jeśli zdjęcie zaklasyfikowane jako uszkodzone lub rozmyte jest w rzeczywistości dobre, kliknij <span class="ui-btn">✓ Oznacz jako bez wady / nieuszkodzone</span> (na górnym pasku widoku wad, w oknie szczegółów) albo <span class="ui-btn">✓ Bez wady</span> bezpośrednio na karcie zdjęcia / w tabeli. Zdjęcie opuści listę wad i zachowa ocenę ostrości (nie trafi do <em>Niezbadanej jakości</em>).</li>
+            <li>Zaznacz naprawdę niechciane zdjęcia i kliknij <span class="ui-btn">🗑️ Do Kosza</span> — ustawia w bazie SQLite bezpieczny atrybut <code>KOSZ</code> (bez ruszania czy przenoszenia fizycznych plików na dysku), skąd zawsze można je przywrócić.</li>
         </ul>
     </section>
 
@@ -285,7 +287,7 @@
         </div>
         <p>Prawidłowa data zdjęcia decyduje o tym, do jakiego folderu <code>RRRR/MM/DD</code> trafi jego backup oraz do jakiego albumu zostanie przypisane.</p>
         <ul class="checklist">
-            <li>Kliknij w lewym menu <span class="ui-btn">⚠️ Niezgodność dat</span>. Znajdują się tam wyłącznie pliki bez daty EXIF, których data utworzenia pliku kłóci się z nazwą pliku lub nazwą folderu (np. wskutek dawnego przekopiowania na Windows). System automatycznie ustawił już dla nich najstarszą wiarygodną datę.</li>
+            <li>Kliknij w lewym menu <span class="ui-btn">⚠️ Niezgodność dat</span>. Znajdują się tam pliki bez rozstrzygającego EXIF lub z rozbieżnościami daty (np. po przekopiowaniu na Windows). Nad listą dostępny jest <strong>Filtr przyczyny niezgodności</strong>: <code>Wszystkie</code>, <code>📂 Z nazwą folderu</code>, <code>🏷️ Data pliku vs nazwa</code>, <code>📋 Ślad kopiowania (ctime &gt; mtime)</code>, <code>📷 EXIF</code> oraz <code>❓ Inne</code>.</li>
             <li>Jeśli wyznaczona data jest prawidłowa, zaznacz zdjęcia (lub ustaw zakres na <em>Cały aktualny filtr</em>) i kliknij na żółtym pasku <span class="ui-btn">✓ Usuń z listy niezgodności BEZ zmiany daty</span>.</li>
             <li>Jeśli chcesz nadać grupie zdjęć z jednego wydarzenia konkretną datę, wpisz ją w polu <code>RRRR-MM-DD GG:MM</code> i kliknij <span class="ui-btn">📅 Ustaw nową datę i usuń z listy</span>.</li>
         </ul>
@@ -304,14 +306,15 @@
         <ul class="checklist">
             <li>Kliknij na górnym pasku <span class="ui-btn">🛡️ Backup zdjęć/filmów</span>.</li>
             <li>W sekcji <strong>Wybierz dyski docelowe na backup</strong> upewnij się, że zaznaczony jest Twój dysk przeznaczony na kopię zapasową (system domyślnie zaznacza dysk z najmniejszą liczbą oryginałów i największą ilością wolnego miejsca).</li>
+            <li><strong>Tryb ścisłej ochrony pozostałych urządzeń:</strong> zaznacz <kbd>🔒 Zapisuj wyłącznie na wybranych urządzeniach (ochrona pozostałych dysków)</kbd>, gdy np. chcesz wykonywać zapisy (nowe kopie, porządkowanie kopii lokalnych, przypisania do albumu <em>Ważne</em>) wyłącznie na wybranych dyskach docelowych (np. <code>Backup-1</code> i <code>Foto-1</code>). Na żadnym niewybranym dysku nie zostaną wykonane żadne zapisy ani kasowanie, dzięki czemu ewentualne skasowane tam wcześniej dane nie zostaną nadpisane.</li>
             <li>Sprawdź opcję <kbd>⚡ Zminimalizuj przeniesienia</kbd>:
                 <ul>
                     <li>Zostaw <strong>zaznaczoną</strong>, jeśli chcesz, aby kopie znajdujące się już na innych dyskach niż oryginał pozostały na tych dyskach i zostały jedynie uporządkowane lokalnie do katalogu <code>daf_backup/RRRR/MM/DD/</code>.</li>
-                    <li><strong>Odznacz</strong> ją, jeśli chcesz zebrać wszystkie rozproszone backupy na jeden wybrany dysk docelowy.</li>
+                    <li><strong>Odznacz</strong> ją, jeśli chcesz zebrać wszystkie rozproszone backupy na wybrane dyski docelowe.</li>
                 </ul>
             </li>
             <li>Podłącz dyski wskazane jako gotowa para w <strong>Harmonogramie par urządzeń (A ↔ B)</strong> i kliknij <span class="ui-btn">🛡️ Zrób backup</span>.</li>
-            <li>Przy okazji tego kroku wszystkie oryginały, które miały na swoim własnym dysku dodatkową kopię, zostaną automatycznie wyróżnione w albumach <code>Ważne - &lt;NazwaDysku&gt; / RRRR / MM / DD</code>!</li>
+            <li><strong>Przenoszenie istniejących kopii między dyskami:</strong> w oknie <span class="ui-btn">🚚 Przenieś backupy</span> widzisz liczbę backupów każdego rodzaju na poszczególnych dyskach (<code>w daf_backup/</code>, <code>zielone</code>, <code>pomarańczowe</code>) oraz możesz wybrać, które typy mają zostać przeniesione do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym.</li>
         </ul>
         <div class="tip-box">
             <strong>Jak sprawdzić, że wszystko ma już backup?</strong> Po wykonaniu operacji kafelek <em>Brakujące backupy (1 kopia)</em> oraz <em>Backupy pomarańczowe (ten sam dysk)</em> pokażą wartość <strong><code>0</code></strong>, a liczba <em>Backupy zielone (inny dysk)</em> będzie równa liczbie <em>Wszystkie unikalne (Oryginały)</em>.
@@ -335,9 +338,10 @@
                 <span class="tag-pill tag-green">BACKUP</span> (2. kopia chroniona) oraz
                 <span class="tag-pill tag-red">DUPLIKAT</span> (3. i kolejne nadmiarowe kopie).</li>
             <li>Kliknij przycisk <span class="ui-btn">☑️ Zaznacz tylko nadmiarowe kopie</span> — system zaznaczy wyłącznie czerwone <span class="tag-pill tag-red">DUPLIKAT</span> na wszystkich stronach wyników (nigdy nie zaznaczy Oryginału ani Backupu!).</li>
-            <li>Kliknij na górnym pasku <span class="ui-btn">🔥 Usuń trwale</span> (lub <span class="ui-btn">🗑️ Do Kosza</span>).</li>
+            <li>Kliknij na górnym pasku <span class="ui-btn">🔥 Usuń trwale</span> (lub <span class="ui-btn">🗑️ Do Kosza</span>). System automatycznie zdejmuje atrybut tylko-do-odczytu (<code>Read-Only</code>) w Windows podczas kasowania i zachowuje dawne ścieżki usuniętych duplikatów w historii (możesz później wyszukać oryginał po nazwie/ścieżce usuniętego duplikatu).</li>
             <li>System najpierw jednorazowo utworzy kopię bezpieczeństwa bazy SQLite (Etap 1/2), a następnie usunie zweryfikowane w 100% duplikaty z podłączonych dysków (Etap 2/2).</li>
-            <li>Jeśli część duplikatów leży na odłączonym dysku, na ekranie pojawi się prośba z dokładną liczbą duplikatów do skasowania na tym dysku — podłącz go i kliknij <span class="ui-btn">▶️ Kontynuuj na podłączonym dysku</span>.</li>
+            <li>Jeśli część duplikatów leży na odłączonym dysku, na ekranie pojawi się prośba z dokładną liczbą duplikatów do skasowania na tym dysku — podłącz go i kliknij <span class="ui-btn">▶️ Kontynuuj na podłączonym dysku</span> (role klastrów są przeliczane dopiero po zakończeniu wszystkich dysków, bez powrotu na wcześniejsze dyski).</li>
+            <li><strong>Weryfikacja po deduplikacji:</strong> w oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> kliknij <span class="ui-btn">✅ Weryfikuj usunięte duplikaty (100% Oryginałów)</span>, aby porównać bieżącą bazę z kopią sprzed usuwania i potwierdzić, że 100% usuniętych duplikatów ma aktywny Oryginał o tym samym <code>file_hash</code>.</li>
         </ul>
     </section>
 
@@ -361,8 +365,8 @@
                 <p>Wyszukaj zdjęcia (np. po tagu AI <code>morze_woda</code>, po roku lub przez <span class="ui-btn">🔍 Podobne</span>), zaznacz wybrane ujęcia (z klawiszem <kbd>Shift</kbd> zaznaczysz cały przedział) i kliknij <span class="ui-btn">📁 Przypisz do albumu</span>.</p>
             </div>
             <div class="sub-box">
-                <h3>Sposób C: Konsolidacja fizyczna albumu na wybrany dysk</h3>
-                <p>Gdy wybierzesz dowolny album w lewym menu, na jego pasku narzędzi możesz wybrać dysk docelowy i kliknąć <span class="ui-btn">Przenieś na dysk</span> — wszystkie zdjęcia z tego albumu i jego podalbumów zostaną fizycznie zebrane w jednym katalogu <code>DomoweArchiwumAlbumy/&lt;NazwaAlbumu&gt;/</code>.</p>
+                <h3>Sposób C: Porządkowanie oryginałów i eksport albumu do wywołania</h3>
+                <p>Kliknij <span class="ui-btn">🗂️ Uporządkuj oryginały</span>, aby automatycznie pogrupować nieprzypisane oryginały w <code>daf_oryginal/RRRR/MM/DD/</code> na ich macierzystym dysku (z zachowaniem pierwotnej ścieżki z nazwą dysku do wyszukiwania). Użyj <span class="ui-btn">📤 Eksportuj album fizycznie</span>, aby skopiować wybrane zdjęcia albumu do <code>daf_albums/&lt;NazwaAlbumu&gt;/</code> np. na pendrive'a do wywołania (katalog pomijany przy skanowaniu).</p>
             </div>
             <div class="sub-box">
                 <h3>Kopia bazy i kompaktowanie na koniec pracy</h3>
@@ -383,17 +387,16 @@
 
         <div class="grid-2">
             <div class="sub-box">
-                <h3>🔍 1. Wyszukiwanie słowne i semantyczne (po polsku i angielsku)</h3>
-                <p>Wpisz w polu <code>Szukaj...</code> na górze ekranu dowolną frazę: nazwę pliku (np. <code>IMG_2023</code>), nazwę folderu lub obiekt/scenę po polsku (np. <code>pies</code>, <code>kot</code>, <code>samochod</code>, <code>morze</code>, <code>gory</code>, <code>ludzie</code>, <code>zachod</code>, <code>noc</code>, <code>architektura</code>, <code>jedzenie</code>). Wyszukiwarka automatycznie tłumaczy polskie kategorie na klasy AI i przeszukuje bazę w ułamku sekundy.</p>
+                <h3>🔍 1. Wyszukiwanie słowne, historia duplikatów i widoczność backupów</h3>
+                <p>Wpisz w polu <code>Szukaj...</code> (skrót <kbd>/</kbd>) frazę: nazwę pliku, folderu, pierwotną ścieżkę po uporządkowaniu, dawną ścieżkę <em>usuniętego duplikatu</em> albo kategorię po polsku (np. <code>pies</code>, <code>morze</code>, <code>gory</code>) i naciśnij <kbd>Enter</kbd> lub przycisk <span class="ui-btn">🔄 Odśwież</span>. Domyślnie wszystkie rodzaje backupów są ukryte; obok wyszukiwarki możesz je włączyć filtrem <span class="ui-btn">🛡️ Backupy</span> (<code>daf_backup/</code>, <code>Zielone</code>, <code>Pomarańczowe</code>).</p>
             </div>
             <div class="sub-box">
-                <h3>🧠 2. Wyszukiwanie wizualne „Znajdź podobne (512-D)”</h3>
-                <p>Nie musisz pamiętać daty ani nazwy zdjęcia. Znajdź jedno zdjęcie z danej sesji lub miejsca i kliknij <span class="ui-btn">🔍 Podobne</span>. Przełączaj między 6 trybami na fioletowym pasku:
-                <em>Prawie identyczne (układ 8x8)</em>, <em>Te same obiekty AI</em>, <em>Paleta barw HSV</em>, <em>Ta sama sesja czasowa</em> lub <em>Kompozycja i Ludzie</em>.</p>
+                <h3>🔌 2. Kolejność dysków offline i tryb „Tylko dostępne online”</h3>
+                <p>Nad listą zdjęć automatycznie wyświetlają się <strong>dwie uporządkowane listy dysków offline</strong> potrzebnych do podglądu oryginałów (osobno dla bieżącej strony/zakładki i dla całego aktywnego widoku). Kliknięcie dysku filtruje do niego listę, przycisk <span class="ui-btn">💾 Wszystkie urządzenia</span> przywraca pełny widok, a <span class="ui-btn">🟢 Tylko dostępne online</span> pokazuje wyłącznie pliki z aktualnie podłączonych dysków. Lewy panel boczny można zwijać przyciskiem <span class="ui-btn">☰</span>.</p>
             </div>
             <div class="sub-box">
-                <h3>🖥️ 3. Trzy tryby widoku i zaawansowane sortowanie</h3>
-                <p>Na górnym pasku możesz w każdej chwili przełączyć:
+                <h3>🖥️ 3. Trzy tryby widoku, sortowanie i podobieństwo 512-D</h3>
+                <p>Przycisk <span class="ui-btn">🔍 Podobne</span> na zdjęciu przeszukuje kolekcję w 6 trybach (układ 8x8 LAB, obiekty AI, barwy HSV, ta sama sesja, kompozycja). Na górnym pasku przełączysz tryb wyświetlania:
                 <ul>
                     <li><strong>Widok: Oś czasu</strong> — zdjęcia ułożone chronologicznie dzień po dniu.</li>
                     <li><strong>Widok: Gęsty (Kompakt)</strong> — nawet 12 kolumn miniatur na jednym ekranie do szybkiego przeglądu tysięcy zdjęć.</li>
@@ -402,8 +405,8 @@
                 </p>
             </div>
             <div class="sub-box">
-                <h3>⛶ 4. Skróty klawiszowe i gesty w przeglądarce pełnoekranowej</h3>
-                <p>Po kliknięciu zdjęcia w Lightboxie:
+                <h3>⛶ 4. Skróty klawiszowe i podgląd wideo w trybie Offline</h3>
+                <p>Po kliknięciu zdjęcia lub filmu w Lightboxie (w trybie Offline przy odłączonym dysku wideo wyświetla dostępną miniaturę zamiast błędu odtwarzania):
                 <ul>
                     <li><kbd>&larr;</kbd> / <kbd>&rarr;</kbd> — poprzednie / następne zdjęcie lub wideo.</li>
                     <li><strong>Kółko myszy (lub kliknięcie zdjęcia)</strong> — płynny Zoom do 600%, przeciąganie myszą przesuwa kadr (Pan).</li>

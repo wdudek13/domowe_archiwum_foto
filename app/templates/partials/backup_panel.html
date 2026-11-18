@@ -34,8 +34,26 @@
                 </div>
             </div>
             <div class="text-[11px] text-amber-200">
-                Oczekujące operacje dla pary — Nowe kopie: {{ execution_result.next_pair_prompt.backups_to_copy }}, Kopie zdalne: {{ execution_result.next_pair_prompt.remote_moves }}, Kopie lokalne: {{ execution_result.next_pair_prompt.local_relocs }}.
+                Oczekujące operacje dla tej pary — Nowe kopie: {{ execution_result.next_pair_prompt.backups_to_copy }}, Kopie zdalne: {{ execution_result.next_pair_prompt.remote_moves }}, Kopie lokalne: {{ execution_result.next_pair_prompt.local_relocs }}.
             </div>
+            <div class="pt-1 flex flex-wrap items-center gap-2">
+                <button type="button"
+                        onclick="document.getElementById('backup-execute-form').requestSubmit()"
+                        class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-1.5 rounded-lg font-bold shadow transition">
+                    ▶️ Podłączyłem wskazaną parę dysków — Kontynuuj backup
+                </button>
+            </div>
+            {% if execution_result.pending_pairs_summary and execution_result.pending_pairs_summary|length > 1 %}
+            <div class="pt-2 border-t border-amber-700/50 space-y-1 text-[10px] text-amber-100/90 font-mono">
+                <div class="font-sans font-semibold text-amber-200">📋 Kolejka pozostałych par do podłączenia ({{ execution_result.pending_pairs_summary|length }}):</div>
+                {% for pp in execution_result.pending_pairs_summary %}
+                <div class="flex flex-wrap justify-between gap-2 bg-slate-950/50 rounded px-2 py-1">
+                    <span>{{ loop.index }}. {{ pp.vol_a_label }} ↔ {{ pp.vol_b_label }}</span>
+                    <span>(nowe: {{ pp.backups_to_copy }}, zdal: {{ pp.remote_moves }}, lok: {{ pp.local_relocs }})</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
         </div>
         {% endif %}
     </div>

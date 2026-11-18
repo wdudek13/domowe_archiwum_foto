@@ -1212,7 +1212,7 @@ def control_background_process(
             rem_ids = []
             params = {}
 
-        if not rem_ids and job.job_type != "backup_dedup":
+        if not rem_ids and job.job_type not in ("backup_dedup", "backup_exec"):
             job.status = "COMPLETED"
             db.commit()
         else:
@@ -1256,10 +1256,32 @@ def control_background_process(
                     _execute_delete_permanently_items(db, rem_ids, job_id=job.id)
                 else:
                     _execute_move_to_trash_items(db, rem_ids, job_id=job.id)
-            elif job.job_type == "backup_dedup":
+            elif job.job_type in ("backup_dedup", "backup_exec"):
                 svc = StorageAutomationService(db)
-                svc.execute_backup_and_deduplication(job_id=job.id)
-                ProcessManager.finish_job(job.id, status="COMPLETED", message="Backup i deduplikacja wznowione i wykonane.", db=db)
+                exec_res = svc.execute_backup_and_deduplication(
+                    preferred_target_volume_id=params.get("preferred_target_volume_id"),
+                    job_id=job.id,
+                    operation_mode="backup_only",
+                    selected_pair_keys=params.get("selected_pairs"),
+                    target_volume_ids=params.get("target_volume_ids"),
+                    minimize_transfers=bool(params.get("minimize_transfers", True)),
+                    strict_target_writes_only=bool(params.get("strict_target_writes_only", False)),
+                )
+                if exec_res.get("pending_offline_pairs_count", 0) > 0:
+                    ProcessManager.update_progress(
+                        job.id,
+                        status="WAITING_FOR_DEVICE",
+                        message=exec_res.get("waiting_message")
+                        or f"Oczekiwanie na podłączenie kolejnej pary dysków (pozostało par: {exec_res['pending_offline_pairs_count']}).",
+                        db=db,
+                    )
+                else:
+                    ProcessManager.finish_job(
+                        job.id,
+                        status="COMPLETED",
+                        message=exec_res.get("summary") or "Backup i deduplikacja wznowione i wykonane.",
+                        db=db,
+                    )
                 db.commit()
             elif job.job_type == "scan":
                 scan_path = str(params.get("path") or "").strip()
@@ -1745,19 +1767,36 @@ def execute_backup_action(
 
     svc = StorageAutomationService(db)
     effective_pairs = selected_pairs if pairs_submitted else (selected_pairs or None)
-    job_id = ProcessManager.create_job(
-        job_type="backup_exec",
-        title="Automatyczny Backup zdjęć i filmów do daf_backup/",
-        item_ids=[],
-        params={
-            "preferred_target_volume_id": pref_vid,
-            "target_volume_ids": parsed_targets,
-            "minimize_transfers": eff_minimize,
-            "strict_target_writes_only": eff_strict_target,
-            "selected_pairs": effective_pairs,
-        },
-        db=db,
-    )
+    job_params = {
+        "preferred_target_volume_id": pref_vid,
+        "target_volume_ids": parsed_targets,
+        "minimize_transfers": eff_minimize,
+        "strict_target_writes_only": eff_strict_target,
+        "selected_pairs": effective_pairs,
+    }
+    existing_wait_job = db.scalars(
+        select(BackgroundJob)
+        .where(
+            BackgroundJob.job_type == "backup_exec",
+            BackgroundJob.status.in_(["WAITING_FOR_DEVICE", "STOPPED"]),
+        )
+        .order_by(BackgroundJob.id.desc())
+        .limit(1)
+    ).first()
+    if existing_wait_job:
+        job_id = existing_wait_job.id
+        existing_wait_job.params_json = json.dumps(job_params, ensure_ascii=False)
+        existing_wait_job.status = "RUNNING"
+        existing_wait_job.last_message = "Wznawianie automatycznego backupu na podłączonych dyskach..."
+        db.commit()
+    else:
+        job_id = ProcessManager.create_job(
+            job_type="backup_exec",
+            title="Automatyczny Backup zdjęć i filmów do daf_backup/",
+            item_ids=[],
+            params=job_params,
+            db=db,
+        )
     exec_result = svc.execute_backup_and_deduplication(
         preferred_target_volume_id=pref_vid,
         job_id=job_id,
@@ -1771,7 +1810,8 @@ def execute_backup_action(
         ProcessManager.update_progress(
             job_id,
             status="WAITING_FOR_DEVICE",
-            message=f"Oczekiwanie na podłączenie kolejnej pary dysków (pozostało par: {exec_result['pending_offline_pairs_count']}).",
+            message=exec_result.get("waiting_message")
+            or f"Oczekiwanie na podłączenie kolejnej pary dysków (pozostało par: {exec_result['pending_offline_pairs_count']}).",
             db=db,
         )
     else:

@@ -5389,6 +5389,102 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertIn("daf-modal-header", r_home_g.text)
                 self.assertIn("daf-section-toggle", r_home_g.text)
 
+    def test_backup_offline_pair_prompt_status_and_resume(self):
+        with self.TestingSessionLocal() as db:
+            vol_src = WindowsVolume(
+                volume_serial_number="AA01-1111",
+                volume_label="SrcOfflineA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=False,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_dst = WindowsVolume(
+                volume_serial_number="BB02-2222",
+                volume_label="DstOfflineB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=False,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=80 * 1024**3,
+            )
+            db.add_all([vol_src, vol_dst])
+            db.commit()
+            db.refresh(vol_src)
+            db.refresh(vol_dst)
+
+            p1 = create_synthetic_jpeg(self.drive_a / "off_pair_1.jpg", color=(15, 35, 55))
+            p2 = create_synthetic_jpeg(self.drive_a / "off_pair_2.jpg", color=(65, 85, 105))
+            it1 = FileScannerService.process_file(p1, vol_src)
+            it2 = FileScannerService.process_file(p2, vol_src)
+            db.add_all([it1, it2])
+            db.commit()
+
+            # 1) Start backup while BOTH drives are offline (only unrelated SysC connected)
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"CC00-0001": ("C:\\", "SysC")}):
+                r_start = self.client.post(
+                    "/actions/execute-backup",
+                    data={
+                        "target_vols_submitted": "true",
+                        "target_volume_ids": [str(vol_dst.id)],
+                        "minimize_submitted": "true",
+                        "minimize_transfers": "true",
+                    },
+                )
+                self.assertEqual(r_start.status_code, 200)
+                self.assertIn("Podłączyłem wskazaną parę dysków — Kontynuuj backup", r_start.text)
+                self.assertIn("SrcOfflineA", r_start.text)
+                self.assertIn("DstOfflineB", r_start.text)
+
+                job = db.scalars(
+                    select(BackgroundJob)
+                    .where(BackgroundJob.job_type == "backup_exec")
+                    .order_by(BackgroundJob.id.desc())
+                    .limit(1)
+                ).first()
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "WAITING_FOR_DEVICE")
+                self.assertEqual(job.total_count, 2)
+                self.assertEqual(job.processed_count, 0)
+                self.assertIn("SrcOfflineA", job.last_message)
+                self.assertIn("DstOfflineB", job.last_message)
+
+                # 2) Clicking Resume while drives are STILL offline must keep WAITING_FOR_DEVICE (NOT COMPLETED 0/0)
+                r_resume_still_off = self.client.post(
+                    "/actions/process-control",
+                    data={"action": "resume", "job_id": str(job.id)},
+                )
+                self.assertEqual(r_resume_still_off.status_code, 200)
+                db.expire_all()
+                job_still = db.get(BackgroundJob, job.id)
+                self.assertEqual(job_still.status, "WAITING_FOR_DEVICE")
+                self.assertEqual(job_still.total_count, 2)
+                self.assertIn("SrcOfflineA", job_still.last_message)
+                self.assertIn("DstOfflineB", job_still.last_message)
+
+            # 3) Connect both drives and click Resume in Status panel -> must actually copy backups & mark COMPLETED 2/2
+            vsn_both = {
+                "AA01-1111": (str(self.drive_a), "SrcOfflineA"),
+                "BB02-2222": (str(self.drive_b), "DstOfflineB"),
+            }
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+                r_resume_online = self.client.post(
+                    "/actions/process-control",
+                    data={"action": "resume", "job_id": str(job.id)},
+                )
+                self.assertEqual(r_resume_online.status_code, 200)
+                db.expire_all()
+                job_done = db.get(BackgroundJob, job.id)
+                self.assertEqual(job_done.status, "COMPLETED")
+                self.assertEqual(job_done.processed_count, 2)
+                self.assertEqual(job_done.total_count, 2)
+
+                bkp_items = list(
+                    db.scalars(
+                        select(MediaItem).where(MediaItem.is_backup_copy == True, MediaItem.volume_id == vol_dst.id)
+                    ).all()
+                )
+                self.assertEqual(len(bkp_items), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
