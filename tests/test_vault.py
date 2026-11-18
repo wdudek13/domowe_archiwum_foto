@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 import numpy as np
 from PIL import Image, JpegImagePlugin
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.orm import sessionmaker, Session
 
 from app.database import Base, ensure_schema_migrations, get_db, set_sqlite_pragma
@@ -4947,6 +4947,283 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(len(res_i0["offline_items"]), 1)
                 self.assertEqual(res_i0["offline_ids"], [it_i0_4.id])
                 spy_flag.assert_not_called()
+
+    def test_quality_defect_clear_offline_drive_queues_sidebar_reset_and_semantic_backup_filter(self):
+        with self.TestingSessionLocal() as db:
+            vol_on = WindowsVolume(
+                volume_serial_number="ON11-0001",
+                volume_label="OnlineMain",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=50 * 1024**3,
+            )
+            vol_off1 = WindowsVolume(
+                volume_serial_number="OF11-0002",
+                volume_label="OffDriveAlpha",
+                last_known_drive_letter=str(self.root / "OfflineMissingAlpha"),
+                is_online=False,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=10 * 1024**3,
+            )
+            vol_off2 = WindowsVolume(
+                volume_serial_number="OF22-0003",
+                volume_label="OffDriveBeta",
+                last_known_drive_letter=str(self.root / "OfflineMissingBeta"),
+                is_online=False,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=10 * 1024**3,
+            )
+            db.add_all([vol_on, vol_off1, vol_off2])
+            db.commit()
+            db.refresh(vol_on)
+            db.refresh(vol_off1)
+            db.refresh(vol_off2)
+
+            vsn_online_only = {"ON11-0001": (str(self.drive_a), "OnlineMain")}
+
+            # 1) Item 1: Clear quality defects (single, filtered defect sub-view, selected batch)
+            p_corr = create_synthetic_jpeg(self.drive_a / "corr_fix.jpg", color=(80, 90, 100))
+            p_blur = create_synthetic_jpeg(self.drive_a / "blur_fix.jpg", color=(100, 110, 120))
+            p_dark = create_synthetic_jpeg(self.drive_a / "dark_fix.jpg", color=(20, 25, 30))
+            it_corr = FileScannerService.process_file(p_corr, vol_on)
+            it_corr.is_corrupted = True
+            it_corr.blur_score = None
+            it_corr.duplicate_role = "original"
+            it_blur = FileScannerService.process_file(p_blur, vol_on)
+            it_blur.is_blurry = True
+            it_blur.blur_score = 18.5
+            it_blur.duplicate_role = "original"
+            it_dark = FileScannerService.process_file(p_dark, vol_on)
+            it_dark.is_blurry = False
+            it_dark.blur_score = 78.0
+            it_dark.duplicate_role = "original"
+            db.add_all([it_corr, it_blur, it_dark])
+            db.commit()
+
+            db.add_all([
+                MediaTag(media_id=it_corr.id, tag="do_usuniecia", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_corr.id, tag="do_usuniecia:uszkodzone", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_blur.id, tag="do_usuniecia", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_blur.id, tag="do_usuniecia:rozmyte", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_dark.id, tag="do_usuniecia", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_dark.id, tag="do_usuniecia:niedoswietlone", confidence=1.0, source_model="quality_check"),
+                MediaTag(media_id=it_dark.id, tag="krajobraz", confidence=0.95, source_model="clip"),
+            ])
+            db.commit()
+
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_online_only):
+                r_detail = self.client.get(f"/media/{it_corr.id}/detail")
+                self.assertEqual(r_detail.status_code, 200)
+                self.assertIn("Oznacz jako bez wady / nieuszkodzone", r_detail.text)
+
+                r_grid_def = self.client.get("/media/search?quality_defect=uszkodzone")
+                self.assertEqual(r_grid_def.status_code, 200)
+                self.assertIn("corr_fix.jpg", r_grid_def.text)
+                self.assertIn("/actions/clear-quality-defect", r_grid_def.text)
+                self.assertIn("✓ Bez wady", r_grid_def.text)
+
+                r_tbl_def = self.client.get("/media/search?view_mode=table&quality_defect=uszkodzone")
+                self.assertEqual(r_tbl_def.status_code, 200)
+                self.assertIn("✓ Bez wady", r_tbl_def.text)
+
+                # Clear single item by media_id
+                r_cls1 = self.client.post("/actions/clear-quality-defect", data={"media_id": it_corr.id})
+                self.assertEqual(r_cls1.status_code, 200)
+                self.assertEqual(r_cls1.headers.get("HX-Trigger"), "refresh-all")
+                db.expire_all()
+                it_corr_db = db.get(MediaItem, it_corr.id)
+                self.assertFalse(it_corr_db.is_corrupted)
+                self.assertFalse(it_corr_db.is_blurry)
+                self.assertEqual(it_corr_db.blur_score, 100.0)
+                self.assertEqual(
+                    list(db.scalars(select(MediaTag.tag).where(MediaTag.media_id == it_corr.id)).all()),
+                    [],
+                )
+
+                # Must NOT show up as unanalyzed quality after being cleared
+                r_unan = self.client.get("/media/search?unanalyzed_quality_only=true")
+                self.assertEqual(r_unan.status_code, 200)
+                self.assertNotIn("corr_fix.jpg", r_unan.text)
+
+                # Clear filtered view (only niedoswietlone), preserving blur_score >= 45 and non-defect tags
+                r_cls_dark = self.client.post(
+                    "/actions/clear-quality-defect",
+                    data={"scope": "filtered", "quality_defect": "niedoswietlone"},
+                )
+                self.assertEqual(r_cls_dark.status_code, 200)
+                db.expire_all()
+                it_dark_db = db.get(MediaItem, it_dark.id)
+                self.assertEqual(it_dark_db.blur_score, 78.0)
+                self.assertEqual(
+                    list(db.scalars(select(MediaTag.tag).where(MediaTag.media_id == it_dark.id)).all()),
+                    ["krajobraz"],
+                )
+                # Blurry item was NOT in niedoswietlone and remains intact
+                self.assertTrue(db.get(MediaItem, it_blur.id).is_blurry)
+
+                # Clear selected batch
+                r_cls_blur = self.client.post(
+                    "/actions/clear-quality-defect",
+                    data={"scope": "selected", "selected_ids": [it_blur.id]},
+                )
+                self.assertEqual(r_cls_blur.status_code, 200)
+                db.expire_all()
+                it_blur_db = db.get(MediaItem, it_blur.id)
+                self.assertFalse(it_blur_db.is_blurry)
+                self.assertEqual(it_blur_db.blur_score, 100.0)
+                self.assertEqual(
+                    list(db.scalars(select(MediaTag.tag).where(MediaTag.media_id == it_blur.id)).all()),
+                    [],
+                )
+
+            # 2) Item 2: Ordered offline drive queues (page 1 vs entire multi-page view)
+            # Clear prior test items so page 1 / page 2 counts are exact
+            db.execute(delete(MediaTag))
+            db.execute(delete(MediaItem))
+            db.commit()
+
+            base_dt = datetime.datetime(2025, 5, 1, 12, 0, 0)
+            queue_items = []
+            # Page 1 (top 10 newest): 6 on OffDriveAlpha, 2 on OffDriveBeta, 2 on OnlineMain
+            specs_p1 = (
+                [vol_off1.id] * 6
+                + [vol_off2.id] * 2
+                + [vol_on.id] * 2
+            )
+            # Page 2 (next 5 older): 5 on OffDriveBeta -> full view totals Beta=7, Alpha=6
+            specs_p2 = [vol_off2.id] * 5
+            for idx, vid_q in enumerate(specs_p1 + specs_p2):
+                dt_i = base_dt - datetime.timedelta(minutes=idx)
+                fname_i = f"queue_{idx:02d}.jpg"
+                queue_items.append(
+                    MediaItem(
+                        id=str(uuid.uuid4()),
+                        volume_id=vid_q,
+                        relative_path=fname_i,
+                        file_name=fname_i,
+                        file_size_bytes=1024,
+                        media_type="image",
+                        mime_type="image/jpeg",
+                        file_hash=f"qh_{idx:04d}" + ("0" * 57),
+                        hash_algorithm="sha256",
+                        fs_ctime=dt_i,
+                        fs_mtime=dt_i,
+                        effective_date=dt_i,
+                        thumbnail_relative_path=f"q_{idx}.webp",
+                        duplicate_role="original",
+                        is_primary_duplicate=True,
+                        is_backup_copy=False,
+                        blur_score=95.0,
+                    )
+                )
+            db.add_all(queue_items)
+            db.commit()
+
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_online_only):
+                r_q_page1 = self.client.get("/media/search?page=1&page_size=10")
+                self.assertEqual(r_q_page1.status_code, 200)
+                txt_p1 = r_q_page1.text
+                self.assertIn("Dyski offline wymagane do podglądu oryginałów w kolejności", txt_p1)
+                self.assertIn("Pierwsza zakładka / bieżąca strona", txt_p1)
+                self.assertIn("Cały aktywny widok / filtr", txt_p1)
+                p1_sec, view_sec = txt_p1.split("Cały aktywny widok / filtr", 1)
+                # On page 1: OffDriveAlpha (6) must precede OffDriveBeta (2)
+                self.assertIn("6 szt.", p1_sec)
+                self.assertIn("2 szt.", p1_sec)
+                self.assertLess(p1_sec.index("OffDriveAlpha"), p1_sec.index("OffDriveBeta"))
+                # On full view: OffDriveBeta (7) must precede OffDriveAlpha (6)
+                self.assertIn("7 szt.", view_sec)
+                self.assertIn("6 szt.", view_sec)
+                self.assertLess(view_sec.index("OffDriveBeta"), view_sec.index("OffDriveAlpha"))
+
+            # 3) Item 3 & 4: Unanalyzed quality visibility + sidebar backup exclusion + semantic search hiding backups
+            p_dji_orig = create_synthetic_jpeg(self.drive_a / "DJI_20250101_001.jpg", color=(40, 80, 120))
+            p_dji_vault = self.drive_a / "daf_backup" / "2025" / "01" / "01" / "DJI_20250101_vault.jpg"
+            p_dji_vault.parent.mkdir(parents=True, exist_ok=True)
+            p_dji_vault.write_bytes(p_dji_orig.read_bytes())
+            p_dji_green = create_synthetic_jpeg(self.drive_a / "DJI_20250101_green.jpg", color=(45, 85, 125))
+            p_dji_orange = create_synthetic_jpeg(self.drive_a / "DJI_20250101_orange.jpg", color=(50, 90, 130))
+
+            it_dji_orig = FileScannerService.process_file(p_dji_orig, vol_on)
+            it_dji_orig.duplicate_role = "original"
+            it_dji_orig.blur_score = 88.0
+
+            it_dji_vault = FileScannerService.process_file(p_dji_vault, vol_on)
+            it_dji_vault.duplicate_role = "backup_green"
+            it_dji_vault.is_backup_copy = True
+            it_dji_vault.blur_score = None
+            it_dji_vault.has_date_anomaly = True
+
+            it_dji_green = FileScannerService.process_file(p_dji_green, vol_on)
+            it_dji_green.duplicate_role = "backup_green"
+            it_dji_green.is_backup_copy = False
+            it_dji_green.blur_score = None
+            it_dji_green.has_date_anomaly = True
+
+            it_dji_orange = FileScannerService.process_file(p_dji_orange, vol_on)
+            it_dji_orange.duplicate_role = "backup_orange"
+            it_dji_orange.is_backup_copy = False
+            it_dji_orange.blur_score = None
+            it_dji_orange.has_date_anomaly = True
+
+            it_unan_recycle = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_on.id,
+                relative_path="$RECYCLE.BIN/S-1-5-21/$RZUR758.jpg",
+                file_name="$RZUR758.jpg",
+                file_size_bytes=512,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="unan_" + ("a" * 59),
+                hash_algorithm="sha256",
+                fs_ctime=base_dt,
+                fs_mtime=base_dt,
+                effective_date=base_dt,
+                thumbnail_relative_path="rzur.webp",
+                duplicate_role="original",
+                is_primary_duplicate=True,
+                is_backup_copy=False,
+                blur_score=None,
+                is_corrupted=False,
+            )
+            db.add_all([it_dji_orig, it_dji_vault, it_dji_green, it_dji_orange, it_unan_recycle])
+            db.commit()
+
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_online_only):
+                # Sidebar count for Wszystkie multimedia = 15 queue_items + DJI_001 + $RZUR758 = 17 (NOT 19 with outside backups!)
+                r_sb_cons = self.client.get("/media/sidebar")
+                self.assertEqual(r_sb_cons.status_code, 200)
+                self.assertIn(">17<", r_sb_cons.text)
+                self.assertIn(">1<", r_sb_cons.text)  # unanalyzed_quality count == 1 ($RZUR758.jpg), excluding backup_green/orange
+
+                r_unan_only = self.client.get("/media/search?unanalyzed_quality_only=true&q=")
+                self.assertEqual(r_unan_only.status_code, 200)
+                self.assertIn("$RZUR758.jpg", r_unan_only.text)
+                self.assertNotIn("DJI_20250101_green.jpg", r_unan_only.text)
+
+                # Semantic search MUST hide daf_backup, backup_green, and backup_orange by default
+                r_sem_hide = self.client.get("/semantic/search?q=DJI_20250101")
+                self.assertEqual(r_sem_hide.status_code, 200)
+                self.assertIn("DJI_20250101_001.jpg", r_sem_hide.text)
+                self.assertIn("DJI_20250101", r_sem_hide.text)
+                self.assertNotIn("DJI_20250101_vault.jpg", r_sem_hide.text)
+                self.assertNotIn("DJI_20250101_green.jpg", r_sem_hide.text)
+                self.assertNotIn("DJI_20250101_orange.jpg", r_sem_hide.text)
+
+                # When backup_filter=all_with_backups is enabled, semantic search displays backups too
+                r_sem_all = self.client.get("/semantic/search?q=DJI_20250101&backup_filter=all_with_backups")
+                self.assertEqual(r_sem_all.status_code, 200)
+                self.assertIn("DJI_20250101_001.jpg", r_sem_all.text)
+                self.assertIn("DJI_20250101_vault.jpg", r_sem_all.text)
+                self.assertIn("DJI_20250101_green.jpg", r_sem_all.text)
+                self.assertIn("DJI_20250101_orange.jpg", r_sem_all.text)
+
+                # Home HTML includes reset of 'q' and stopPropagation on #main-search-input
+                r_home_html = self.client.get("/")
+                self.assertEqual(r_home_html.status_code, 200)
+                self.assertIn("['q', 'volume_id'", r_home_html.text)
+                self.assertIn("onchange=\"event.stopPropagation()\"", r_home_html.text)
 
 
 if __name__ == "__main__":

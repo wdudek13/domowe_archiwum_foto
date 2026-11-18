@@ -10,8 +10,13 @@ import numpy as np
 from app.database import get_db, THUMBNAILS_DIR
 from app.models import MediaEmbedding, MediaItem, MediaTag, MediaGroup, WindowsVolume
 from app.ai.embeddings import OnDemandClipEmbedder
-from app.ai.tagger import PL_CATEGORY_MAPPING
-from app.routers.media import render_template, build_flat_album_choices
+from app.routers.media import (
+    render_template,
+    build_flat_album_choices,
+    build_search_context,
+    build_offline_drives_queues,
+    _build_cross_vault_backup_map,
+)
 
 logger = logging.getLogger("SemanticRouter")
 router = APIRouter(prefix="/semantic", tags=["Semantic Search"])
@@ -119,6 +124,13 @@ def find_visually_similar(
             .where(
                 MediaItem.is_trashed == False,
                 or_(
+                    MediaItem.id == target_item.id,
+                    and_(
+                        MediaItem.is_backup_copy == False,
+                        MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+                    ),
+                ),
+                or_(
                     and_(MediaItem.effective_date >= time_low, MediaItem.effective_date <= time_high),
                     MediaItem.relative_path.ilike(f"{target_parent_dir}/%") if target_parent_dir else False,
                 ),
@@ -154,7 +166,17 @@ def find_visually_similar(
                 joinedload(MediaItem.tags),
                 joinedload(MediaItem.embedding),
             )
-            .where(MediaItem.id.in_(list(contextual_ids)), MediaItem.is_trashed == False)
+            .where(
+                MediaItem.id.in_(list(contextual_ids)),
+                MediaItem.is_trashed == False,
+                or_(
+                    MediaItem.id == target_item.id,
+                    and_(
+                        MediaItem.is_backup_copy == False,
+                        MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+                    ),
+                ),
+            )
         ).unique().all()
     )
 
@@ -247,6 +269,10 @@ def find_visually_similar(
     scores_map = {x[0].id: x[1] for x in top_matches}
     total_bytes = sum(it.file_size_bytes for it in sorted_items)
     all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all())
+    all_volumes = list(db.scalars(select(WindowsVolume)).all())
+    sim_vol_counts = defaultdict(int)
+    for it in sorted_items:
+        sim_vol_counts[it.volume_id] += 1
 
     label = f"{SIMILARITY_MODES[mode]} — Wzorzec (100%): {target_item.file_name}"
     return render_template(
@@ -268,75 +294,15 @@ def find_visually_similar(
             "similarity_modes": SIMILARITY_MODES,
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
-            "all_volumes": list(db.scalars(select(WindowsVolume)).all()),
+            "all_volumes": all_volumes,
+            "offline_drives_info": build_offline_drives_queues(sorted_items, sim_vol_counts, all_volumes),
+            "cross_vault_backup_by_item_id": _build_cross_vault_backup_map(db, sorted_items),
             "similarity_scores": scores_map,
         },
     )
 
 
 @router.get("/search")
-def semantic_search(request: Request, q: str = Query(...), db: Session = Depends(get_db)):
-    clean_q = q.strip().lower()
-    if not clean_q:
-        return render_template(
-            request,
-            "partials/media_grid.html",
-            {
-                "timeline": {},
-                "items_flat": [],
-                "total_matching": 0,
-                "total_size_mb": 0,
-                "page": 1,
-                "total_pages": 1,
-                "view_mode": "grid",
-                "similarity_scores": {},
-            },
-        )
-
-    search_terms = [clean_q]
-    for pl_cat, en_words in PL_CATEGORY_MAPPING.items():
-        if clean_q in pl_cat or any(clean_q in w or w in clean_q for w in en_words):
-            search_terms.append(pl_cat)
-            search_terms.extend(en_words)
-
-    conds = [MediaItem.file_name.ilike(f"%{clean_q}%"), MediaItem.relative_path.ilike(f"%{clean_q}%")]
-    for term in set(search_terms):
-        conds.append(MediaTag.tag.ilike(f"%{term}%"))
-
-    matched_items = list(
-        db.scalars(
-            select(MediaItem)
-            .options(joinedload(MediaItem.volume), joinedload(MediaItem.group), joinedload(MediaItem.tags), joinedload(MediaItem.embedding))
-            .outerjoin(MediaItem.tags)
-            .where(MediaItem.is_trashed == False, or_(*conds))
-            .distinct()
-            .limit(150)
-        ).unique().all()
-    )
-
-    grouped = defaultdict(list)
-    total_bytes = 0
-    for it in matched_items:
-        grouped[it.effective_date.strftime("%Y-%m-%d")].append(it)
-        total_bytes += it.file_size_bytes
-
-    all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all())
-    return render_template(
-        request,
-        "partials/media_grid.html",
-        {
-            "timeline": dict(grouped),
-            "items_flat": matched_items,
-            "total_matching": len(matched_items),
-            "total_size_mb": total_bytes / (1024 * 1024),
-            "page": 1,
-            "page_size": 150,
-            "total_pages": 1,
-            "view_mode": "grid",
-            "sort_by": "semantic",
-            "all_groups": all_groups,
-            "flat_album_choices": build_flat_album_choices(all_groups),
-            "all_volumes": list(db.scalars(select(WindowsVolume)).all()),
-            "similarity_scores": {},
-        },
-    )
+def semantic_search(request: Request, q: str = Query(""), db: Session = Depends(get_db)):
+    """Live search endpoint sharing all gallery & backup-visibility filters with /media/search."""
+    return render_template(request, "partials/media_grid.html", build_search_context(request, db))

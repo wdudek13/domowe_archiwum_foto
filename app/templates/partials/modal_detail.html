@@ -96,20 +96,30 @@
                 </div>
 
                 <!-- Diagnostyka jakości i wady (Kandydat do usunięcia) -->
-                {% if defect_labels %}
+                {% if defect_labels or item.is_corrupted or item.is_blurry %}
                 <div class="mt-3 p-3 rounded-xl bg-orange-950/30 border border-orange-700/60 space-y-2">
-                    <div class="flex items-center justify-between">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
                         <div class="font-bold text-orange-300 text-xs flex items-center space-x-1.5">
                             <span>⚠️ Wykryte wady jakości (kandydat do usunięcia):</span>
                         </div>
-                        <button type="button"
-                                hx-post="/actions/move-to-trash"
-                                hx-vals='{"scope": "selected", "selected_ids": "{{ item.id }}"}'
-                                hx-target="#global-notification"
-                                onclick="this.closest('.fixed').remove();"
-                                class="bg-rose-800 hover:bg-rose-700 text-white text-[11px] px-2.5 py-1 rounded font-semibold shadow">
-                            🗑️ Przenieś do Kosza
-                        </button>
+                        <div class="flex items-center space-x-1.5">
+                            <button type="button"
+                                    hx-post="/actions/clear-quality-defect"
+                                    hx-vals='{"media_id": "{{ item.id }}"}'
+                                    hx-target="#global-notification"
+                                    hx-on::after-request="if(event.detail.successful) htmx.ajax('GET', '/media/{{ item.id }}/detail', {target: '#modal-container', swap: 'innerHTML'})"
+                                    class="bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] px-2.5 py-1 rounded font-semibold shadow">
+                                ✓ Oznacz jako bez wady / nieuszkodzone
+                            </button>
+                            <button type="button"
+                                    hx-post="/actions/move-to-trash"
+                                    hx-vals='{"scope": "selected", "selected_ids": "{{ item.id }}"}'
+                                    hx-target="#global-notification"
+                                    onclick="this.closest('.fixed').remove();"
+                                    class="bg-rose-800 hover:bg-rose-700 text-white text-[11px] px-2.5 py-1 rounded font-semibold shadow">
+                                🗑️ Przenieś do Kosza
+                            </button>
+                        </div>
                     </div>
                     <div class="flex flex-wrap gap-1.5">
                         {% for d in defect_labels %}

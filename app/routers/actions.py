@@ -12,7 +12,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from sqlalchemy import select, delete, update, text
+from sqlalchemy import select, delete, update, text, or_
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
@@ -115,6 +115,7 @@ def _resolve_bulk_ids_fast(
     unbacked_only: bool = False,
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
+    quality_defect: Optional[str] = None,
     selected_ids_json: Optional[str] = None,
     redundant_clusters_only: bool = False,
     backups_to_move_only: bool = False,
@@ -152,6 +153,7 @@ def _resolve_bulk_ids_fast(
             unbacked_only,
             unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
+            quality_defect=quality_defect,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
             backup_filter=backup_filter,
@@ -181,6 +183,7 @@ def resolve_target_items(
     unbacked_only: bool = False,
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
+    quality_defect: Optional[str] = None,
     limit: Optional[int] = None,
     selected_ids_json: Optional[str] = None,
     redundant_clusters_only: bool = False,
@@ -220,6 +223,7 @@ def resolve_target_items(
             unbacked_only,
             unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
+            quality_defect=quality_defect,
             redundant_clusters_only=redundant_clusters_only,
             backups_to_move_only=backups_to_move_only,
             backup_filter=backup_filter,
@@ -4189,3 +4193,75 @@ def verify_deleted_duplicates_action(db: Session = Depends(get_db)):
         f"{snap_note}"
         f"</div>"
     )
+
+
+@router.post("/clear-quality-defect")
+async def clear_quality_defect_action(request: Request, db: Session = Depends(get_db)):
+    """Marks selected/filtered items (or a single media_id) as defect-free without trashing files."""
+    form = await _read_large_form(request)
+    media_id = _form_str(form, "media_id")
+    if media_id and media_id.strip():
+        item_ids = [media_id.strip()]
+    else:
+        item_ids = _resolve_bulk_ids_fast(
+            db,
+            scope=_form_str(form, "scope", "selected") or "selected",
+            selected_ids=[str(x) for x in form.getlist("selected_ids")],
+            q=_form_str(form, "q"),
+            media_type=_form_str(form, "media_type", "all") or "all",
+            volume_id=_form_str(form, "volume_id"),
+            folder_prefix=_form_str(form, "folder_prefix"),
+            group_id=_form_str(form, "group_id"),
+            tag=_form_str(form, "tag"),
+            year=_form_str(form, "year"),
+            anomaly_only=_form_bool(form, "anomaly_only"),
+            blurry_only=_form_bool(form, "blurry_only"),
+            duplicates_only=_form_bool(form, "duplicates_only"),
+            untagged_only=_form_bool(form, "untagged_only"),
+            ungrouped_only=_form_bool(form, "ungrouped_only"),
+            unbacked_only=_form_bool(form, "unbacked_only"),
+            unvectored_only=_form_bool(form, "unvectored_only"),
+            unanalyzed_quality_only=_form_bool(form, "unanalyzed_quality_only"),
+            quality_defect=_form_str(form, "quality_defect"),
+            selected_ids_json=_form_str(form, "selected_ids_json"),
+            redundant_clusters_only=_form_bool(form, "redundant_clusters_only"),
+            backups_to_move_only=_form_bool(form, "backups_to_move_only"),
+            backup_filter=_form_str(form, "backup_filter", "none") or "none",
+            backup_types=[str(x) for x in form.getlist("backup_types")],
+            backup_mode=_form_str(form, "backup_mode", "hide") or "hide",
+            anomaly_type=_form_str(form, "anomaly_type", "all") or "all",
+        )
+
+    if not item_ids:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak plików do oznaczenia jako nieuszkodzone / bez wady.</span>")
+
+    for idx in range(0, len(item_ids), 5000):
+        chunk = item_ids[idx : idx + 5000]
+        db.execute(
+            update(MediaItem)
+            .where(MediaItem.id.in_(chunk))
+            .values(is_corrupted=False, is_blurry=False)
+        )
+        db.execute(
+            update(MediaItem)
+            .where(
+                MediaItem.id.in_(chunk),
+                or_(MediaItem.blur_score.is_(None), MediaItem.blur_score < 45.0),
+            )
+            .values(blur_score=100.0)
+        )
+        db.execute(
+            delete(MediaTag).where(
+                MediaTag.media_id.in_(chunk),
+                MediaTag.tag.ilike("do_usuniecia%"),
+            )
+        )
+
+    db.commit()
+    msg = f"Oznaczono jako bez wady / nieuszkodzone: {len(item_ids)} zdjęć."
+    OperationLogger.log("QUALITY_DEFECT_CLEAR", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>✓ {msg}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+

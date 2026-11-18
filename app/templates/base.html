@@ -349,10 +349,12 @@
             if (!form) return;
             clearPersistedSelection();
             if (paramsObj._reset) {
-                ['volume_id', 'folder_prefix', 'group_id', 'tag', 'quality_defect', 'year'].forEach(k => {
+                ['q', 'volume_id', 'folder_prefix', 'group_id', 'tag', 'quality_defect', 'year'].forEach(k => {
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.value = '';
                 });
+                const mtEl = form.querySelector("[name='media_type']");
+                if (mtEl) mtEl.value = 'all';
                 const bfEl = form.querySelector("[name='backup_filter']");
                 if (bfEl) bfEl.value = 'none';
                 const bmEl = form.querySelector("[name='backup_mode']");

@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, asc, select, or_, func, extract, and_
 from sqlalchemy.orm import Session, joinedload, aliased, load_only
 
+from app.ai.tagger import PL_CATEGORY_MAPPING
 from app.database import get_db, THUMBNAILS_DIR
 from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, DeletedDuplicateHistory
 from app.operation_log import ProcessManager
@@ -82,7 +83,11 @@ def compute_backup_and_dup_sidebar_stats(db: Session) -> dict:
     missing_backups = max(0, total_unique - green_backups - orange_backups)
     backups_to_relocate = green_outside_vault + orange_backups
     redundant_duplicates = counts[("duplicate", False)] + counts[("duplicate", True)]
-    total_all_gallery = sum(cnt for (_role, is_bkp), cnt in counts.items() if not is_bkp)
+    total_all_gallery = sum(
+        cnt
+        for (role, is_bkp), cnt in counts.items()
+        if not is_bkp and role not in ("backup_green", "backup_orange")
+    )
     total_dups_gallery = green_outside_vault + counts[("backup_orange", False)] + counts[("duplicate", False)]
     return {
         "total_unique": total_unique,
@@ -96,6 +101,57 @@ def compute_backup_and_dup_sidebar_stats(db: Session) -> dict:
         "redundant_duplicates": redundant_duplicates,
         "total_all_gallery": total_all_gallery,
         "total_dups_gallery": total_dups_gallery,
+    }
+
+
+def build_offline_drives_queues(
+    items_page: List[MediaItem],
+    view_vol_counts_map: dict,
+    all_volumes: List[WindowsVolume],
+) -> dict:
+    """
+    Computes two ordered queues (descending count) of offline drives needed to view
+    the originals: one for the current page/tab (`page_drives`) and one for the
+    entire active view/filter (`view_drives`).
+    """
+    vol_by_id = {v.id: v for v in all_volumes}
+    offline_vols = {vid: v for vid, v in vol_by_id.items() if not v.is_online}
+
+    page_counts = defaultdict(int)
+    for it in items_page:
+        if it.volume_id in offline_vols:
+            page_counts[it.volume_id] += 1
+
+    def _format_queue(counts_dict: dict) -> List[dict]:
+        rows = []
+        for vid, cnt in counts_dict.items():
+            vol = offline_vols.get(vid)
+            if not vol or not cnt or int(cnt) <= 0:
+                continue
+            rows.append(
+                {
+                    "volume_id": vid,
+                    "volume_label": vol.volume_label or f"Dysk #{vid}",
+                    "drive_letter": vol.last_known_drive_letter or "",
+                    "serial": vol.volume_serial_number or "",
+                    "count": int(cnt),
+                }
+            )
+        rows.sort(key=lambda r: (-r["count"], r["volume_label"].lower(), r["volume_id"]))
+        for idx, row in enumerate(rows, start=1):
+            row["order"] = idx
+        return rows
+
+    page_drives = _format_queue(page_counts)
+    view_drives = _format_queue(
+        {vid: cnt for vid, cnt in view_vol_counts_map.items() if vid in offline_vols}
+    )
+    return {
+        "has_offline": bool(page_drives or view_drives),
+        "page_drives": page_drives,
+        "view_drives": view_drives,
+        "page_offline_count": sum(r["count"] for r in page_drives),
+        "view_offline_count": sum(r["count"] for r in view_drives),
     }
 
 
@@ -362,6 +418,13 @@ def apply_media_filters(
         stmt = stmt.where(MediaItem.id.in_(get_unbacked_primary_ids_subquery()))
     if q and q.strip():
         clean_q = q.strip()
+        clean_q_low = clean_q.lower()
+        search_terms = [clean_q_low]
+        for pl_cat, en_words in PL_CATEGORY_MAPPING.items():
+            if clean_q_low in pl_cat or any(clean_q_low in w or w in clean_q_low for w in en_words):
+                search_terms.append(pl_cat)
+                search_terms.extend(en_words)
+
         del_hist_hashes = select(DeletedDuplicateHistory.file_hash).where(
             or_(
                 DeletedDuplicateHistory.file_name.ilike(f"%{clean_q}%"),
@@ -369,15 +432,17 @@ def apply_media_filters(
                 DeletedDuplicateHistory.volume_label.ilike(f"%{clean_q}%"),
             )
         )
-        stmt = stmt.outerjoin(MediaItem.tags).where(
-            or_(
-                MediaItem.file_name.ilike(f"%{clean_q}%"),
-                MediaItem.relative_path.ilike(f"%{clean_q}%"),
-                MediaItem.original_relative_path.ilike(f"%{clean_q}%"),
-                MediaTag.tag.ilike(f"%{clean_q}%"),
-                MediaItem.file_hash.in_(del_hist_hashes),
-            )
-        )
+        q_tag_alias = aliased(MediaTag)
+        q_conds = [
+            MediaItem.file_name.ilike(f"%{clean_q}%"),
+            MediaItem.relative_path.ilike(f"%{clean_q}%"),
+            MediaItem.original_relative_path.ilike(f"%{clean_q}%"),
+            MediaItem.file_hash.in_(del_hist_hashes),
+        ]
+        for term in sorted(set(search_terms)):
+            q_conds.append(q_tag_alias.tag.ilike(f"%{term}%"))
+
+        stmt = stmt.outerjoin(q_tag_alias, q_tag_alias.media_id == MediaItem.id).where(or_(*q_conds))
     return stmt
 
 
@@ -404,23 +469,28 @@ _SIDEBAR_CACHE: dict = {"stamp": None, "data": None}
 
 def _compute_sidebar_static_aggs(db: Session) -> dict:
     """Computes heavy sidebar counts and tag breakdowns using fast covering-index queries."""
+    gallery_visible = and_(
+        MediaItem.is_trashed == False,
+        MediaItem.is_backup_copy == False,
+        MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+    )
     vol_counts = dict(
         db.execute(
             select(MediaItem.volume_id, func.count(MediaItem.id))
-            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
+            .where(gallery_visible)
             .group_by(MediaItem.volume_id)
         ).all()
     )
     direct_counts = dict(
         db.execute(
             select(MediaItem.group_id, func.count(MediaItem.id))
-            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
+            .where(gallery_visible)
             .group_by(MediaItem.group_id)
         ).all()
     )
     years = db.execute(
         select(extract("year", MediaItem.effective_date).label("yr"), func.count(MediaItem.id))
-        .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
+        .where(gallery_visible)
         .group_by("yr")
         .order_by(desc("yr"))
     ).all()
@@ -430,8 +500,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
     total_anomalies = (
         db.scalar(
             select(func.count(MediaItem.id)).where(
-                MediaItem.is_trashed == False,
-                MediaItem.is_backup_copy == False,
+                gallery_visible,
                 MediaItem.has_date_anomaly == True,
             )
         )
@@ -442,8 +511,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
     total_blurry = (
         db.scalar(
             select(func.count(MediaItem.id)).where(
-                MediaItem.is_trashed == False,
-                MediaItem.is_backup_copy == False,
+                gallery_visible,
                 or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
             )
         )
@@ -453,8 +521,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
     total_unanalyzed_quality = (
         db.scalar(
             select(func.count(MediaItem.id)).where(
-                MediaItem.is_trashed == False,
-                MediaItem.is_backup_copy == False,
+                gallery_visible,
                 MediaItem.blur_score.is_(None),
                 MediaItem.is_corrupted == False,
             )
@@ -465,7 +532,11 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
     excl_ids = list(
         db.scalars(
             select(MediaItem.id).where(
-                or_(MediaItem.is_trashed == True, MediaItem.is_backup_copy == True)
+                or_(
+                    MediaItem.is_trashed == True,
+                    MediaItem.is_backup_copy == True,
+                    MediaItem.duplicate_role.in_(["backup_green", "backup_orange"]),
+                )
             )
         ).all()
     )
@@ -498,7 +569,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
             for t, c in db.execute(
                 select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
                 .join(MediaItem, MediaItem.id == MediaTag.media_id)
-                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model != "quality_check")
+                .where(gallery_visible, MediaTag.source_model != "quality_check")
                 .group_by(MediaTag.tag)
                 .order_by(desc("cnt"))
                 .limit(35)
@@ -508,7 +579,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
             db.execute(
                 select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)))
                 .join(MediaItem, MediaItem.id == MediaTag.media_id)
-                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model == "quality_check")
+                .where(gallery_visible, MediaTag.source_model == "quality_check")
                 .group_by(MediaTag.tag)
             ).all()
         )
@@ -516,15 +587,14 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
             db.scalar(
                 select(func.count(MediaEmbedding.media_id))
                 .join(MediaItem, MediaItem.id == MediaEmbedding.media_id)
-                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
+                .where(gallery_visible)
             )
             or 0
         )
         total_untagged = (
             db.scalar(
                 select(func.count(MediaItem.id)).where(
-                    MediaItem.is_trashed == False,
-                    MediaItem.is_backup_copy == False,
+                    gallery_visible,
                     ~MediaItem.id.in_(select(MediaTag.media_id).distinct()),
                 )
             )
@@ -533,8 +603,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
         total_unvectored = (
             db.scalar(
                 select(func.count(MediaItem.id)).where(
-                    MediaItem.is_trashed == False,
-                    MediaItem.is_backup_copy == False,
+                    gallery_visible,
                     ~MediaItem.id.in_(select(MediaEmbedding.media_id)),
                 )
             )
@@ -672,8 +741,13 @@ def build_search_context(request: Request, db: Session) -> dict:
     joins_tags = bool((q and q.strip()) or (tag and tag.strip()) or (quality_defect and quality_defect.strip()))
     if joins_tags:
         filtered_stmt = filtered_stmt.distinct()
-        count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
+        count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes, MediaItem.volume_id).subquery()
         set_stats = db.execute(select(func.count(count_subq.c.id), func.sum(count_subq.c.file_size_bytes))).one()
+        view_vol_counts_map = dict(
+            db.execute(
+                select(count_subq.c.volume_id, func.count(count_subq.c.id)).group_by(count_subq.c.volume_id)
+            ).all()
+        )
         redundant_dup_count_filtered = 0
         if duplicates_only:
             redundant_dup_count_filtered = (
@@ -688,6 +762,13 @@ def build_search_context(request: Request, db: Session) -> dict:
         set_stats = db.execute(
             filtered_stmt.with_only_columns(func.count(MediaItem.id), func.sum(MediaItem.file_size_bytes)).order_by(None)
         ).one()
+        view_vol_counts_map = dict(
+            db.execute(
+                filtered_stmt.with_only_columns(MediaItem.volume_id, func.count(MediaItem.id))
+                .order_by(None)
+                .group_by(MediaItem.volume_id)
+            ).all()
+        )
         redundant_dup_count_filtered = 0
         if duplicates_only:
             redundant_dup_count_filtered = (
@@ -785,6 +866,7 @@ def build_search_context(request: Request, db: Session) -> dict:
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
     deleted_dup_counts_by_hash, deleted_dup_matches_by_hash = _build_deleted_dup_history_map(db, items, q)
+    offline_drives_info = build_offline_drives_queues(items, view_vol_counts_map, all_volumes)
 
     return {
         "timeline": dict(grouped),
@@ -794,12 +876,14 @@ def build_search_context(request: Request, db: Session) -> dict:
         "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
         "deleted_dup_counts_by_hash": deleted_dup_counts_by_hash,
         "deleted_dup_matches_by_hash": deleted_dup_matches_by_hash,
+        "offline_drives_info": offline_drives_info,
         "total_size_mb": total_size_bytes / (1024 * 1024),
         "page": page_int,
         "page_size": page_size_int,
         "total_pages": total_pages,
         "view_mode": view_mode,
         "sort_by": sort_by,
+        "active_q": q,
         "active_group": active_group,
         "active_volume": active_volume,
         "active_tag": tag,

@@ -44,6 +44,15 @@
             {% if unanalyzed_quality_only %}
                 <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🔍 Niezbadana jakość / ostrość</span>
             {% endif %}
+            {% if active_q and active_q.strip() %}
+                <span class="inline-flex items-center space-x-1 bg-indigo-950 text-indigo-200 border border-indigo-600 px-2 py-0.5 rounded-full">
+                    <span>🔍 Szukaj: &bdquo;{{ active_q }}&rdquo;</span>
+                    <button type="button"
+                            title="Wyczyść frazę wyszukiwania"
+                            onclick="const qEl=document.getElementById('main-search-input'); if(qEl){qEl.value='';} htmx.trigger(document.getElementById('filter-form'), 'submit');"
+                            class="text-indigo-300 hover:text-white font-bold ml-1">✕</button>
+                </span>
+            {% endif %}
             {% if backup_mode is defined and backup_mode != 'hide' %}
                 <span class="bg-teal-950 text-teal-300 border border-teal-700 px-2 py-0.5 rounded-full">
                     🛡️ Backupy ({{ 'Tylko backupy' if backup_mode == 'only' else 'Wraz z oryginałami' }}{% if backup_types %}: {{ backup_types|join(', ') }}{% endif %})
@@ -59,6 +68,60 @@
         </div>
         {% endif %}
     </div>
+
+    <!-- Kolejność dysków offline wymaganych do zobaczenia oryginałów -->
+    {% if offline_drives_info is defined and offline_drives_info.has_offline %}
+    <div class="bg-slate-900/90 border border-amber-700/60 px-4 py-2.5 rounded-xl text-xs space-y-1.5">
+        <div class="font-bold text-amber-300 flex items-center justify-between flex-wrap gap-2">
+            <span>🔌 Dyski offline wymagane do podglądu oryginałów w kolejności (wg liczby plików):</span>
+            <span class="text-[10px] font-normal text-slate-400">Podłącz nośnik Windows, aby wyświetlić oryginalne pliki RAW/JPG/wideo zamiast miniatur</span>
+        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-2 text-[11px]">
+            <div class="bg-slate-950/70 border border-borderBg/80 rounded-lg px-2.5 py-1.5">
+                <div class="text-slate-300 font-semibold mb-1">
+                    1️⃣ Pierwsza zakładka / bieżąca strona (Strona {{ page }}/{{ total_pages }} &mdash; {{ offline_drives_info.page_offline_count }} szt.):
+                </div>
+                {% if offline_drives_info.page_drives %}
+                <div class="flex flex-wrap gap-1.5">
+                    {% for d in offline_drives_info.page_drives %}
+                    <button type="button"
+                            onclick="applySidebarFilter({volume_id: '{{ d.volume_id }}'})"
+                            title="Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }})"
+                            class="inline-flex items-center space-x-1 bg-amber-950/70 hover:bg-amber-900/80 border border-amber-700/60 text-amber-200 px-2 py-0.5 rounded-md font-mono transition">
+                        <span class="font-bold text-amber-400">{{ d.order }}.</span>
+                        <span>{{ d.volume_label }} ({{ d.drive_letter }})</span>
+                        <span class="text-slate-300 font-sans">&mdash; {{ d.count }} szt.</span>
+                    </button>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <span class="text-emerald-400">✓ Wszystkie oryginały na bieżącej stronie są ONLINE.</span>
+                {% endif %}
+            </div>
+            <div class="bg-slate-950/70 border border-borderBg/80 rounded-lg px-2.5 py-1.5">
+                <div class="text-slate-300 font-semibold mb-1">
+                    2️⃣ Cały aktywny widok / filtr (łącznie {{ offline_drives_info.view_offline_count }} szt.):
+                </div>
+                {% if offline_drives_info.view_drives %}
+                <div class="flex flex-wrap gap-1.5">
+                    {% for d in offline_drives_info.view_drives %}
+                    <button type="button"
+                            onclick="applySidebarFilter({volume_id: '{{ d.volume_id }}'})"
+                            title="Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }})"
+                            class="inline-flex items-center space-x-1 bg-slate-800/90 hover:bg-slate-700 border border-amber-700/40 text-amber-100 px-2 py-0.5 rounded-md font-mono transition">
+                        <span class="font-bold text-amber-400">{{ d.order }}.</span>
+                        <span>{{ d.volume_label }} ({{ d.drive_letter }})</span>
+                        <span class="text-slate-300 font-sans">&mdash; {{ d.count }} szt.</span>
+                    </button>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <span class="text-emerald-400">✓ Brak plików offline w aktywnym widoku.</span>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
 
     <!-- Pasek narzędzi Wad Jakości (Kandydaci do usunięcia) -->
     {% if (active_tag and active_tag.startswith('do_usuniecia')) or active_quality_defect or blurry_only %}
@@ -83,6 +146,13 @@
                     onclick="selectAllVisible(true)"
                     class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg font-medium border border-borderBg">
                 ☑️ Zaznacz widoczne
+            </button>
+            <button type="button"
+                    hx-post="/actions/clear-quality-defect"
+                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-target="#global-notification"
+                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-3.5 py-1.5 rounded-lg font-semibold shadow">
+                ✓ Oznacz jako bez wady / nieuszkodzone
             </button>
             <button type="button"
                     hx-post="/actions/move-to-trash"
@@ -611,6 +681,14 @@
                         {% if 'do_usuniecia:niska_rozdzielczosc' in d_tags %}
                             <span class="bg-purple-950 text-purple-200 border border-purple-700 font-bold px-1 py-0.5 rounded text-[10px]" title="Niska rozdzielczość (<160px)">🔍 MINI</span>
                         {% endif %}
+                        {% if d_tags or item.is_corrupted or item.is_blurry %}
+                            <button type="button"
+                                    hx-post="/actions/clear-quality-defect"
+                                    hx-vals='{"media_id": "{{ item.id }}"}'
+                                    hx-target="#global-notification"
+                                    title="Oznacz zdjęcie jako bez wady / nieuszkodzone"
+                                    class="text-[10px] bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-1.5 py-0.5 rounded font-semibold">✓ Bez wady</button>
+                        {% endif %}
                         {% if item.embedding %}<span class="bg-purple-900/90 text-purple-200 px-1 rounded text-[9px] font-mono">512D</span>{% endif %}
                         {% if item.has_date_anomaly %}
                             <span class="bg-amber-500 text-black font-bold px-1 rounded text-[10px]" title="{{ item.date_anomaly_reason }}">! Data</span>
@@ -855,6 +933,19 @@
                         <div class="text-[9px] text-sky-400/90 font-mono truncate cursor-pointer hover:underline"
                              hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container">
                             🗂️ Usunięte kopie: {{ deleted_dup_counts_by_hash[item.file_hash] }}
+                        </div>
+                        {% endif %}
+
+                        {% if d_tags or item.is_corrupted or item.is_blurry %}
+                        <div class="flex justify-end">
+                            <button type="button"
+                                    hx-post="/actions/clear-quality-defect"
+                                    hx-vals='{"media_id": "{{ item.id }}"}'
+                                    hx-target="#global-notification"
+                                    title="Oznacz zdjęcie jako bez wady / nieuszkodzone"
+                                    class="text-[9px] bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-1.5 py-0.5 rounded font-semibold transition">
+                                ✓ Bez wady
+                            </button>
                         </div>
                         {% endif %}
 

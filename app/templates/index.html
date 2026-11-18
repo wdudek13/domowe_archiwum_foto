@@ -39,6 +39,7 @@
             <div class="flex items-center space-x-1">
                 <input type="text" id="main-search-input" name="q" placeholder="Szukaj (np. osoba, natura, morze, pies, IMG)..."
                        hx-get="/semantic/search" hx-target="#media-grid" hx-trigger="keyup changed delay:250ms" hx-include="#filter-form"
+                       onchange="event.stopPropagation()"
                        class="bg-slate-900 border border-borderBg rounded-lg px-3 py-1.5 w-60 focus:outline-none focus:border-indigo-500">
             </div>
 
