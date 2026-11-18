@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 import logging
 import sys
+import threading
 import traceback
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -8,6 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
+import app.database as db_module
 from app.database import BASE_DIR, engine, Base, get_db, THUMBNAILS_DIR, ensure_schema_migrations
 from app.operation_log import OperationLogger
 from app.routers import media, actions, semantic
@@ -31,6 +33,16 @@ async def lifespan(_app: FastAPI):
     run_safe_migrations()
     THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
     OperationLogger.log("APP_STARTUP", "Uruchomiono serwer Domowe Archiwum Foto.", status="INFO")
+
+    def _warmup_sidebar() -> None:
+        try:
+            with db_module.SessionLocal() as warmup_db:
+                media.build_sidebar_context(warmup_db)
+            logger.info("Cache paska bocznego gotowy.")
+        except Exception as exc:
+            logger.debug("Sidebar warmup skipped: %s", exc)
+
+    threading.Thread(target=_warmup_sidebar, daemon=True).start()
     logger.info("Gotowe! Serwer Domowe Archiwum Foto nasłuchuje.")
     yield
     try:

@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, asc, select, or_, func, extract, and_
-from sqlalchemy.orm import Session, joinedload, aliased
+from sqlalchemy.orm import Session, joinedload, aliased, load_only
 
 from app.database import get_db, THUMBNAILS_DIR
 from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, DeletedDuplicateHistory
@@ -49,18 +49,9 @@ def render_template(request: Request, name: str, context: Optional[dict] = None)
 
 def get_unbacked_primary_ids_subquery():
     """Returns a SQL subquery of primary MediaItem IDs that have no copy on a different device."""
-    bkp_alias = aliased(MediaItem)
-    backed_hashes = (
-        select(MediaItem.file_hash)
-        .join(
-            bkp_alias,
-            and_(
-                bkp_alias.file_hash == MediaItem.file_hash,
-                bkp_alias.volume_id != MediaItem.volume_id,
-                bkp_alias.is_trashed == False,
-            ),
-        )
-        .where(MediaItem.is_trashed == False, MediaItem.is_primary_duplicate == True)
+    backed_hashes = select(MediaItem.file_hash).where(
+        MediaItem.is_trashed == False,
+        MediaItem.duplicate_role == "backup_green",
     )
     return (
         select(MediaItem.id)
@@ -91,6 +82,8 @@ def compute_backup_and_dup_sidebar_stats(db: Session) -> dict:
     missing_backups = max(0, total_unique - green_backups - orange_backups)
     backups_to_relocate = green_outside_vault + orange_backups
     redundant_duplicates = counts[("duplicate", False)] + counts[("duplicate", True)]
+    total_all_gallery = sum(cnt for (_role, is_bkp), cnt in counts.items() if not is_bkp)
+    total_dups_gallery = green_outside_vault + counts[("backup_orange", False)] + counts[("duplicate", False)]
     return {
         "total_unique": total_unique,
         "missing_backups": missing_backups,
@@ -101,6 +94,8 @@ def compute_backup_and_dup_sidebar_stats(db: Session) -> dict:
         "backups_to_relocate": backups_to_relocate,
         "unbacked_cross_device": missing_backups + orange_backups,
         "redundant_duplicates": redundant_duplicates,
+        "total_all_gallery": total_all_gallery,
+        "total_dups_gallery": total_dups_gallery,
     }
 
 
@@ -203,13 +198,7 @@ def apply_media_filters(
         stmt = stmt.where(MediaItem.is_trashed == False)
 
     # Exclude backup copies from media browsing/displaying (Req 2: daf_backup is a backup vault, not a media collection)
-    stmt = stmt.where(
-        MediaItem.is_backup_copy == False,
-        ~MediaItem.relative_path.ilike("daf_backup/%"),
-        ~MediaItem.relative_path.ilike("daf_backup\\%"),
-        ~MediaItem.relative_path.ilike("backup/%"),
-        ~MediaItem.relative_path.ilike("backup\\%"),
-    )
+    stmt = stmt.where(MediaItem.is_backup_copy == False)
 
     if media_type in ("image", "video"):
         stmt = stmt.where(MediaItem.media_type == media_type)
@@ -254,10 +243,6 @@ def apply_media_filters(
             .where(
                 MediaItem.is_trashed == False,
                 MediaItem.is_backup_copy == False,
-                ~MediaItem.relative_path.ilike("daf_backup/%"),
-                ~MediaItem.relative_path.ilike("daf_backup\\%"),
-                ~MediaItem.relative_path.ilike("backup/%"),
-                ~MediaItem.relative_path.ilike("backup\\%"),
             )
             .group_by(MediaItem.file_hash)
             .having(func.count(MediaItem.id) > 1)
@@ -317,11 +302,11 @@ def build_flat_album_choices(groups: List[MediaGroup]) -> List[dict]:
     return result
 
 
-def build_sidebar_context(db: Session) -> dict:
-    svc = StorageAutomationService(db)
-    volumes = svc.refresh_volumes_online_status()
-    vol_space = svc.get_volume_space_map(volumes)
+_SIDEBAR_CACHE: dict = {"stamp": None, "data": None}
 
+
+def _compute_sidebar_static_aggs(db: Session) -> dict:
+    """Computes heavy sidebar counts and tag breakdowns using fast covering-index queries."""
     vol_counts = dict(
         db.execute(
             select(MediaItem.volume_id, func.count(MediaItem.id))
@@ -329,10 +314,6 @@ def build_sidebar_context(db: Session) -> dict:
             .group_by(MediaItem.volume_id)
         ).all()
     )
-
-    groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
-    trashed_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all())
-
     direct_counts = dict(
         db.execute(
             select(MediaItem.group_id, func.count(MediaItem.id))
@@ -340,39 +321,6 @@ def build_sidebar_context(db: Session) -> dict:
             .group_by(MediaItem.group_id)
         ).all()
     )
-    children_map = defaultdict(list)
-    for g in groups:
-        children_map[g.parent_id].append(g)
-
-    def build_tree(parent_id=None, depth=0):
-        if depth > 8:
-            return []
-        nodes = []
-        for g in children_map.get(parent_id, []):
-            sub_nodes = build_tree(g.id, depth + 1)
-            own = direct_counts.get(g.id, 0)
-            total = own + sum(n["total_count"] for n in sub_nodes)
-            nodes.append({"group": g, "depth": depth, "own_count": own, "total_count": total, "children": sub_nodes})
-        return nodes
-
-    top_tags = db.execute(
-        select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
-        .join(MediaItem, MediaItem.id == MediaTag.media_id)
-        .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model != "quality_check")
-        .group_by(MediaTag.tag)
-        .order_by(desc("cnt"))
-        .limit(35)
-    ).all()
-
-    defect_counts_raw = dict(
-        db.execute(
-            select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)))
-            .join(MediaItem, MediaItem.id == MediaTag.media_id)
-            .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model == "quality_check")
-            .group_by(MediaTag.tag)
-        ).all()
-    )
-
     years = db.execute(
         select(extract("year", MediaItem.effective_date).label("yr"), func.count(MediaItem.id))
         .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
@@ -380,17 +328,122 @@ def build_sidebar_context(db: Session) -> dict:
         .order_by(desc("yr"))
     ).all()
 
-    total_all = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)) or 0
-    total_anomalies = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.has_date_anomaly == True)) or 0
-    total_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.is_primary_duplicate == False)) or 0
-    total_redundant_dups = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaItem.duplicate_role == "duplicate")) or 0
-    total_blurry = db.scalar(
-        select(func.count(MediaItem.id)).where(
-            MediaItem.is_trashed == False,
-            MediaItem.is_backup_copy == False,
-            or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
+    bkp_stats = compute_backup_and_dup_sidebar_stats(db)
+    total_all = bkp_stats["total_all_gallery"]
+    total_anomalies = (
+        db.scalar(
+            select(func.count(MediaItem.id)).where(
+                MediaItem.is_trashed == False,
+                MediaItem.is_backup_copy == False,
+                MediaItem.has_date_anomaly == True,
+            )
         )
-    ) or 0
+        or 0
+    )
+    total_dups = bkp_stats["total_dups_gallery"]
+    total_redundant_dups = bkp_stats["redundant_duplicates"]
+    total_blurry = (
+        db.scalar(
+            select(func.count(MediaItem.id)).where(
+                MediaItem.is_trashed == False,
+                MediaItem.is_backup_copy == False,
+                or_(MediaItem.is_blurry == True, MediaItem.is_corrupted == True),
+            )
+        )
+        or 0
+    )
+    total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
+    total_unanalyzed_quality = (
+        db.scalar(
+            select(func.count(MediaItem.id)).where(
+                MediaItem.is_trashed == False,
+                MediaItem.is_backup_copy == False,
+                MediaItem.blur_score.is_(None),
+                MediaItem.is_corrupted == False,
+            )
+        )
+        or 0
+    )
+
+    excl_ids = list(
+        db.scalars(
+            select(MediaItem.id).where(
+                or_(MediaItem.is_trashed == True, MediaItem.is_backup_copy == True)
+            )
+        ).all()
+    )
+    if len(excl_ids) <= 500:
+        tag_top_stmt = select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt")).where(
+            MediaTag.source_model != "quality_check"
+        )
+        defect_stmt = select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id))).where(
+            MediaTag.source_model == "quality_check"
+        )
+        vec_stmt = select(func.count(MediaEmbedding.media_id))
+        tagged_stmt = select(func.count(func.distinct(MediaTag.media_id)))
+        if excl_ids:
+            tag_top_stmt = tag_top_stmt.where(~MediaTag.media_id.in_(excl_ids))
+            defect_stmt = defect_stmt.where(~MediaTag.media_id.in_(excl_ids))
+            vec_stmt = vec_stmt.where(~MediaEmbedding.media_id.in_(excl_ids))
+            tagged_stmt = tagged_stmt.where(~MediaTag.media_id.in_(excl_ids))
+        top_tags = [
+            (t, c)
+            for t, c in db.execute(tag_top_stmt.group_by(MediaTag.tag).order_by(desc("cnt")).limit(35)).all()
+        ]
+        defect_counts_raw = dict(db.execute(defect_stmt.group_by(MediaTag.tag)).all())
+        total_vectors = db.scalar(vec_stmt) or 0
+        tagged_active_count = db.scalar(tagged_stmt) or 0
+        total_untagged = max(0, total_all - tagged_active_count)
+        total_unvectored = max(0, total_all - total_vectors)
+    else:
+        top_tags = [
+            (t, c)
+            for t, c in db.execute(
+                select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
+                .join(MediaItem, MediaItem.id == MediaTag.media_id)
+                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model != "quality_check")
+                .group_by(MediaTag.tag)
+                .order_by(desc("cnt"))
+                .limit(35)
+            ).all()
+        ]
+        defect_counts_raw = dict(
+            db.execute(
+                select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)))
+                .join(MediaItem, MediaItem.id == MediaTag.media_id)
+                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, MediaTag.source_model == "quality_check")
+                .group_by(MediaTag.tag)
+            ).all()
+        )
+        total_vectors = (
+            db.scalar(
+                select(func.count(MediaEmbedding.media_id))
+                .join(MediaItem, MediaItem.id == MediaEmbedding.media_id)
+                .where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False)
+            )
+            or 0
+        )
+        total_untagged = (
+            db.scalar(
+                select(func.count(MediaItem.id)).where(
+                    MediaItem.is_trashed == False,
+                    MediaItem.is_backup_copy == False,
+                    ~MediaItem.id.in_(select(MediaTag.media_id).distinct()),
+                )
+            )
+            or 0
+        )
+        total_unvectored = (
+            db.scalar(
+                select(func.count(MediaItem.id)).where(
+                    MediaItem.is_trashed == False,
+                    MediaItem.is_backup_copy == False,
+                    ~MediaItem.id.in_(select(MediaEmbedding.media_id)),
+                )
+            )
+            or 0
+        )
+
     total_defects_all = defect_counts_raw.get("do_usuniecia", 0) or total_blurry
     defect_counts = {
         "all": total_defects_all,
@@ -401,34 +454,10 @@ def build_sidebar_context(db: Session) -> dict:
         "detail": defect_counts_raw.get("do_usuniecia:brak_detali", 0),
         "lowres": defect_counts_raw.get("do_usuniecia:niska_rozdzielczosc", 0),
     }
-    total_trashed = db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_trashed == True)) or 0
-    total_vectors = db.scalar(select(func.count(MediaEmbedding.media_id)).join(MediaItem, MediaItem.id == MediaEmbedding.media_id).where(MediaItem.is_backup_copy == False)) or 0
-    total_untagged = db.scalar(
-        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, ~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
-    ) or 0
-    total_unvectored = db.scalar(
-        select(func.count(MediaItem.id)).where(MediaItem.is_trashed == False, MediaItem.is_backup_copy == False, ~MediaItem.id.in_(select(MediaEmbedding.media_id)))
-    ) or 0
-    total_unanalyzed_quality = db.scalar(
-        select(func.count(MediaItem.id)).where(
-            MediaItem.is_trashed == False,
-            MediaItem.is_backup_copy == False,
-            MediaItem.blur_score.is_(None),
-            MediaItem.is_corrupted == False,
-        )
-    ) or 0
-    total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
-    bkp_stats = compute_backup_and_dup_sidebar_stats(db)
-    jobs_summary = ProcessManager.get_jobs_summary(db)
 
     return {
-        "volumes": volumes,
-        "vol_space": vol_space,
         "vol_counts": vol_counts,
-        "group_tree": build_tree(None, 0),
-        "all_groups": groups,
-        "flat_album_choices": build_flat_album_choices(groups),
-        "trashed_groups": trashed_groups,
+        "direct_counts": direct_counts,
         "top_tags": top_tags,
         "years": [(int(y), c) for y, c in years if y is not None],
         "total_all": total_all,
@@ -445,9 +474,62 @@ def build_sidebar_context(db: Session) -> dict:
         "total_untagged": total_untagged,
         "total_unvectored": total_unvectored,
         "total_unanalyzed_quality": total_unanalyzed_quality,
-        "total_unbacked": total_unbacked,
+        "total_unbacked": bkp_stats["unbacked_cross_device"],
+    }
+
+
+def build_sidebar_context(db: Session) -> dict:
+    svc = StorageAutomationService(db)
+    volumes = svc.refresh_volumes_online_status()
+    vol_space = svc.get_volume_space_map(volumes)
+
+    groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False).order_by(MediaGroup.name.asc())).all())
+    trashed_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == True).order_by(MediaGroup.name.asc())).all())
+
+    bind_key = str(db.get_bind().url) if db.get_bind() is not None else ""
+    stamp = (
+        bind_key,
+        db.scalar(select(func.count(MediaItem.id))) or 0,
+        str(db.scalar(select(func.max(MediaItem.updated_at))) or ""),
+        db.scalar(select(func.max(MediaTag.id))) or 0,
+        db.scalar(select(func.count(MediaEmbedding.media_id))) or 0,
+        db.scalar(select(func.count(MediaGroup.id))) or 0,
+        db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_primary_duplicate == False)) or 0,
+    )
+    if _SIDEBAR_CACHE["stamp"] != stamp or _SIDEBAR_CACHE["data"] is None:
+        _SIDEBAR_CACHE["data"] = _compute_sidebar_static_aggs(db)
+        _SIDEBAR_CACHE["stamp"] = stamp
+    aggs = _SIDEBAR_CACHE["data"]
+
+    direct_counts = aggs["direct_counts"]
+    children_map = defaultdict(list)
+    for g in groups:
+        children_map[g.parent_id].append(g)
+
+    def build_tree(parent_id=None, depth=0):
+        if depth > 8:
+            return []
+        nodes = []
+        for g in children_map.get(parent_id, []):
+            sub_nodes = build_tree(g.id, depth + 1)
+            own = direct_counts.get(g.id, 0)
+            total = own + sum(n["total_count"] for n in sub_nodes)
+            nodes.append({"group": g, "depth": depth, "own_count": own, "total_count": total, "children": sub_nodes})
+        return nodes
+
+    jobs_summary = ProcessManager.get_jobs_summary(db)
+
+    ctx = {
+        "volumes": volumes,
+        "vol_space": vol_space,
+        "group_tree": build_tree(None, 0),
+        "all_groups": groups,
+        "flat_album_choices": build_flat_album_choices(groups),
+        "trashed_groups": trashed_groups,
         "jobs_summary": jobs_summary,
     }
+    ctx.update(aggs)
+    return ctx
 
 
 def build_search_context(request: Request, db: Session) -> dict:
@@ -483,10 +565,36 @@ def build_search_context(request: Request, db: Session) -> dict:
         anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only,
         unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect,
         redundant_clusters_only=redundant_clusters_only, backups_to_move_only=backups_to_move_only,
-    ).distinct()
-
-    count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
-    set_stats = db.execute(select(func.count(count_subq.c.id), func.sum(count_subq.c.file_size_bytes))).one()
+    )
+    joins_tags = bool((q and q.strip()) or (tag and tag.strip()) or (quality_defect and quality_defect.strip()))
+    if joins_tags:
+        filtered_stmt = filtered_stmt.distinct()
+        count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
+        set_stats = db.execute(select(func.count(count_subq.c.id), func.sum(count_subq.c.file_size_bytes))).one()
+        redundant_dup_count_filtered = 0
+        if duplicates_only:
+            redundant_dup_count_filtered = (
+                db.scalar(
+                    select(func.count(count_subq.c.id))
+                    .join(MediaItem, MediaItem.id == count_subq.c.id)
+                    .where(MediaItem.duplicate_role == "duplicate")
+                )
+                or 0
+            )
+    else:
+        set_stats = db.execute(
+            filtered_stmt.with_only_columns(func.count(MediaItem.id), func.sum(MediaItem.file_size_bytes)).order_by(None)
+        ).one()
+        redundant_dup_count_filtered = 0
+        if duplicates_only:
+            redundant_dup_count_filtered = (
+                db.scalar(
+                    filtered_stmt.where(MediaItem.duplicate_role == "duplicate")
+                    .with_only_columns(func.count(MediaItem.id))
+                    .order_by(None)
+                )
+                or 0
+            )
     total_matching = set_stats[0] or 0
     total_size_bytes = set_stats[1] or 0
 
@@ -494,7 +602,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         joinedload(MediaItem.volume),
         joinedload(MediaItem.group),
         joinedload(MediaItem.tags),
-        joinedload(MediaItem.embedding),
+        joinedload(MediaItem.embedding).load_only(MediaEmbedding.media_id, MediaEmbedding.model_name, MediaEmbedding.dimensions),
     )
 
     if duplicates_only:
@@ -551,12 +659,6 @@ def build_search_context(request: Request, db: Session) -> dict:
             else:
                 folder_counts["."] += 1
         subfolders = sorted(folder_counts.items(), key=lambda x: x[1], reverse=True)[:25]
-
-    redundant_dup_count_filtered = 0
-    if duplicates_only:
-        redundant_dup_count_filtered = db.scalar(
-            select(func.count(count_subq.c.id)).join(MediaItem, MediaItem.id == count_subq.c.id).where(MediaItem.duplicate_role == "duplicate")
-        ) or 0
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
     deleted_dup_counts_by_hash, deleted_dup_matches_by_hash = _build_deleted_dup_history_map(db, items, q)

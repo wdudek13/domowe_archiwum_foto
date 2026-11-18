@@ -177,6 +177,38 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS ix_deleted_duplicate_history_file_name ON deleted_duplicate_history (file_name);"
         )
+        if m_cols and {"is_trashed", "duplicate_role", "is_backup_copy", "file_hash"}.issubset(m_cols):
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_role_bkp_trashed ON media_items (is_trashed, duplicate_role, is_backup_copy, file_hash);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_browse_date ON media_items (is_trashed, is_backup_copy, effective_date DESC, file_size_bytes);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_updated_at ON media_items (updated_at);"
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_media_sidebar_aggs ON media_items (
+                    is_trashed, is_backup_copy, volume_id, group_id, effective_date,
+                    has_date_anomaly, is_blurry, is_corrupted, blur_score
+                );
+                """
+            )
+            cur.execute(
+                """
+                UPDATE media_items SET is_backup_copy = 1
+                WHERE is_backup_copy = 0
+                  AND (LOWER(relative_path) LIKE 'daf_backup/%' OR LOWER(relative_path) LIKE 'daf_backup\\%'
+                       OR LOWER(relative_path) LIKE 'backup/%' OR LOWER(relative_path) LIKE 'backup\\%');
+                """
+            )
+        cur.execute("PRAGMA table_info(media_tags);")
+        t_cols = {row[1] for row in cur.fetchall()}
+        if {"source_model", "tag", "media_id"}.issubset(t_cols):
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_tags_src_tag_mid ON media_tags (source_model, tag, media_id);"
+            )
         # Clear legacy false-positive date anomalies caused solely by missing EXIF or copy timestamps on EXIF files
         if m_cols:
             cur.execute(
