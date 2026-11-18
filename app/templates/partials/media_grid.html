@@ -204,7 +204,11 @@
     <div class="bg-amber-950/30 border border-amber-700/60 p-3.5 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
         <div class="space-y-1">
             <div class="font-bold text-amber-300 text-sm">
+                {% if backups_to_move_only %}
+                📦 Backupy do przeniesienia do <code>daf_backup/</code> — Podgląd klastrów (zielone poza vaultem + pomarańczowe)
+                {% else %}
                 👥 Duplikaty binarne — Klastry (Nadmiarowych kopii do usunięcia: <span class="text-rose-300 font-mono">{{ total_redundant_dups or 0 }}</span> szt.)
+                {% endif %}
             </div>
             <div class="text-slate-300 text-[11px]">
                 <span class="bg-emerald-600 text-white font-bold px-1.5 py-0.2 rounded text-[10px]">ORYGINAŁ ✓</span> 1. kopia (ma kopię w <code>daf_backup/</code> na innym dysku) &bull;
@@ -216,6 +220,12 @@
             </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+            {% if backups_to_move_only %}
+            <button type="button" onclick="openBackupModal()"
+                    class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg font-semibold shadow">
+                🛡️ Otwórz Panel Backupu zdjęć/filmów
+            </button>
+            {% endif %}
             <button type="button"
                     hx-post="/actions/refresh-duplicate-tags"
                     hx-target="#global-notification"

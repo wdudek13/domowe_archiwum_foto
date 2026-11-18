@@ -116,6 +116,8 @@ def _resolve_bulk_ids_fast(
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
     selected_ids_json: Optional[str] = None,
+    redundant_clusters_only: bool = False,
+    backups_to_move_only: bool = False,
 ) -> List[str]:
     """Fast ID-only resolution that avoids loading tens of thousands of ORM rows on HTTP POST."""
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
@@ -146,6 +148,8 @@ def _resolve_bulk_ids_fast(
             unbacked_only,
             unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
+            redundant_clusters_only=redundant_clusters_only,
+            backups_to_move_only=backups_to_move_only,
         ).distinct()
     return [str(x) for x in db.scalars(stmt).all()]
 
@@ -171,6 +175,8 @@ def resolve_target_items(
     unanalyzed_quality_only: bool = False,
     limit: Optional[int] = None,
     selected_ids_json: Optional[str] = None,
+    redundant_clusters_only: bool = False,
+    backups_to_move_only: bool = False,
 ) -> List[MediaItem]:
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
     if scope == "selected" and eff_ids:
@@ -202,6 +208,8 @@ def resolve_target_items(
             unbacked_only,
             unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
+            redundant_clusters_only=redundant_clusters_only,
+            backups_to_move_only=backups_to_move_only,
         ).distinct()
     if limit:
         stmt = stmt.limit(limit)
@@ -1264,6 +1272,8 @@ def get_redundant_duplicate_ids(
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
     quality_defect: Optional[str] = None,
+    redundant_clusters_only: bool = False,
+    backups_to_move_only: bool = False,
     db: Session = Depends(get_db),
 ):
     """Returns IDs of all redundant copies (duplicate_role == 'duplicate', i.e. 3rd+ copy) across ALL pages for the current filter."""
@@ -1288,6 +1298,8 @@ def get_redundant_duplicate_ids(
         unvectored_only=unvectored_only,
         unanalyzed_quality_only=unanalyzed_quality_only,
         quality_defect=quality_defect,
+        redundant_clusters_only=redundant_clusters_only,
+        backups_to_move_only=backups_to_move_only,
     ).where(MediaItem.duplicate_role == "duplicate").distinct()
     ids = [str(x) for x in db.scalars(stmt).all()]
     return JSONResponse({"ids": ids, "count": len(ids)})
@@ -3336,6 +3348,8 @@ async def move_items_to_local_trash(
     anomaly_only = _form_bool(form, "anomaly_only")
     blurry_only = _form_bool(form, "blurry_only")
     duplicates_only = _form_bool(form, "duplicates_only")
+    redundant_clusters_only = _form_bool(form, "redundant_clusters_only")
+    backups_to_move_only = _form_bool(form, "backups_to_move_only")
     untagged_only = _form_bool(form, "untagged_only")
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
@@ -3364,6 +3378,8 @@ async def move_items_to_local_trash(
             untagged_only=untagged_only, unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
             selected_ids_json=selected_ids_json,
+            redundant_clusters_only=redundant_clusters_only,
+            backups_to_move_only=backups_to_move_only,
         )
 
     if not item_ids and not t_gid:
@@ -3777,6 +3793,8 @@ async def delete_files_permanently_from_disk(
     anomaly_only = _form_bool(form, "anomaly_only")
     blurry_only = _form_bool(form, "blurry_only")
     duplicates_only = _form_bool(form, "duplicates_only")
+    redundant_clusters_only = _form_bool(form, "redundant_clusters_only")
+    backups_to_move_only = _form_bool(form, "backups_to_move_only")
     untagged_only = _form_bool(form, "untagged_only")
     unvectored_only = _form_bool(form, "unvectored_only")
     unanalyzed_quality_only = _form_bool(form, "unanalyzed_quality_only")
@@ -3801,6 +3819,8 @@ async def delete_files_permanently_from_disk(
             untagged_only=untagged_only, unvectored_only=unvectored_only,
             unanalyzed_quality_only=unanalyzed_quality_only,
             selected_ids_json=selected_ids_json,
+            redundant_clusters_only=redundant_clusters_only,
+            backups_to_move_only=backups_to_move_only,
         )
 
     if not item_ids and not grp_to_delete:

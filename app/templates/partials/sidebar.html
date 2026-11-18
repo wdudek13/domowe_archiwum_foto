@@ -38,13 +38,38 @@
                 <span>🛡️ Brak backupu na innym dysku</span>
                 <span class="font-mono text-[10px]">{{ total_unbacked or 0 }}</span>
             </button>
+            {% if bkp_stats is defined %}
+            <div class="mx-1 px-2.5 py-2 rounded-lg bg-slate-900/90 border border-emerald-900/50 space-y-1 text-[10px]">
+                <div class="flex justify-between text-slate-300">
+                    <span>Oryginały (unikalne):</span>
+                    <strong class="font-mono text-sky-300">{{ bkp_stats.total_unique }}</strong>
+                </div>
+                <div class="flex justify-between text-rose-300">
+                    <span>&bull; Brakujące (1 kopia):</span>
+                    <span class="font-mono">{{ bkp_stats.missing_backups }}</span>
+                </div>
+                <div class="flex justify-between text-emerald-300">
+                    <span>&bull; Backupy zielone (inny dysk):</span>
+                    <span class="font-mono">{{ bkp_stats.green_backups }} <span class="text-slate-400">({{ bkp_stats.green_in_vault }}/{{ bkp_stats.green_outside_vault }})</span></span>
+                </div>
+                <div class="flex justify-between text-orange-300">
+                    <span>&bull; Backupy pomarańczowe (ten dysk):</span>
+                    <span class="font-mono">{{ bkp_stats.orange_backups }}</span>
+                </div>
+                <button type="button" onclick="applySidebarFilter({_reset: true, duplicates_only: true, backups_to_move_only: true})"
+                        class="w-full mt-1 pt-1 border-t border-borderBg/50 flex justify-between items-center text-teal-300 hover:text-teal-200 font-semibold">
+                    <span>📦 Backupy do przeniesienia</span>
+                    <span class="font-mono">{{ bkp_stats.backups_to_relocate }}</span>
+                </button>
+            </div>
+            {% endif %}
             <button onclick="applySidebarFilter({_reset: true, anomaly_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-amber-300">
                 <span>⚠️ Niezgodność dat</span>
                 <span class="font-mono text-[10px]">{{ total_anomalies }}</span>
             </button>
-            <button onclick="applySidebarFilter({_reset: true, duplicates_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-rose-300">
+            <button onclick="applySidebarFilter({_reset: true, duplicates_only: true, redundant_clusters_only: true})" class="w-full flex justify-between items-center px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-rose-300">
                 <span>👥 Duplikaty binarne</span>
-                <span class="font-mono text-[10px]">{{ total_dups }}</span>
+                <span class="font-mono text-[10px]">{{ bkp_stats.redundant_duplicates if bkp_stats is defined else (total_redundant_dups or 0) }}</span>
             </button>
             <div class="pt-1 mt-1 border-t border-borderBg/40 space-y-0.5">
                 <div class="flex items-center justify-between px-1 text-[10px] font-bold text-orange-400 uppercase tracking-wider">

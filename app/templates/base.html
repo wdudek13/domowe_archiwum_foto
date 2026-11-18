@@ -356,7 +356,8 @@
                 [
                     'anomaly_only', 'blurry_only', 'duplicates_only',
                     'untagged_only', 'unvectored_only', 'unanalyzed_quality_only',
-                    'ungrouped_only', 'trashed_only', 'unbacked_only'
+                    'ungrouped_only', 'trashed_only', 'unbacked_only',
+                    'redundant_clusters_only', 'backups_to_move_only'
                 ].forEach(k => {
                     const el = form.querySelector(`[name='${k}']`);
                     if (el) el.checked = false;

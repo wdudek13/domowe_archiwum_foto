@@ -1805,7 +1805,11 @@ class StorageAutomationService:
                     else:
                         can_verify_from_meta = (
                             orig.file_size_bytes == bkp.file_size_bytes == cand.file_size_bytes
-                            and (cand.media_type == "image" or bool(orig.verified_sha256 or bkp.verified_sha256))
+                            and (
+                                cand.media_type == "image"
+                                or orig.hash_algorithm == "partial_3x64k"
+                                or bool(orig.verified_sha256 or bkp.verified_sha256)
+                            )
                         )
                         if not can_verify_from_meta:
                             ref_vols = [

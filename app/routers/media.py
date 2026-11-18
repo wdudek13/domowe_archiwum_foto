@@ -48,7 +48,7 @@ def render_template(request: Request, name: str, context: Optional[dict] = None)
 
 
 def get_unbacked_primary_ids_subquery():
-    """Returns a SQL subquery of primary MediaItem IDs that have no backup copy on a different device."""
+    """Returns a SQL subquery of primary MediaItem IDs that have no copy on a different device."""
     bkp_alias = aliased(MediaItem)
     backed_hashes = (
         select(MediaItem.file_hash)
@@ -57,7 +57,6 @@ def get_unbacked_primary_ids_subquery():
             and_(
                 bkp_alias.file_hash == MediaItem.file_hash,
                 bkp_alias.volume_id != MediaItem.volume_id,
-                bkp_alias.is_backup_copy == True,
                 bkp_alias.is_trashed == False,
             ),
         )
@@ -71,6 +70,38 @@ def get_unbacked_primary_ids_subquery():
             ~MediaItem.file_hash.in_(backed_hashes),
         )
     )
+
+
+def compute_backup_and_dup_sidebar_stats(db: Session) -> dict:
+    """Computes sidebar counts reconciled 1-to-1 with the Backup & Duplicates modal summary."""
+    rows = db.execute(
+        select(MediaItem.duplicate_role, MediaItem.is_backup_copy, func.count(MediaItem.id))
+        .where(MediaItem.is_trashed == False)
+        .group_by(MediaItem.duplicate_role, MediaItem.is_backup_copy)
+    ).all()
+    counts = defaultdict(int)
+    for role, is_bkp, cnt in rows:
+        counts[(role or "original", bool(is_bkp))] += int(cnt or 0)
+
+    total_unique = counts[("original", False)] + counts[("original", True)]
+    green_in_vault = counts[("backup_green", True)]
+    green_outside_vault = counts[("backup_green", False)]
+    green_backups = green_in_vault + green_outside_vault
+    orange_backups = counts[("backup_orange", False)] + counts[("backup_orange", True)]
+    missing_backups = max(0, total_unique - green_backups - orange_backups)
+    backups_to_relocate = green_outside_vault + orange_backups
+    redundant_duplicates = counts[("duplicate", False)] + counts[("duplicate", True)]
+    return {
+        "total_unique": total_unique,
+        "missing_backups": missing_backups,
+        "green_backups": green_backups,
+        "green_in_vault": green_in_vault,
+        "green_outside_vault": green_outside_vault,
+        "orange_backups": orange_backups,
+        "backups_to_relocate": backups_to_relocate,
+        "unbacked_cross_device": missing_backups + orange_backups,
+        "redundant_duplicates": redundant_duplicates,
+    }
 
 
 def _build_cross_vault_backup_map(db: Session, items: List[MediaItem]) -> dict:
@@ -163,6 +194,8 @@ def apply_media_filters(
     unvectored_only: bool = False,
     unanalyzed_quality_only: bool = False,
     quality_defect: Optional[str] = None,
+    redundant_clusters_only: bool = False,
+    backups_to_move_only: bool = False,
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
@@ -230,6 +263,20 @@ def apply_media_filters(
             .having(func.count(MediaItem.id) > 1)
         )
         stmt = stmt.where(MediaItem.file_hash.in_(dup_hashes_subq))
+    if redundant_clusters_only:
+        redundant_hashes_subq = select(MediaItem.file_hash).where(
+            MediaItem.is_trashed == False,
+            MediaItem.is_backup_copy == False,
+            MediaItem.duplicate_role == "duplicate",
+        )
+        stmt = stmt.where(MediaItem.file_hash.in_(redundant_hashes_subq))
+    if backups_to_move_only:
+        bkp_move_hashes = select(MediaItem.file_hash).where(
+            MediaItem.is_trashed == False,
+            MediaItem.is_backup_copy == False,
+            MediaItem.duplicate_role.in_(["backup_green", "backup_orange"]),
+        )
+        stmt = stmt.where(MediaItem.file_hash.in_(bkp_move_hashes))
     if unbacked_only:
         stmt = stmt.where(MediaItem.id.in_(get_unbacked_primary_ids_subquery()))
     if q and q.strip():
@@ -371,6 +418,7 @@ def build_sidebar_context(db: Session) -> dict:
         )
     ) or 0
     total_unbacked = db.scalar(select(func.count()).select_from(get_unbacked_primary_ids_subquery().subquery())) or 0
+    bkp_stats = compute_backup_and_dup_sidebar_stats(db)
     jobs_summary = ProcessManager.get_jobs_summary(db)
 
     return {
@@ -387,6 +435,8 @@ def build_sidebar_context(db: Session) -> dict:
         "total_anomalies": total_anomalies,
         "total_dups": total_dups,
         "total_redundant_dups": total_redundant_dups,
+        "total_backups_to_relocate": bkp_stats["backups_to_relocate"],
+        "bkp_stats": bkp_stats,
         "total_blurry": total_blurry,
         "total_defects_all": total_defects_all,
         "defect_counts": defect_counts,
@@ -413,6 +463,8 @@ def build_search_context(request: Request, db: Session) -> dict:
     anomaly_only = to_bool(qp.get("anomaly_only"))
     blurry_only = to_bool(qp.get("blurry_only"))
     duplicates_only = to_bool(qp.get("duplicates_only"))
+    redundant_clusters_only = to_bool(qp.get("redundant_clusters_only"))
+    backups_to_move_only = to_bool(qp.get("backups_to_move_only"))
     untagged_only = to_bool(qp.get("untagged_only"))
     ungrouped_only = to_bool(qp.get("ungrouped_only"))
     trashed_only = to_bool(qp.get("trashed_only"))
@@ -429,7 +481,8 @@ def build_search_context(request: Request, db: Session) -> dict:
     filtered_stmt = apply_media_filters(
         base_stmt, db, q, media_type, vol_id_int, folder_prefix, grp_id_int, tag, yr_int,
         anomaly_only, blurry_only, duplicates_only, untagged_only, ungrouped_only, trashed_only, unbacked_only,
-        unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect
+        unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect,
+        redundant_clusters_only=redundant_clusters_only, backups_to_move_only=backups_to_move_only,
     ).distinct()
 
     count_subq = filtered_stmt.with_only_columns(MediaItem.id, MediaItem.file_size_bytes).subquery()
@@ -530,6 +583,8 @@ def build_search_context(request: Request, db: Session) -> dict:
         "active_folder": folder_prefix,
         "trashed_only": trashed_only,
         "duplicates_only": duplicates_only,
+        "redundant_clusters_only": redundant_clusters_only,
+        "backups_to_move_only": backups_to_move_only,
         "anomaly_only": anomaly_only,
         "unbacked_only": unbacked_only,
         "untagged_only": untagged_only,

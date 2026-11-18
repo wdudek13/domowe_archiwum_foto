@@ -4473,6 +4473,84 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(r_rec_q.status_code, 200)
                 self.assertIn("rec_orig.jpg", r_rec_q.text)
 
+                # Reconcile sidebar counts with Backup panel stats + redundant_clusters_only / backups_to_move_only filters
+                svc.flag_duplicate_clusters()
+                plan_rec = svc.build_backup_and_dedup_plan()
+                p_stats = plan_rec["stats"]
+                r_sb_reconcile = self.client.get("/media/sidebar")
+                self.assertEqual(r_sb_reconcile.status_code, 200)
+                self.assertIn("Backupy do przeniesienia", r_sb_reconcile.text)
+                self.assertIn(f">{p_stats['total_unique']}<", r_sb_reconcile.text)
+                self.assertIn(f">{p_stats['missing_backups']}<", r_sb_reconcile.text)
+                self.assertIn(f">{p_stats['orange_backups']}<", r_sb_reconcile.text)
+                # Ensure green copy outside daf_backup (p3_b) counts under backups_to_move_only, not as lacking cross-device backup
+                r_unb = self.client.get("/media/search?unbacked_only=true")
+                self.assertEqual(r_unb.status_code, 200)
+                self.assertNotIn("outside_bkp.jpg", r_unb.text)
+                r_bkp_mv = self.client.get("/media/search?duplicates_only=true&backups_to_move_only=true")
+                self.assertEqual(r_bkp_mv.status_code, 200)
+                self.assertIn("outside_bkp.jpg", r_bkp_mv.text)
+                self.assertIn("Otwórz Panel Backupu zdjęć/filmów", r_bkp_mv.text)
+
+                # redundant_clusters_only=true shows ONLY clusters with duplicate_role=='duplicate' (excludes 2-copy ORYGINAL+BACKUP clusters)
+                r_red_only = self.client.get("/media/search?duplicates_only=true&redundant_clusters_only=true")
+                self.assertEqual(r_red_only.status_code, 200)
+                self.assertNotIn("outside_bkp.jpg", r_red_only.text)
+                self.assertIn(
+                    f"Nadmiarowych kopii do usunięcia: <span class=\"text-rose-300 font-mono\">{p_stats['redundant_duplicates']}</span>",
+                    r_red_only.text,
+                )
+
+                # Offline-ref video with partial_3x64k is eligible for metadata SHA-256 verification instead of blocking as unverified
+                p_v3_on = self.drive_a / "vid_p3_dup.mp4"
+                p_v3_payload = b"ftypisom_partial3x64k_" + (b"\x11\x22\x33\x44" * 1024)
+                p_v3_on.write_bytes(p_v3_payload)
+                p_v3_hash = FastHasher.hash_video_partial(p_v3_on, len(p_v3_payload))
+                v3_specs = [
+                    (vol_d.id, "v3_orig.mp4", "original", False),
+                    (vol_d.id, "daf_backup/2024/08/01/v3_orig.mp4", "backup_same_dev", True),
+                    (vol_a.id, "vid_p3_dup.mp4", "duplicate", False),
+                ]
+                v3_items = [
+                    MediaItem(
+                        id=str(_uuid.uuid4()),
+                        volume_id=vid_i,
+                        relative_path=rp,
+                        file_name=Path(rp).name,
+                        file_size_bytes=len(p_v3_payload),
+                        file_hash=p_v3_hash,
+                        hash_algorithm="partial_3x64k",
+                        verified_sha256=None,
+                        media_type="video",
+                        mime_type="video/mp4",
+                        fs_ctime=now_vid_dt,
+                        fs_mtime=now_vid_dt,
+                        effective_date=now_vid_dt,
+                        thumbnail_relative_path="dummy_v3_thumb.webp",
+                        duplicate_role=dr,
+                        is_backup_copy=ibkp,
+                    )
+                    for vid_i, rp, dr, ibkp in v3_specs
+                ]
+                db.add_all(v3_items)
+                db.commit()
+                res_v3 = svc.execute_safe_duplicate_removal(
+                    [v3_items[2].id], delete_mode="permanent", force_duplicate_verification=True
+                )
+                self.assertEqual(res_v3["physical_count"], 1)
+                self.assertEqual(res_v3["processed_count"], 1)
+                self.assertFalse(p_v3_on.exists())
+
+                # Verify once all 3rd+ duplicates are removed, Duplikaty binarne shows 0 while 2-copy clusters remain under Backupy do przeniesienia
+                for rem_dup in db.scalars(select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.duplicate_role == "duplicate")).all():
+                    db.delete(rem_dup)
+                db.commit()
+                svc.flag_duplicate_clusters()
+                r_red_zero = self.client.get("/media/search?duplicates_only=true&redundant_clusters_only=true")
+                self.assertEqual(r_red_zero.status_code, 200)
+                self.assertIn("Brak plików spełniających kryteria.", r_red_zero.text)
+                self.assertIn("Nadmiarowych kopii do usunięcia: <span class=\"text-rose-300 font-mono\">0</span>", r_red_zero.text)
+
     def test_maintenance_vacuum_and_orphan_thumbnails(self):
         with self.TestingSessionLocal() as db:
             vol = WindowsVolume(
