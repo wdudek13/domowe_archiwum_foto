@@ -4413,6 +4413,27 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertIsNotNone(db.get(MediaItem, rec_items[0].id))
                 self.assertIsNotNone(db.get(MediaItem, rec_items[1].id))
 
+                # ReadOnly Windows attribute ([WinError 5]) duplicate must be cleared & deleted without crashing
+                import stat as _stat
+                p_ro_dup = self.drive_a / "rec_ro_dup.jpg"
+                p_ro_dup.write_bytes(p_rec_o.read_bytes())
+                it_ro_dup = FileScannerService.process_file(p_ro_dup, vol_a)
+                db.add(it_ro_dup)
+                db.commit()
+                svc.flag_duplicate_clusters()
+                os.chmod(p_ro_dup, _stat.S_IREAD)
+                res_ro = svc.execute_safe_duplicate_removal(
+                    [it_ro_dup.id],
+                    delete_mode="permanent",
+                    force_duplicate_verification=True,
+                    trash_dir=self.root / "kosz",
+                    thumbnails_dir=self.thumbs_dir,
+                )
+                self.assertEqual(res_ro["physical_count"], 1)
+                self.assertEqual(res_ro["processed_count"], 1)
+                self.assertFalse(p_ro_dup.exists())
+                self.assertIsNone(db.get(MediaItem, it_ro_dup.id))
+
     def test_maintenance_vacuum_and_orphan_thumbnails(self):
         with self.TestingSessionLocal() as db:
             vol = WindowsVolume(

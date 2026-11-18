@@ -1,9 +1,11 @@
 from collections import defaultdict
 import datetime
 import logging
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sqlalchemy import select, text, update, delete, func
 from sqlalchemy.orm import Session, joinedload
@@ -15,6 +17,24 @@ from app.operation_log import OperationLogger
 from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 
 logger = logging.getLogger("StorageOps")
+
+
+def _safe_unlink(path: Path) -> None:
+    """Deletes a file on disk, clearing Windows Read-Only attribute if needed."""
+    try:
+        path.unlink()
+    except PermissionError:
+        os.chmod(path, stat.S_IWRITE)
+        path.unlink()
+
+
+def _safe_move(src: Path, dst: Path) -> None:
+    """Moves a file on disk, clearing Windows Read-Only attribute if needed."""
+    try:
+        shutil.move(str(src), str(dst))
+    except PermissionError:
+        os.chmod(src, stat.S_IWRITE)
+        shutil.move(str(src), str(dst))
 
 
 class StorageAutomationService:
@@ -1748,11 +1768,33 @@ class StorageAutomationService:
 
                     if delete_mode == "trash":
                         dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
-                        shutil.move(str(cand_path), str(dest_p))
+                        try:
+                            _safe_move(cand_path, dest_p)
+                        except OSError as exc:
+                            blocked_verify += 1
+                            OperationLogger.log(
+                                "DUP_DELETE_LOCKED",
+                                f"Pominięto zablokowany plik {cand_path}: {exc}",
+                                status="WARN",
+                                db=self.db,
+                                commit=True,
+                            )
+                            continue
                         cand.is_trashed = True
                         physical_count += 1
                     else:
-                        cand_path.unlink()
+                        try:
+                            _safe_unlink(cand_path)
+                        except OSError as exc:
+                            blocked_verify += 1
+                            OperationLogger.log(
+                                "DUP_DELETE_LOCKED",
+                                f"Pominięto zablokowany plik {cand_path}: {exc}",
+                                status="WARN",
+                                db=self.db,
+                                commit=True,
+                            )
+                            continue
                         physical_count += 1
                         thumb_shared = any(
                             x.thumbnail_relative_path == cand.thumbnail_relative_path
@@ -1762,7 +1804,7 @@ class StorageAutomationService:
                             tp = eff_thumbs_dir / cand.thumbnail_relative_path
                             if tp.exists():
                                 try:
-                                    tp.unlink()
+                                    _safe_unlink(tp)
                                 except OSError as exc:
                                     logger.debug("Thumb unlink warning %s: %s", tp, exc)
                         self.db.delete(cand)
@@ -1777,7 +1819,7 @@ class StorageAutomationService:
                         if src_p.exists():
                             dest_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
                             try:
-                                shutil.move(str(src_p), str(dest_p))
+                                _safe_move(src_p, dest_p)
                                 physical_count += 1
                             except Exception as exc:
                                 logger.debug("Move to trash physical warning: %s", exc)
@@ -1785,14 +1827,14 @@ class StorageAutomationService:
                     else:
                         if src_p.exists():
                             try:
-                                src_p.unlink()
+                                _safe_unlink(src_p)
                                 physical_count += 1
                             except OSError as exc:
                                 logger.debug("Permanent delete unlink warning: %s", exc)
                         trash_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
                         if trash_p.exists():
                             try:
-                                trash_p.unlink()
+                                _safe_unlink(trash_p)
                                 physical_count += 1
                             except OSError as exc:
                                 logger.debug("Permanent delete trash unlink warning: %s", exc)
@@ -1800,7 +1842,7 @@ class StorageAutomationService:
                             thumb_p = eff_thumbs_dir / cand.thumbnail_relative_path
                             if thumb_p.exists():
                                 try:
-                                    thumb_p.unlink()
+                                    _safe_unlink(thumb_p)
                                 except OSError as exc:
                                     logger.debug("Permanent delete thumb unlink warning: %s", exc)
                         self.db.delete(cand)
