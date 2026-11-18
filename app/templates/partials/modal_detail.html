@@ -196,6 +196,23 @@
                 </div>
                 {% endif %}
 
+                {% if deleted_duplicate_paths %}
+                <div class="mt-4 p-3 rounded-xl bg-slate-900/90 border border-sky-800/60 space-y-2">
+                    <div class="font-bold text-sky-300 text-xs">🗂️ Historia usuniętych duplikatów powiązanych z tym plikiem ({{ deleted_duplicate_paths|length }} szt.):</div>
+                    <div class="space-y-1 max-h-36 overflow-y-auto">
+                        {% for ddp in deleted_duplicate_paths %}
+                        <div class="flex items-center justify-between p-1.5 rounded bg-slate-950/90 border border-borderBg text-[10px]">
+                            <div class="truncate pr-2" title="{{ ddp.volume_label }} ({{ ddp.drive_letter }}{{ ddp.relative_path }})">
+                                <span class="bg-slate-800 text-sky-300 border border-sky-700/60 px-1 rounded font-semibold mr-1">USUNIĘTY DUPLIKAT</span>
+                                <span class="text-amber-300 font-semibold">{{ ddp.volume_label }}</span>
+                                <span class="font-mono text-slate-300">({{ ddp.drive_letter }}{{ ddp.relative_path }})</span>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
                 <div class="mt-5 flex gap-2">
                     <button onclick="this.closest('.fixed').remove(); htmx.ajax('GET', '/semantic/similar/{{ item.id }}', '#media-grid');"
                             class="flex-1 bg-purple-800 hover:bg-purple-700 text-white py-2 rounded-lg font-medium transition">

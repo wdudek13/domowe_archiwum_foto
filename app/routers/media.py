@@ -12,7 +12,7 @@ from sqlalchemy import desc, asc, select, or_, func, extract, and_
 from sqlalchemy.orm import Session, joinedload, aliased
 
 from app.database import get_db, THUMBNAILS_DIR
-from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding
+from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, DeletedDuplicateHistory
 from app.operation_log import ProcessManager
 from app.scanner import MetadataDateResolver
 from app.storage_ops import StorageAutomationService
@@ -108,6 +108,41 @@ def _build_cross_vault_backup_map(db: Session, items: List[MediaItem]) -> dict:
     return result
 
 
+def _build_deleted_dup_history_map(db: Session, items: List[MediaItem], q: Optional[str] = None) -> tuple[dict, dict]:
+    """Returns (counts_by_hash, query_matches_by_hash) for DeletedDuplicateHistory entries matching displayed items."""
+    if not items:
+        return {}, {}
+    hashes = list({it.file_hash for it in items if it.file_hash})
+    if not hashes:
+        return {}, {}
+    counts_by_hash = dict(
+        db.execute(
+            select(DeletedDuplicateHistory.file_hash, func.count(DeletedDuplicateHistory.id))
+            .where(DeletedDuplicateHistory.file_hash.in_(hashes))
+            .group_by(DeletedDuplicateHistory.file_hash)
+        ).all()
+    )
+    matches_by_hash = defaultdict(list)
+    if q and q.strip():
+        clean_q = q.strip()
+        like_pattern = f"%{clean_q}%"
+        rows = db.scalars(
+            select(DeletedDuplicateHistory).where(
+                DeletedDuplicateHistory.file_hash.in_(hashes),
+                or_(
+                    DeletedDuplicateHistory.file_name.ilike(like_pattern),
+                    DeletedDuplicateHistory.relative_path.ilike(like_pattern),
+                    DeletedDuplicateHistory.volume_label.ilike(like_pattern),
+                ),
+            )
+        ).all()
+        for row in rows:
+            lst = matches_by_hash[row.file_hash]
+            if len(lst) < 3:
+                lst.append(f"{row.volume_label} ({row.drive_letter}{row.relative_path})")
+    return counts_by_hash, dict(matches_by_hash)
+
+
 def apply_media_filters(
     stmt,
     db: Session,
@@ -199,11 +234,19 @@ def apply_media_filters(
         stmt = stmt.where(MediaItem.id.in_(get_unbacked_primary_ids_subquery()))
     if q and q.strip():
         clean_q = q.strip()
+        del_hist_hashes = select(DeletedDuplicateHistory.file_hash).where(
+            or_(
+                DeletedDuplicateHistory.file_name.ilike(f"%{clean_q}%"),
+                DeletedDuplicateHistory.relative_path.ilike(f"%{clean_q}%"),
+                DeletedDuplicateHistory.volume_label.ilike(f"%{clean_q}%"),
+            )
+        )
         stmt = stmt.outerjoin(MediaItem.tags).where(
             or_(
                 MediaItem.file_name.ilike(f"%{clean_q}%"),
                 MediaItem.relative_path.ilike(f"%{clean_q}%"),
                 MediaTag.tag.ilike(f"%{clean_q}%"),
+                MediaItem.file_hash.in_(del_hist_hashes),
             )
         )
     return stmt
@@ -463,6 +506,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         ) or 0
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
+    deleted_dup_counts_by_hash, deleted_dup_matches_by_hash = _build_deleted_dup_history_map(db, items, q)
 
     return {
         "timeline": dict(grouped),
@@ -470,6 +514,8 @@ def build_search_context(request: Request, db: Session) -> dict:
         "total_matching": total_matching,
         "total_redundant_dups": redundant_dup_count_filtered,
         "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
+        "deleted_dup_counts_by_hash": deleted_dup_counts_by_hash,
+        "deleted_dup_matches_by_hash": deleted_dup_matches_by_hash,
         "total_size_mb": total_size_bytes / (1024 * 1024),
         "page": page_int,
         "page_size": page_size_int,
@@ -681,6 +727,13 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
         defect_labels.append({"tag": "do_usuniecia:rozmyte", "name": f"Rozmyte / brak ostrości (wynik: {blur_val})", "desc": "Niski wskaźnik ostrości Laplaciana", "badge_class": "bg-amber-950 text-amber-300 border-amber-700"})
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, [it] + duplicate_copies)
+    deleted_duplicate_paths = list(
+        db.scalars(
+            select(DeletedDuplicateHistory)
+            .where(DeletedDuplicateHistory.file_hash == it.file_hash)
+            .order_by(DeletedDuplicateHistory.volume_label.asc(), DeletedDuplicateHistory.relative_path.asc())
+        ).all()
+    )
 
     return render_template(
         request,
@@ -690,6 +743,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,
+            "deleted_duplicate_paths": deleted_duplicate_paths,
             "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
             "folder_date_str": folder_date_str,
             "quality_tags": quality_tags,

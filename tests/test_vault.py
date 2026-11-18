@@ -29,6 +29,7 @@ from app.models import (
     MediaEmbedding,
     BackgroundJob,
     OperationLogEntry,
+    DeletedDuplicateHistory,
 )
 from app.backup import BackupManager
 from app.operation_log import OperationLogger, ProcessManager
@@ -4433,6 +4434,44 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(res_ro["processed_count"], 1)
                 self.assertFalse(p_ro_dup.exists())
                 self.assertIsNone(db.get(MediaItem, it_ro_dup.id))
+
+                # Deleted duplicate paths must be preserved in deleted_duplicate_history and searchable without restoring duplicates
+                hist_rows = list(db.scalars(select(DeletedDuplicateHistory).where(DeletedDuplicateHistory.file_hash == rec_items[0].file_hash)).all())
+                hist_names = {h.file_name for h in hist_rows}
+                self.assertIn("rec_ro_dup.jpg", hist_names)
+                self.assertIn("rec_live_dup.jpg", hist_names)
+                self.assertIn("rec_ghost_dup.jpg", hist_names)
+
+                for vm in ("grid", "table"):
+                    r_hist_q = self.client.get(f"/media/search?q=rec_ro_dup.jpg&view_mode={vm}")
+                    self.assertEqual(r_hist_q.status_code, 200)
+                    self.assertIn("rec_orig.jpg", r_hist_q.text)
+                    self.assertIn("Dawny duplikat", r_hist_q.text)
+
+                r_hist_det = self.client.get(f"/media/{rec_items[0].id}/detail")
+                self.assertEqual(r_hist_det.status_code, 200)
+                self.assertIn("Historia usuniętych duplikatów powiązanych z tym plikiem", r_hist_det.text)
+                self.assertIn("rec_ro_dup.jpg", r_hist_det.text)
+
+                # Verify historical recovery from a pre-deletion SQLite backup file
+                p_hist_bkp_dup = self.drive_a / "rec_from_backup_hist_dup.jpg"
+                p_hist_bkp_dup.write_bytes(p_rec_o.read_bytes())
+                it_hist_bkp_dup = FileScannerService.process_file(p_hist_bkp_dup, vol_a)
+                db.add(it_hist_bkp_dup)
+                db.commit()
+                snap_bkp_path = self.root / "pre_delete_snap.db"
+                src_conn = sqlite3.connect(self.db_path.as_posix())
+                dst_conn = sqlite3.connect(snap_bkp_path.as_posix())
+                src_conn.backup(dst_conn)
+                dst_conn.close()
+                src_conn.close()
+                db.delete(it_hist_bkp_dup)
+                db.commit()
+                recovered_cnt = svc.recover_deleted_duplicate_history_from_backup(snap_bkp_path)
+                self.assertGreaterEqual(recovered_cnt, 1)
+                r_rec_q = self.client.get("/media/search?q=rec_from_backup_hist_dup.jpg")
+                self.assertEqual(r_rec_q.status_code, 200)
+                self.assertIn("rec_orig.jpg", r_rec_q.text)
 
     def test_maintenance_vacuum_and_orphan_thumbnails(self):
         with self.TestingSessionLocal() as db:

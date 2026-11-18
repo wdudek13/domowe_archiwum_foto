@@ -450,7 +450,21 @@
                         hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container">
                         {{ item.file_name }}
                     </td>
-                    <td class="p-2 font-mono text-[11px] text-slate-300 truncate max-w-[200px]" title="{{ item.relative_path }}">{{ item.relative_path }}</td>
+                    <td class="p-2 font-mono text-[11px] text-slate-300 truncate max-w-[200px]" title="{{ item.relative_path }}">
+                        <div>{{ item.relative_path }}</div>
+                        {% if deleted_dup_matches_by_hash is defined and deleted_dup_matches_by_hash.get(item.file_hash) %}
+                        <div class="text-[9px] text-sky-300 font-mono truncate cursor-pointer hover:underline"
+                             hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container"
+                             title="Znaleziono po dawnej ścieżce usuniętego duplikatu: {{ deleted_dup_matches_by_hash[item.file_hash]|join(', ') }}">
+                            🗂️ Dawny duplikat: {{ deleted_dup_matches_by_hash[item.file_hash][0] }}
+                        </div>
+                        {% elif deleted_dup_counts_by_hash is defined and deleted_dup_counts_by_hash.get(item.file_hash) %}
+                        <div class="text-[9px] text-sky-400/90 font-mono cursor-pointer hover:underline"
+                             hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container">
+                            🗂️ Usunięte kopie: {{ deleted_dup_counts_by_hash[item.file_hash] }}
+                        </div>
+                        {% endif %}
+                    </td>
                     <td class="p-2 font-mono text-[11px] text-amber-300">{{ item.volume.volume_label }} ({{ item.volume.last_known_drive_letter }})</td>
                     <td class="p-2">
                         {% if item.group %}
@@ -723,6 +737,19 @@
                             <span class="truncate max-w-[110px]" title="{{ item.relative_path }}">{{ item.relative_path }}</span>
                             <span>{{ "%.1f"|format(item.file_size_bytes / (1024*1024)) }} MB</span>
                         </div>
+
+                        {% if deleted_dup_matches_by_hash is defined and deleted_dup_matches_by_hash.get(item.file_hash) %}
+                        <div class="text-[9px] text-sky-300 font-mono truncate cursor-pointer hover:underline"
+                             hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container"
+                             title="Znaleziono po dawnej ścieżce usuniętego duplikatu: {{ deleted_dup_matches_by_hash[item.file_hash]|join(', ') }}">
+                            🗂️ Dawny duplikat: {{ deleted_dup_matches_by_hash[item.file_hash][0] }}
+                        </div>
+                        {% elif deleted_dup_counts_by_hash is defined and deleted_dup_counts_by_hash.get(item.file_hash) %}
+                        <div class="text-[9px] text-sky-400/90 font-mono truncate cursor-pointer hover:underline"
+                             hx-get="/media/{{ item.id }}/detail" hx-target="#modal-container">
+                            🗂️ Usunięte kopie: {{ deleted_dup_counts_by_hash[item.file_hash] }}
+                        </div>
+                        {% endif %}
 
                         {% if duplicates_only %}
                         <div class="pt-1 border-t border-borderBg/60 flex items-center justify-between text-[9px]">

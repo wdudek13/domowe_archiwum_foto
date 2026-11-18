@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import stat
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sqlalchemy import select, text, update, delete, func
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.backup import BackupManager
 import app.database as db_module
-from app.models import MediaItem, WindowsVolume, MediaGroup
+from app.models import MediaItem, WindowsVolume, MediaGroup, DeletedDuplicateHistory
 from app.operation_log import OperationLogger
 from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 
@@ -1467,6 +1468,87 @@ class StorageAutomationService:
             "summary": summary_msg,
         }
 
+    def _record_deleted_duplicate_history(
+        self,
+        cand: MediaItem,
+        vol: Optional[WindowsVolume],
+        orig_id: Optional[str] = None,
+    ) -> None:
+        """Records the former path and volume of a permanently deleted duplicate linked to its cluster file_hash."""
+        self.db.execute(
+            text(
+                """
+                INSERT OR IGNORE INTO deleted_duplicate_history (
+                    deleted_item_id, original_item_id, file_hash, volume_id,
+                    volume_label, drive_letter, relative_path, file_name, deleted_at
+                ) VALUES (
+                    :deleted_item_id, :original_item_id, :file_hash, :volume_id,
+                    :volume_label, :drive_letter, :relative_path, :file_name, :deleted_at
+                )
+                """
+            ),
+            {
+                "deleted_item_id": cand.id,
+                "original_item_id": orig_id,
+                "file_hash": cand.file_hash,
+                "volume_id": cand.volume_id,
+                "volume_label": vol.volume_label if vol else "",
+                "drive_letter": vol.last_known_drive_letter if vol else "",
+                "relative_path": cand.relative_path,
+                "file_name": cand.file_name,
+                "deleted_at": datetime.datetime.utcnow(),
+            },
+        )
+
+    def recover_deleted_duplicate_history_from_backup(self, backup_db_path: Path) -> int:
+        """
+        Imports deleted duplicate paths from a pre-deletion SQLite backup database into deleted_duplicate_history
+        for all items that were removed from media_items but still have a surviving copy in the current DB.
+        """
+        if not backup_db_path or not backup_db_path.exists():
+            return 0
+        self.db.commit()
+        target_db = db_module.DB_PATH
+        conn = sqlite3.connect(target_db.as_posix(), timeout=30.0)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA busy_timeout = 30000;")
+            cur.execute("ATTACH DATABASE ? AS old_db", (backup_db_path.as_posix(),))
+            before_cnt = cur.execute("SELECT count(*) FROM main.deleted_duplicate_history").fetchone()[0]
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO main.deleted_duplicate_history (
+                    deleted_item_id, original_item_id, file_hash, volume_id,
+                    volume_label, drive_letter, relative_path, file_name, deleted_at
+                )
+                SELECT
+                    o.id,
+                    (
+                        SELECT m.id FROM main.media_items m
+                        WHERE m.file_hash = o.file_hash AND m.is_trashed = 0
+                        ORDER BY m.is_primary_duplicate DESC, m.effective_date ASC, m.id ASC
+                        LIMIT 1
+                    ),
+                    o.file_hash,
+                    o.volume_id,
+                    COALESCE(v.volume_label, ''),
+                    COALESCE(v.last_known_drive_letter, ''),
+                    o.relative_path,
+                    o.file_name,
+                    CURRENT_TIMESTAMP
+                FROM old_db.media_items o
+                LEFT JOIN old_db.windows_volumes v ON v.id = o.volume_id
+                WHERE NOT EXISTS (SELECT 1 FROM main.media_items m WHERE m.id = o.id)
+                  AND EXISTS (SELECT 1 FROM main.media_items m2 WHERE m2.file_hash = o.file_hash AND m2.is_trashed = 0);
+                """
+            )
+            conn.commit()
+            after_cnt = cur.execute("SELECT count(*) FROM main.deleted_duplicate_history").fetchone()[0]
+            cur.execute("DETACH DATABASE old_db")
+            return max(0, int(after_cnt - before_cnt))
+        finally:
+            conn.close()
+
     def execute_safe_duplicate_removal(
         self,
         item_ids: List[str],
@@ -1688,6 +1770,7 @@ class StorageAutomationService:
                             if delete_mode == "trash":
                                 cand.is_trashed = True
                             else:
+                                self._record_deleted_duplicate_history(cand, vol, orig_id=orig.id if orig else None)
                                 self.db.delete(cand)
                             self.db.commit()
                             removed_ids.add(cand.id)
@@ -1807,6 +1890,7 @@ class StorageAutomationService:
                                     _safe_unlink(tp)
                                 except OSError as exc:
                                     logger.debug("Thumb unlink warning %s: %s", tp, exc)
+                        self._record_deleted_duplicate_history(cand, vol, orig_id=orig.id if orig else None)
                         self.db.delete(cand)
 
                     removed_ids.add(cand.id)

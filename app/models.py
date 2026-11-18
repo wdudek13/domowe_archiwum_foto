@@ -151,3 +151,23 @@ class OperationLogEntry(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, index=True, nullable=False)
+
+
+class DeletedDuplicateHistory(Base):
+    """Preserves former paths, filenames, and volume metadata of permanently deleted duplicates linked to Originals via file_hash."""
+    __tablename__ = "deleted_duplicate_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deleted_item_id: Mapped[Optional[str]] = mapped_column(String(36), index=True, nullable=True)
+    original_item_id: Mapped[Optional[str]] = mapped_column(String(36), index=True, nullable=True)
+    file_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    volume_id: Mapped[Optional[int]] = mapped_column(Integer, index=True, nullable=True)
+    volume_label: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    drive_letter: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    deleted_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_del_dup_hist_unique", "file_hash", "volume_id", "relative_path", unique=True),
+    )

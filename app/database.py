@@ -152,6 +152,31 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         cur.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS media_tags_fts USING fts5(media_id UNINDEXED, tag, source_model UNINDEXED);"
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deleted_duplicate_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                deleted_item_id VARCHAR(36),
+                original_item_id VARCHAR(36),
+                file_hash VARCHAR(64) NOT NULL,
+                volume_id INTEGER,
+                volume_label VARCHAR(128) DEFAULT '' NOT NULL,
+                drive_letter VARCHAR(16) DEFAULT '' NOT NULL,
+                relative_path TEXT NOT NULL,
+                file_name VARCHAR(255) NOT NULL,
+                deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_del_dup_hist_unique ON deleted_duplicate_history (file_hash, volume_id, relative_path);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_deleted_duplicate_history_file_hash ON deleted_duplicate_history (file_hash);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_deleted_duplicate_history_file_name ON deleted_duplicate_history (file_name);"
+        )
         # Clear legacy false-positive date anomalies caused solely by missing EXIF or copy timestamps on EXIF files
         if m_cols:
             cur.execute(
