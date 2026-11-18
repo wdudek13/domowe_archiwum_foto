@@ -32,12 +32,17 @@ class StorageAutomationService:
         connected_map = WindowsVolumeInspector.get_connected_vsn_map()
         volumes = list(self.db.scalars(select(WindowsVolume)).all())
         now = datetime.datetime.utcnow()
+        dirty = False
         for vol in volumes:
+            prev_online = vol.is_online
+            prev_letter = vol.last_known_drive_letter
+            prev_total = int(vol.total_space_bytes or 0)
+            prev_free = int(vol.free_space_bytes or 0)
+
             if vol.volume_serial_number in connected_map:
                 root_letter, _ = connected_map[vol.volume_serial_number]
-                vol.last_known_drive_letter = root_letter
-                vol.is_online = True
-                vol.last_seen_at = now
+                new_letter = root_letter
+                new_online = True
             else:
                 dl = (vol.last_known_drive_letter or "").strip()
                 is_drive_root = bool(re.fullmatch(r"[A-Za-z]:\\?", dl))
@@ -45,20 +50,49 @@ class StorageAutomationService:
                 if connected_map and (is_drive_root or is_hw_vsn):
                     # Real drive enumeration found no match for this VSN, so the drive is genuinely disconnected
                     # even if another USB device reused the same Windows drive letter.
-                    vol.is_online = False
+                    new_online = False
                 else:
-                    vol.is_online = bool(dl and Path(dl).exists())
-                    if vol.is_online:
-                        vol.last_seen_at = now
+                    new_online = bool(dl and Path(dl).exists())
+                new_letter = vol.last_known_drive_letter
 
-            if vol.is_online:
+            new_total, new_free = prev_total, prev_free
+            if new_online:
                 try:
-                    usage = shutil.disk_usage(vol.last_known_drive_letter)
-                    vol.total_space_bytes = int(usage.total)
-                    vol.free_space_bytes = int(usage.free)
+                    usage = shutil.disk_usage(new_letter)
+                    new_total = int(usage.total)
+                    new_free = int(usage.free)
                 except Exception as exc:
-                    logger.debug("disk_usage update skipped for %s: %s", vol.last_known_drive_letter, exc)
-        self.db.commit()
+                    logger.debug("disk_usage update skipped for %s: %s", new_letter, exc)
+
+            stale_seen = (
+                new_online
+                and (
+                    vol.last_seen_at is None
+                    or abs((now - vol.last_seen_at.replace(tzinfo=None)).total_seconds()) > 60
+                )
+            )
+            changed = (
+                (new_online != prev_online)
+                or (new_letter != prev_letter)
+                or (new_total != prev_total)
+                or (abs(new_free - prev_free) > 1024 * 1024)
+                or stale_seen
+            )
+            if changed:
+                vol.is_online = new_online
+                vol.last_known_drive_letter = new_letter
+                vol.total_space_bytes = new_total
+                vol.free_space_bytes = new_free
+                if new_online:
+                    vol.last_seen_at = now
+                dirty = True
+
+        if dirty:
+            try:
+                self.db.commit()
+            except Exception as exc:
+                logger.debug("refresh_volumes_online_status commit deferred (DB busy): %s", exc)
+                self.db.rollback()
         return volumes
 
     def get_volume_space_map(self, volumes: List[WindowsVolume], commit_updates: bool = True) -> Dict[int, Optional[Dict[str, Any]]]:
@@ -72,9 +106,14 @@ class StorageAutomationService:
             if v.is_online:
                 try:
                     u = shutil.disk_usage(v.last_known_drive_letter)
-                    v.total_space_bytes = int(u.total)
-                    v.free_space_bytes = int(u.free)
-                    dirty = True
+                    new_total = int(u.total)
+                    new_free = int(u.free)
+                    prev_total = int(v.total_space_bytes or 0)
+                    prev_free = int(v.free_space_bytes or 0)
+                    if new_total != prev_total or abs(new_free - prev_free) > 1024 * 1024:
+                        v.total_space_bytes = new_total
+                        v.free_space_bytes = new_free
+                        dirty = True
                 except Exception as exc:
                     logger.debug("disk_usage warning for %s: %s", v.last_known_drive_letter, exc)
 
@@ -95,7 +134,11 @@ class StorageAutomationService:
                 vol_space[v.id] = None
 
         if dirty and commit_updates:
-            self.db.commit()
+            try:
+                self.db.commit()
+            except Exception as exc:
+                logger.debug("get_volume_space_map commit deferred (DB busy): %s", exc)
+                self.db.rollback()
         return vol_space
 
     def flag_duplicate_clusters(self) -> int:
@@ -1436,6 +1479,7 @@ class StorageAutomationService:
                 processed_count=0,
                 total_count=len(item_ids),
                 message="Weryfikacja dysków i aktualizacja klastrów duplikatów...",
+                db=self.db,
             )
 
         self.refresh_volumes_online_status()
@@ -1480,11 +1524,11 @@ class StorageAutomationService:
             if progress_cb:
                 progress_cb(step_idx, total_candidates, msg_text, drive_text)
             if job_id:
-                ProcessManager.update_progress(
+                ProcessManager.update_cache_only(
                     job_id,
+                    message=msg_text,
                     processed_count=step_idx,
                     total_count=total_candidates,
-                    message=msg_text,
                 )
 
         if progress_cb:
@@ -1495,6 +1539,7 @@ class StorageAutomationService:
                 processed_count=0,
                 total_count=total_candidates,
                 message=f"Przygotowanie usuwania ({total_candidates} plików)...",
+                db=self.db,
             )
 
         volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
@@ -1579,6 +1624,7 @@ class StorageAutomationService:
                             it.is_trashed = True
                         else:
                             self.db.delete(it)
+                        self.db.commit()
                         removed_ids.add(it.id)
                         processed_count += 1
                     _report_step(drive_label, f"[{step_idx}/{total_candidates}] {drive_label} (offline): {it.file_name}")
@@ -1617,6 +1663,16 @@ class StorageAutomationService:
 
                     cand_path = Path(vol.last_known_drive_letter) / cand.relative_path
                     if not cand_path.exists():
+                        if Path(vol.last_known_drive_letter).exists():
+                            # Duplicate file was already physically deleted before previous session was interrupted -> reconcile DB record
+                            if delete_mode == "trash":
+                                cand.is_trashed = True
+                            else:
+                                self.db.delete(cand)
+                            self.db.commit()
+                            removed_ids.add(cand.id)
+                            processed_count += 1
+                            drive_processed_cnt += 1
                         missing_on_disk += 1
                         continue
 
@@ -1682,6 +1738,7 @@ class StorageAutomationService:
                             cand.hash_algorithm = "sha256_verified"
                         except Exception as exc:
                             logger.debug("Rehash collision separate skipped for %s: %s", cand_path, exc)
+                        self.db.commit()
                         continue
 
                     if ref_item is not None and full_sha:
@@ -1752,8 +1809,7 @@ class StorageAutomationService:
                     processed_count += 1
                     drive_processed_cnt += 1
 
-                if processed_count > 0 and processed_count % 50 == 0:
-                    self.db.commit()
+                self.db.commit()
 
             if drive_processed_cnt > 0:
                 processed_drives.append(f"{vol.volume_label} ({vol.last_known_drive_letter}): {drive_processed_cnt} szt.")
@@ -1768,6 +1824,7 @@ class StorageAutomationService:
                     processed_count=step_idx,
                     total_count=total_candidates,
                     message="Aktualizacja tagów klastrów duplikatów...",
+                    db=self.db,
                 )
             self.flag_duplicate_clusters()
 
@@ -1797,6 +1854,10 @@ class StorageAutomationService:
             )
         # Sort offline drives with duplicates to delete from most duplicates to fewest
         offline_drives_info.sort(key=lambda d: (-d["delete_count"], -d["verify_only_count"], d["volume_id"]))
+
+        if not offline_drives_info and offline_items:
+            blocked_verify += len(offline_items)
+            offline_items.clear()
 
         next_offline_prompt = offline_drives_info[0] if offline_drives_info else None
         return {

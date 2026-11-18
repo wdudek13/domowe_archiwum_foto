@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Domowe Archiwum Foto — Szczegółowa Dokumentacja Techniczna i Architektoniczna</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #111827;
+            --text-primary: #f8fafc;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --accent-blue: #38bdf8;
+            --accent-emerald: #34d399;
+            --accent-amber: #fbbf24;
+            --accent-purple: #c084fc;
+            --accent-rose: #fb7185;
+            --border-color: #334155;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.65;
+        }
+        header {
+            background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 2.5rem 2rem;
+            text-align: center;
+        }
+        header h1 {
+            margin: 0 0 0.5rem 0;
+            font-size: 2.25rem;
+            color: var(--accent-blue);
+            letter-spacing: -0.02em;
+        }
+        header p {
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+            max-width: 900px;
+            margin-inline: auto;
+        }
+        .badge-row {
+            margin-top: 1.2rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            justify-content: center;
+        }
+        .badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            border: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+        }
+        .badge.emerald { color: var(--accent-emerald); border-color: #065f46; }
+        .badge.blue { color: var(--accent-blue); border-color: #075985; }
+        .badge.amber { color: var(--accent-amber); border-color: #78350f; }
+        .badge.purple { color: var(--accent-purple); border-color: #581c87; }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 290px 1fr;
+            max-width: 1440px;
+            margin: 0 auto;
+            gap: 2rem;
+            padding: 2rem;
+        }
+        @media (max-width: 980px) {
+            .layout { grid-template-columns: 1fr; }
+        }
+        nav.toc {
+            position: sticky;
+            top: 1.5rem;
+            align-self: start;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 1.25rem;
+            max-height: calc(100vh - 3rem);
+            overflow-y: auto;
+        }
+        nav.toc h2 {
+            margin-top: 0;
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent-blue);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.5rem;
+        }
+        nav.toc ol {
+            margin: 0;
+            padding-left: 1.2rem;
+            font-size: 0.86rem;
+        }
+        nav.toc li { margin-bottom: 0.45rem; }
+        nav.toc a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.15s;
+        }
+        nav.toc a:hover { color: var(--accent-blue); }
+        main { min-width: 0; }
+        section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 1.75rem 2rem;
+            margin-bottom: 2rem;
+        }
+        section h2 {
+            margin-top: 0;
+            color: var(--accent-blue);
+            font-size: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.6rem;
+        }
+        section h3 {
+            color: var(--accent-emerald);
+            font-size: 1.15rem;
+            margin-top: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        p, li { color: var(--text-secondary); }
+        code {
+            font-family: 'Cascadia Code', Consolas, monospace;
+            background: var(--bg-card);
+            color: #e2e8f0;
+            padding: 0.15rem 0.4rem;
+            border-radius: 0.3rem;
+            font-size: 0.88em;
+            border: 1px solid #1e293b;
+        }
+        pre {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            padding: 1rem 1.25rem;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+        }
+        pre code { background: none; padding: 0; border: none; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+        th, td {
+            border: 1px solid var(--border-color);
+            padding: 0.65rem 0.85rem;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background: var(--bg-card);
+            color: var(--accent-blue);
+            font-weight: 600;
+        }
+        tr:nth-child(even) td { background: rgba(15, 23, 42, 0.45); }
+        .callout {
+            border-left: 4px solid var(--accent-emerald);
+            background: rgba(16, 185, 129, 0.08);
+            padding: 1rem 1.25rem;
+            border-radius: 0 0.5rem 0.5rem 0;
+            margin: 1rem 0;
+        }
+        .callout.warn {
+            border-left-color: var(--accent-amber);
+            background: rgba(245, 158, 11, 0.08);
+        }
+        .callout.info {
+            border-left-color: var(--accent-blue);
+            background: rgba(56, 189, 248, 0.08);
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.25rem;
+            margin-top: 1rem;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 0.6rem;
+            padding: 1.15rem;
+        }
+        .card h4 {
+            margin-top: 0;
+            color: var(--accent-amber);
+            font-size: 1rem;
+        }
+        footer {
+            text-align: center;
+            padding: 2rem;
+            border-top: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>📸 Domowe Archiwum Foto — Dokumentacja Techniczna</h1>
+    <p>Architektura systemu, klastrowanie ról duplikatów i backupów, algorytmy 100% weryfikacji binarnej, silnik AI/CV On-Demand oraz kluczowe wnioski inżynieryjne</p>
+    <div class="badge-row">
+        <span class="badge emerald">Python 3.11+ / FastAPI</span>
+        <span class="badge blue">SQLite WAL + SSD Staged Backup (.db.gz)</span>
+        <span class="badge amber">Win32 Kernel32 VSN Tracking</span>
+        <span class="badge purple">OpenCV + ONNX Runtime (On-Demand)</span>
+        <span class="badge emerald">100% Weryfikacja Binarna i Klastrowa</span>
+    </div>
+</header>
+
+<div class="layout">
+    <nav class="toc" aria-label="Spis treści">
+        <h2>Spis treści</h2>
+        <ol>
+            <li><a href="#architektura">1. Architektura i Zasady Projektowe</a></li>
+            <li><a href="#dyski-vsn">2. Śledzenie Dysków USB (Win32 VSN)</a></li>
+            <li><a href="#baza-sqlite">3. Baza SQLite i Konserwacja (VACUUM)</a></li>
+            <li><a href="#klastry-role">4. Model Ról Klastra i Znacznik ORYGINAŁ ✓</a></li>
+            <li><a href="#backup-plan">5. Silnik Planowania i Wykonania Backupu</a></li>
+            <li><a href="#move-backups">6. Przenoszenie Backupów Między Dyskami</a></li>
+            <li><a href="#safe-dup-delete">7. Bezpieczne Usuwanie Duplikatów Dysk-po-Dysku</a></li>
+            <li><a href="#albumy-multimedia">8. Albumy, Daty i Odporność Dekodera</a></li>
+            <li><a href="#ai-cv">9. Silnik AI / Computer Vision (On-Demand)</a></li>
+            <li><a href="#wnioski">10. Czego nauczyliśmy się o systemie (Wnioski Inżynieryjne)</a></li>
+            <li><a href="#api-endpoints">11. Specyfikacja Punktów Końcowych REST / HTMX</a></li>
+        </ol>
+    </nav>
+
+    <main>
+        <section id="architektura">
+            <h2>1. Architektura i Zasady Projektowe</h2>
+            <p>
+                <strong>Domowe Archiwum Foto</strong> to aplikacja <em>local-first</em> działająca na <code>localhost:8000</code>, zaprojektowana do zarządzania kolekcjami rzędu dziesiątek i setek tysięcy zdjęć oraz filmów rozproszonych na wielu zewnętrznych dyskach USB i pendrive'ach.
+            </p>
+            <div class="grid-2">
+                <div class="card">
+                    <h4>Zero-Startup-Overhead</h4>
+                    <p>Podczas startu serwera FastAPI żadne modele sieci neuronowych nie są ładowane do pamięci RAM. Sesje ONNX Runtime (<code>MobileNetV2</code>) oraz klasyfikatory OpenCV są otwierane wyłącznie na czas trwania zadania i natychmiast zwalniane (<code>del</code> + <code>gc.collect()</code>).</p>
+                </div>
+                <div class="card">
+                    <h4>Rozdział Backupu od Usuwania Duplikatów</h4>
+                    <p>Operacja tworzenia kopii zapasowych (<code>🛡️ Backup zdjęć/filmów</code>) jest całkowicie odseparowana od kasowania nadmiarowych kopii (<code>👥 Duplikaty binarne</code>). Backup jest w 100% niedestrukcyjny dla oryginałów, a usuwanie duplikatów wymaga spełnienia wielowarstwowych bramek bezpieczeństwa.</p>
+                </div>
+            </div>
+
+            <h3>Struktura Katalogów Projektu</h3>
+            <pre><code>domowe_archiwum_foto/
+├── app/
+│   ├── ai/
+│   │   ├── embeddings.py       # 512-wymiarowe wektory cech wizualnych (CIE LAB + HSV + Krawędzie Sobel)
+│   │   ├── quality.py          # Odporne dekodowanie obrazów + detekcja ostrości (8x8 Patch) i wad jakości
+│   │   └── tagger.py           # Tagowanie obiektów i scen (ONNX MobileNetV2 + Haar Cascade + analiza HSV)
+│   ├── cloud/
+│   │   └── google_drive.py     # Integracja Google Drive API v3 (OAuth 2.0 + MD5 + retencja 1 kopii bazy)
+│   ├── routers/
+│   │   ├── actions.py          # Operacje dyskowe, backup, bezpieczne usuwanie duplikatów, konserwacja SQLite
+│   │   ├── media.py            # Wyszukiwanie SQLite, mapa cross-vault backup, strumieniowanie raw/HEIC/MOV
+│   │   └── semantic.py         # Wyszukiwanie semantyczne i 6 trybów podobieństwa wizualnego w RAM
+│   ├── templates/              # Szablony HTML5 + HTMX + TailwindCSS (base, index, partials/*)
+│   ├── backup.py               # Transakcyjny BackupManager (bufor SSD staging + kompresja gzip .db.gz)
+│   ├── database.py             # Silnik SQLAlchemy, PRAGMA WAL/FULL, automatyczne migracje schematu i FTS5
+│   ├── models.py               # Modele ORM (WindowsVolume, MediaItem, MediaGroup, MediaTag, BackgroundJob...)
+│   ├── operation_log.py        # Trwały rejestr operacji (operations.log) oraz ProcessManager z cache RAM
+│   ├── scanner.py              # Win32 VSN Inspector, FastHasher (weryfikacja 100%), DateResolver, ThumbnailService
+│   └── storage_ops.py          # Planowanie backupu, przenoszenie backupów, bezpieczne usuwanie duplikatów
+├── data/
+│   ├── db/media_vault.db       # Główna baza danych SQLite (tryb WAL)
+│   ├── backups/                # Lokalna rotowana kopia bazy SQLite + podkatalog bufora SSD (staging/)
+│   ├── logs/operations.log     # Trwały dziennik audytowy wszystkich operacji
+│   ├── thumbnails/             # Lokalny cache miniatur WebP (300 px) umożliwiający pracę w trybie Offline
+│   └── kosz/                   # Lokalny bezpieczny Kosz umożliwiający przywrócenie plików na dysk macierzysty
+└── tests/
+    └── test_vault.py           # Kompleksowy zestaw testów jednostkowych i integracyjnych</code></pre>
+        </section>
+
+        <section id="dyski-vsn">
+            <h2>2. Śledzenie Zewnętrznych Dysków USB (Win32 Kernel32 VSN)</h2>
+            <p>
+                Klasa <code>WindowsVolumeInspector</code> (<code>app/scanner.py</code>) odczytuje sprzętowy numer seryjny wolumenu (<strong>VSN</strong>) za pomocą <code>GetVolumeInformationW</code> oraz mapuje wszystkie zamontowane napędy przez <code>GetLogicalDrives</code>.
+                Metoda <code>StorageAutomationService.refresh_volumes_online_status()</code> weryfikuje obecność VSN w mapie zamontowanych napędów: nawet jeśli system Windows przypisze dawną literę odłączonego dysku (np. <code>E:\</code>) innemu pendrive'owi, brak zgodności numeru VSN gwarantuje poprawne oznaczenie odłączonego dysku jako <code>is_online = False</code>.
+                Dla każdego podłączonego dysku w tabeli <code>windows_volumes</code> zapisywane są wartości <code>total_space_bytes</code> oraz <code>free_space_bytes</code>, które służą jako pamięć podręczna pojemności, gdy dysk przejdzie w stan Offline.
+            </p>
+        </section>
+
+        <section id="baza-sqlite">
+            <h2>3. Baza Danych SQLite, Buforowany Backup SSD i Konserwacja (VACUUM)</h2>
+            <p>Każde połączenie z bazą danych SQLite ustawia bezpieczne parametry transakcyjne (<code>WAL</code>, <code>synchronous = FULL</code>, <code>busy_timeout = 30000</code>). Klasa <code>BackupManager</code> (<code>app/backup.py</code>) realizuje 3-etapowy proces tworzenia kopii bazy:</p>
+            <ol>
+                <li><strong>Etap 1 (Bufor SSD):</strong> Kopiowanie stron bazy za pomocą natywnego <code>sqlite3.Connection.backup()</code> do lokalnego katalogu <code>data/backups/staging/</code> na szybkim dysku lokalnym (eliminuje blokady i wolne losowe zapisy na zewnętrznych dyskach USB).</li>
+                <li><strong>Etap 2 (Opcjonalny <code>DELETE media_embeddings</code> + <code>VACUUM</code> + <code>gzip</code>):</strong> Dla lekkiego backupu usuwane są wektory 512-D i wykonywany jest <code>VACUUM</code> na pliku tymczasowym, po czym strumień jest kompresowany w locie do <code>.db.gz</code> (redukcja rozmiaru o ok. 80%).</li>
+                <li><strong>Etap 3 (Atomowy zapis):</strong> Zapis do pliku <code>.tmp</code> na nośniku docelowym (<code>daf_backup/db_backups/</code> lub Google Drive) i atomowa zmiana nazwy na docelową.</li>
+            </ol>
+            <p>
+                Dodatkowo punkt końcowy <code>POST /actions/vacuum-db</code> umożliwia na żądanie wykonanie <code>PRAGMA wal_checkpoint(TRUNCATE); VACUUM;</code> na głównej bazie danych, a <code>POST /actions/cleanup-orphan-thumbs</code> usuwa nieużywane pliki <code>.webp</code> z katalogu <code>data/thumbnails/</code>.
+            </p>
+        </section>
+
+        <section id="klastry-role">
+            <h2>4. Model Ról Klastra (<code>duplicate_role</code>) i Znacznik <code>ORYGINAŁ ✓</code></h2>
+            <p>
+                Metoda <code>StorageAutomationService.flag_duplicate_clusters()</code> wykonuje zapytanie okienkowe CTE w SQLite, przypisując każdemu nieusuniętemu rekordowi w klastrze (o tym samym <code>file_hash</code>) jedną z czterech ról w kolumnie <code>duplicate_role</code>:
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rola (<code>duplicate_role</code>)</th>
+                        <th>Reguła Wyboru w Klastrze SQL</th>
+                        <th>Reprezentacja w UI</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>original</code></td>
+                        <td>Pozycja #1 w klastrze (<code>is_primary_duplicate = 1</code>). Preferuje pliki spoza <code>daf_backup/</code> znajdujące się na dysku posiadającym lokalne duplikaty (aby oryginał trafił do albumu <em>Ważne</em>), rozstrzygając remisy wg najstarszej daty efektywnej i ścieżki.</td>
+                        <td>Zielony <code>ORYGINAŁ ✓</code> (gdy posiada kopię w <code>daf_backup/</code> na innym dysku) lub niebieski <code>ORYGINAŁ</code>.</td>
+                    </tr>
+                    <tr>
+                        <td><code>backup_green</code></td>
+                        <td>Pozycja #2 w klastrze znajdująca się na <strong>innym wolumenie fizycznym</strong> (<code>volume_id != orig_vol_id</code>) niż Oryginał (z priorytetem dla plików już umieszczonych w <code>daf_backup/</code>).</td>
+                        <td>Zielony <code>BACKUP</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>backup_orange</code></td>
+                        <td>Pozycja #2 w klastrze znajdująca się na <strong>tym samym wolumenie</strong> (<code>volume_id == orig_vol_id</code>) co Oryginał (występuje wyłącznie wtedy, gdy klaster nie ma jeszcze żadnej kopii na innym dysku).</td>
+                        <td>Pomarańczowy <code>BACKUP</code></td>
+                    </tr>
+                    <tr>
+                        <td><code>duplicate</code></td>
+                        <td>Pozycja #3 i każda kolejna w klastrze (<code>final_rn &ge; 3</code>). Nadmiarowa kopia kwalifikująca się do bezpiecznego usunięcia.</td>
+                        <td>Czerwony <code>DUPLIKAT</code></td>
+                    </tr>
+                </tbody>
+            </table>
+            <p>
+                <strong>Świadomość kopii w <code>daf_backup/</code> mimo ukrycia w galerii:</strong> Funkcja <code>apply_media_filters()</code> wyklucza pliki z <code>is_backup_copy == True</code> z widoku galerii, natomiast funkcja <code>_build_cross_vault_backup_map()</code> (<code>app/routers/media.py</code>) sprawdza w tle wszystkie nieusunięte rekordy <code>is_backup_copy == True</code> o tym samym <code>file_hash</code> na innych wolumenach, dzięki czemu Oryginał otrzymuje zielony znacznik <code>ORYGINAŁ ✓</code> wraz z informacją, na którym dysku spoczywa jego backup.
+            </p>
+        </section>
+
+        <section id="backup-plan">
+            <h2>5. Silnik Planowania i Wykonania Backupu (<code>daf_backup/RRRR/MM/DD/</code>)</h2>
+            <p>Metoda <code>build_backup_and_dedup_plan()</code> buduje kompletny plan zabezpieczenia kolekcji:</p>
+            <ul>
+                <li><strong>Niezmiennik statystyk:</strong> <code>missing_backups + green_backups + orange_backups == total_unique</code>.</li>
+                <li><strong>Automatyczny dobór dysków docelowych (<code>default_target_volume_ids</code>):</strong> Sortuje dyski rosnąco według liczby posiadanych oryginałów (<code>orig_count_by_vol</code>) oraz malejąco według wolnej przestrzeni (<code>free_space_bytes</code>), dobierając minimalny zestaw dysków pokrywający zapotrzebowanie na nowe kopie.</li>
+                <li><strong>Trzy strumienie operacji plikowych (z dokładnością do dnia <code>RRRR/MM/DD</code>):</strong>
+                    <ol>
+                        <li><code>backups_to_copy</code> (<em>Nowe kopie</em>): dla klastrów bez zielonego backupu (czyli <code>missing_backups</code> oraz <code>orange_backups</code>) kopiuje Oryginał na wybrany dysk docelowy do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                        <li><code>backups_to_relocate</code> (<em>Kopie lokalne</em>): dla zielonych backupów leżących poza <code>daf_backup/</code> (gdy <code>minimize_transfers=True</code> lub kopia już leży na wybranym dysku docelowym) przenosi plik w obrębie tego samego dysku do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                        <li><code>backups_remote_move</code> (<em>Kopie zdalne</em>): gdy użytkownik wyłączy opcję <em>Zminimalizuj przeniesienia</em> (<code>minimize_transfers=False</code>), przenosi zielone backupy z dysków niebędących docelowymi na wybrane dyski docelowe do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                    </ol>
+                </li>
+                <li><strong>Przypisanie 1-do-1 dla albumu „Ważne” i bilans zgodności (<code>reconciliation</code>):</strong> Każdy oryginał posiadający lokalną kopię na tym samym dysku jest przypisywany dokładnie do jednej aktywnej pary w harmonogramie (<code>_pick_pair_for_important</code>) i umieszczany w hierarchii <code>Ważne - &lt;Etykieta_Dysku&gt; &rarr; RRRR &rarr; MM &rarr; DD</code>. Suma operacji na parach w harmonogramie jest w 100% równa ogólnemu planowi.</li>
+            </ul>
+        </section>
+
+        <section id="move-backups">
+            <h2>6. Przenoszenie Backupów Między Urządzeniami</h2>
+            <p>
+                Metody <code>analyze_move_backups()</code> oraz <code>execute_move_backups()</code> obsługują dedykowane okno <code>🚚 Przenieś backupy</code>:
+            </p>
+            <ul>
+                <li>Dla wybranej pary <code>(source_volume_id, target_volume_id)</code> analizowane są wszystkie pliki <code>is_backup_copy</code> / <code>backup_green</code> / <code>backup_orange</code> na dysku źródłowym.</li>
+                <li><strong>Twarda blokada separacji urządzeń:</strong> Jeżeli w klastrze danego pliku na dysku docelowym (<code>target_volume_id</code>) znajduje się już Oryginał (lub inna kopia niebędąca backupem), plik jest oznaczany jako <code>blocked_same_device_count</code> i <strong>nie zostaje przeniesiony</strong>.</li>
+                <li>Każdy kwalifikujący się plik jest kopiowany do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym, weryfikowany funkcją <code>verify_files_identical_100_percent</code> i dopiero po pełnym potwierdzeniu usuwany z dysku źródłowego.</li>
+            </ul>
+        </section>
+
+        <section id="safe-dup-delete">
+            <h2>7. Bezpieczne Usuwanie Duplikatów Dysk-po-Dysku (100% Weryfikacji)</h2>
+            <p>
+                Usuwanie nadmiarowych kopii (<code>execute_safe_duplicate_removal</code> w <code>app/storage_ops.py</code> oraz worker <code>_run_duplicate_removal_worker</code> w <code>app/routers/actions.py</code>) realizuje wieloetapowy protokół bezpieczeństwa:
+            </p>
+            <div class="callout">
+                <strong>Dwuwarstwowa Bramka Bezpieczeństwa (Safety Gates) przed usunięciem każdego pliku:</strong>
+                <ol>
+                    <li><strong>Safety Gate 1 (Ochrona ról i liczebności klastra):</strong> Plik z rolą <code>original</code> lub flagą <code>is_backup_copy == True</code> nigdy nie może zostać usunięty. Ponadto w klastrze po odjęciu usuwanego kandydata muszą pozostać przy życiu co najmniej 2 kopie (<code>len(surviving) &ge; 2</code>: Oryginał + Backup). W przeciwnym razie operacja jest blokowana (<code>blocked_safety += 1</code>).</li>
+                    <li><strong>Safety Gate 2 (Weryfikacja 100% Online oraz Cross-Metadata Offline):</strong>
+                        <ul>
+                            <li>Gdy w klastrze istnieje kopia referencyjna (Oryginał lub Backup) na aktualnie podłączonym dysku (ONLINE), wykonywana jest 5-warstwowa weryfikacja <code>FastHasher.verify_files_identical_100_percent(ref_path, cand_path)</code> (ochrona <code>samefile</code>/hardlink, rozmiar, pełne SHA-256 + BLAKE2b + MD5, <code>filecmp.cmp</code> bajt-po-bajcie oraz <code>Image.verify()</code>).</li>
+                            <li>Gdy usuwany duplikat <code>cand</code> leży na dysku ONLINE, natomiast zarówno Oryginał, jak i Backup znajdują się na odłączonych dyskach OFFLINE, uruchamiana jest metoda <code>FastHasher.verify_candidate_against_cluster_metadata()</code> sprawdzająca dokładny rozmiar bajtowy, pełny skrót kryptograficzny SHA-256 na dysku oraz poprawność struktury obrazu względem zapisanych metadanych klastra. Pozwala to bezpiecznie usunąć duplikat na podłączonym dysku bez proszenia użytkownika o podłączanie dysku referencyjnego/backupowego.</li>
+                        </ul>
+                    </li>
+                </ol>
+            </div>
+        </section>
+
+        <section id="albumy-multimedia">
+            <h2>8. Albumy, Korekta Dat i Odporność Dekodera Obrazów</h2>
+            <ul>
+                <li><strong>Odporność na częściowo ucięte pliki JPEG i osadzone podglądy:</strong> Moduły <code>app/ai/quality.py</code> (<code>decode_image_array</code>) oraz <code>app/scanner.py</code> (<code>ThumbnailService</code>) wykorzystują <code>ImageFile.LOAD_TRUNCATED_IMAGES = True</code>, wielostopniowy fallback (<code>cv2.imdecode</code> &rarr; <code>PIL.Image</code> &rarr; <code>extract_embedded_frame</code> wyciągający osadzony strumień JPEG z uszkodzonych kontenerów) oraz atomowy zapis miniatur WebP przez pliki tymczasowe.</li>
+                <li><strong>Rozwiązywanie dat (<code>MetadataDateResolver.evaluate_date_sources</code>):</strong> Obecność daty EXIF zawsze ma najwyższy priorytet i nigdy nie generuje fałszywej anomalii. Przy braku EXIF porównywane są: data utworzenia (<code>fs_ctime</code>), data modyfikacji (<code>fs_mtime</code>), data z nazwy pliku oraz data z nazwy folderu (z tolerancją dnia w nazwie folderu przy zgodnym roku i miesiącu).</li>
+            </ul>
+        </section>
+
+        <section id="ai-cv">
+            <h2>9. Silnik AI / Computer Vision (On-Demand)</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Komponent</th>
+                        <th>Plik Źródłowy</th>
+                        <th>Specyfikacja Techniczna</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Detekcja Ostrości i Wad Jakości</td>
+                        <td><code>app/ai/quality.py</code></td>
+                        <td>Analiza wykonywana wyłącznie przy fizycznym dostępie do pliku oryginału (pliki Offline są pomijane, by nie badać skompresowanych miniatur). Wykrywa 6 klas wad: <code>uszkodzone</code>, <code>rozmyte</code>, <code>niedoswietlone</code>, <code>przeswietlone</code>, <code>brak_detali</code>, <code>niska_rozdzielczosc</code>.</td>
+                    </tr>
+                    <tr>
+                        <td>Tagowanie Obiektów i Scen</td>
+                        <td><code>app/ai/tagger.py</code></td>
+                        <td><code>MobileNetV2 (ONNX Runtime)</code> z preprocesingiem bez zniekształceń proporcji (Center Crop 224&times;224) + <code>Haar Cascade</code> + heurystyki barwne HSV.</td>
+                    </tr>
+                    <tr>
+                        <td>Wektory Podobieństwa 512-D</td>
+                        <td><code>app/ai/embeddings.py</code></td>
+                        <td>Znormalizowany wektor <code>512 float32</code> łączący siatkę przestrzenną <code>8&times;8 CIE LAB</code> (192-D), dwustrefowy histogram <code>HSV</code> (256-D) i orientację krawędzi <code>Sobel</code> (64-D). Wyszukiwanie <code>/semantic/similar/{id}</code> działa w 100% w pamięci RAM bez blokowania SQLite.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section id="wnioski">
+            <h2>10. Czego nauczyliśmy się o systemie — Kluczowe Wnioski Inżynieryjne</h2>
+            <p>Rozwój i testy na rzeczywistych, wielodyskowych kolekcjach zdjęć przyniosły sześć fundamentalnych lekcji architektonicznych zaimplementowanych w obecnej wersji systemu:</p>
+            <div class="grid-2">
+                <div class="card">
+                    <h4>1. Zero zapisów do SQLite podczas <code>sqlite3.Connection.backup()</code></h4>
+                    <p>Gdy proces w tle tworzy kopię bazy SQLite i jednocześnie próbuje zapisywać procentowy postęp tego zadania do tabeli <code>background_jobs</code> w tej samej bazie źródłowej, mechanizm <code>sqlite3.backup()</code> wykrywa modyfikację stron i restartuje kopiowanie od początku. Wprowadzenie aktualizacji wyłącznie w pamięci RAM (<code>ProcessManager.update_cache_only</code>) na czas backupu całkowicie wyeliminowało zawieszanie się Etapu 1/2.</p>
+                </div>
+                <div class="card">
+                    <h4>2. Weryfikacja z metadanych eliminuje pytania o puste dyski</h4>
+                    <p>Gdy 3. kopia (duplikat) leżała na podłączonym dysku, a jej Oryginał i Backup znajdowały się na odłączonych dyskach (np. na dedykowanym dysku backupowym z <code>daf_backup/</code>, który w galerii pokazuje 0 zdjęć), klasyczne porównanie dwóch plików wymagało podłączenia dysku backupowego. Dodanie metody <code>verify_candidate_against_cluster_metadata</code> pozwoliło zweryfikować plik lokalnie względem pełnego SHA-256 w bazie i prosić użytkownika <strong>wyłącznie o dyski, na których faktycznie leżą duplikaty do usunięcia</strong>.</p>
+                </div>
+                <div class="card">
+                    <h4>3. Jednokrotny backup bazy w operacjach wielodyskowych</h4>
+                    <p>Podczas usuwania duplikatów rozłożonych na kilka odłączonych dysków USB, kliknięcie <em>„Kontynuuj na podłączonym dysku”</em> nie powinno ponawiać kopii zapasowej bazy SQLite. Przekazanie flagi <code>skip_db_backup=True</code> oraz <code>continue_job_id</code> sprawiło, że zrzut bazy robi się tylko raz na starcie, a kolejne dyski są czyszczone natychmiast.</p>
+                </div>
+                <div class="card">
+                    <h4>4. Skalowanie zaznaczeń dla 50 000+ plików</h4>
+                    <p>Zaznaczenie wszystkich nadmiarowych duplikatów na wszystkich stronach wymagało trzech usprawnień: (a) trwałego zbioru <code>window.persistedSelectedIds</code> w JS przesyłanego jako <code>selected_ids_json</code>, (b) zwiększenia limitu parsera formularzy Starlette/FastAPI (<code>max_fields=250000</code>, <code>64 MB</code>) oraz (c) dzielenia zapytań SQL <code>IN (...)</code> na paczki po <code>5000</code> elementów, aby nigdy nie przekroczyć limitu <code>32766</code> parametrów zmiennych w SQLite.</p>
+                </div>
+                <div class="card">
+                    <h4>5. Ukryta kartoteka <code>daf_backup/</code>, ale jawny status <code>ORYGINAŁ ✓</code></h4>
+                    <p>Użytkownik nie chce widzieć kopii zapasowych z <code>daf_backup/</code> podczas przeglądania zdjęć, ale w widoku duplikatów i szczegółów musi mieć pewność, które oryginały są już chronione. Rozwiązaniem jest filtrowanie <code>is_backup_copy == False</code> w zapytaniach galerii przy jednoczesnym budowaniu mapy <code>_build_cross_vault_backup_map</code> z tabeli <code>media_items</code>.</p>
+                </div>
+                <div class="card">
+                    <h4>6. Rozliczanie 1-do-1 w harmonogramie par dysków</h4>
+                    <p>Jeśli dysk A tworzy pary zarówno z dyskiem B, jak i z dyskiem C, przypisywanie kandydatów do albumu <em>„Ważne”</em> na podstawie samego udziału dysku A w parze powodowało podwójne zliczanie tych samych plików przy obu parach. Przypisanie każdego kandydata 1-do-1 do jednej wybranej pary (<code>_pick_pair_for_important</code>) zapewniło pełną zgodność bilansu (<code>reconciliation</code>).</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="api-endpoints">
+            <h2>11. Specyfikacja Punktów Końcowych REST / HTMX</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metoda i Ścieżka</th>
+                        <th>Opis Działania</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>GET /</code>, <code>GET /przewodnik</code>, <code>GET /dokumentacja</code></td><td>Główny interfejs galerii, przewodnik użytkownika oraz dokumentacja techniczna.</td></tr>
+                    <tr><td><code>GET /media/sidebar</code>, <code>GET /media/search</code></td><td>Panel boczny i filtrowanie SQLite z obsługą paginacji, wad jakości i mapy <code>ORYGINAŁ ✓</code>.</td></tr>
+                    <tr><td><code>GET /media/{id}/detail</code>, <code>GET /media/{id}/raw</code></td><td>Szczegóły pliku oraz strumieniowanie oryginału (z konwersją HEIC/TIFF do JPEG i transkodowaniem MOV/AVI do MP4 w locie).</td></tr>
+                    <tr><td><code>GET /actions/redundant-duplicate-ids</code><br><code>POST /actions/refresh-duplicate-tags</code></td><td>Pobranie pełnej listy ID nadmiarowych kopii (<code>duplicate_role == 'duplicate'</code>) ze wszystkich stron filtra oraz przeliczenie ról klastrowych.</td></tr>
+                    <tr><td><code>GET /actions/backup-panel</code><br><code>POST /actions/backup-panel</code><br><code>POST /actions/execute-backup</code></td><td>Planowanie i wykonywanie backupu do <code>daf_backup/RRRR/MM/DD/</code> z wyborem dysków docelowych i opcją <em>Zminimalizuj przeniesienia</em>.</td></tr>
+                    <tr><td><code>GET /actions/move-backups-panel</code><br><code>POST /actions/execute-move-backups</code></td><td>Analiza i bezpieczne przenoszenie istniejących backupów między wybraną parą dysków z blokadą tego samego urządzenia co Oryginał.</td></tr>
+                    <tr><td><code>POST /actions/delete-permanently</code><br><code>POST /actions/move-to-trash</code><br><code>GET /actions/dup-delete-status</code><br><code>POST /actions/dup-delete-stop</code></td><td>Asynchroniczne, 2-etapowe usuwanie duplikatów (lub przenoszenie do Kosza) dysk-po-dysku z 100% weryfikacją binarną i obsługą <code>skip_db_backup</code>.</td></tr>
+                    <tr><td><code>POST /actions/vacuum-db</code><br><code>POST /actions/cleanup-orphan-thumbs</code></td><td>Kompaktowanie pliku bazy SQLite (<code>VACUUM</code>) oraz usuwanie osieroconych miniatur z <code>data/thumbnails/</code>.</td></tr>
+                    <tr><td><code>GET /actions/gdrive-panel</code><br><code>POST /actions/backup-db-to-medium</code><br><code>POST /actions/restore-db-from-medium</code><br><code>POST /actions/gdrive-sync</code><br><code>POST /actions/gdrive-restore-db</code></td><td>Tworzenie i przywracanie pełnych lub lekkich kopii bazy SQLite (<code>.db</code> / <code>.db.gz</code>) na nośnikach USB oraz w chmurze Google Drive (z automatycznym zachowaniem 1 najnowszej kopii).</td></tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+</div>
+
+<footer>
+    Domowe Archiwum Foto &mdash; Dokumentacja Techniczna HTML5 &bull; Lokalna Architektura Zero-Data-Loss SQLite + FastAPI + OpenCV
+</footer>
+
+</body>
+</html>

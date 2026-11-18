@@ -16,6 +16,7 @@
             --accent-2: #38bdf8;
             --emerald: #34d399;
             --amber: #fbbf24;
+            --orange: #fb923c;
             --rose: #fb7185;
             --purple: #c084fc;
         }
@@ -76,7 +77,7 @@
             max-width: 1280px;
             margin: 0 auto;
             display: grid;
-            grid-template-columns: 290px 1fr;
+            grid-template-columns: 300px 1fr;
             gap: 1.75rem;
             padding: 1.75rem 1.5rem 4rem;
         }
@@ -164,6 +165,18 @@
             font-weight: 600;
             white-space: nowrap;
         }
+        .tag-pill {
+            display: inline-block;
+            padding: 0.1rem 0.5rem;
+            border-radius: 0.3rem;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #fff;
+        }
+        .tag-green { background: #059669; }
+        .tag-blue { background: #0369a1; }
+        .tag-orange { background: #ea580c; }
+        .tag-red { background: #be123c; }
         kbd {
             background: #0f172a;
             border: 1px solid #475569;
@@ -234,11 +247,12 @@
                 <div class="brand-badge">DAF</div>
                 <div>
                     <h1>Przewodnik Użytkownika — Domowe Archiwum Foto</h1>
-                    <p class="subtitle">Instrukcja krok po kroku: bezpieczne porządkowanie zdjęć na wielu dyskach USB, backup, praca Offline, AI i chmura Google Drive</p>
+                    <p class="subtitle">Kompletna instrukcja obsługi: skanowanie dysków USB, backup <code>daf_backup/</code>, bezpieczne usuwanie duplikatów, albumy, AI i chmura Google Drive</p>
                 </div>
             </div>
             <div class="header-actions">
                 <a href="/" class="btn-link primary">🏠 Otwórz Galerię</a>
+                <a href="/szybki-start" class="btn-link">🚀 Szybki Start (Workflow)</a>
                 <a href="/dokumentacja" class="btn-link">🛠️ Dokumentacja Techniczna</a>
             </div>
         </div>
@@ -250,15 +264,17 @@
             <ol>
                 <li><a href="#r1">Szybki start i budowa ekranu</a></li>
                 <li><a href="#r2">Podłączanie i skanowanie dysków USB</a></li>
-                <li><a href="#r3">Przeglądanie galerii i wyszukiwanie podobnych</a></li>
-                <li><a href="#r4">Backup i 100% bezpieczna deduplikacja</a></li>
-                <li><a href="#r5">Albumy i Podalbumy (Organizacja)</a></li>
-                <li><a href="#r6">Tryb Offline i Lista TODO</a></li>
-                <li><a href="#r7">Podgląd, obracanie, zoom i Pełny Ekran</a></li>
-                <li><a href="#r8">Zmiana daty i lista anomalii dat</a></li>
-                <li><a href="#r9">Analiza AI oraz Status i Log Operacji</a></li>
-                <li><a href="#r10">Google Drive — kopia i przywracanie bazy</a></li>
-                <li><a href="#r11">Lokalny Kosz i odzyskiwanie plików</a></li>
+                <li><a href="#r3">Przeglądanie galerii i 6 trybów podobieństwa</a></li>
+                <li><a href="#r4">Backup zdjęć i filmów (<code>daf_backup/</code>)</a></li>
+                <li><a href="#r5">Przenoszenie backupów między dyskami</a></li>
+                <li><a href="#r6">Duplikaty binarne — tagi i 100% bezpieczne usuwanie</a></li>
+                <li><a href="#r7">Albumy, Podalbumy i Przenoszenie plików</a></li>
+                <li><a href="#r8">Podgląd, obracanie, zoom, TV i Pełny Ekran</a></li>
+                <li><a href="#r9">Zmiana daty i niezgodności dat</a></li>
+                <li><a href="#r10">Analiza AI, Wady jakości oraz Konserwacja bazy</a></li>
+                <li><a href="#r11">Kopia Bazy SQLite (USB / Google Drive)</a></li>
+                <li><a href="#r12">Lokalny Kosz i odzyskiwanie plików</a></li>
+                <li><a href="#r13">Najważniejsze zasady i doświadczenia z pracy z systemem</a></li>
             </ol>
         </nav>
 
@@ -266,24 +282,34 @@
             <section id="r1" class="chapter">
                 <h2>1. Szybki start i budowa ekranu</h2>
                 <p>
-                    <strong>Domowe Archiwum Foto</strong> działa lokalnie na Twoim komputerze z systemem Windows, bez wysyłania zdjęć na obce serwery.
-                    Wszystkie indeksy i miniaturki znajdują się w katalogu programu <code>data/</code>, dzięki czemu możesz przeglądać całą kolekcję nawet wtedy, gdy zewnętrzne pendrive'y i dyski USB są schowane w szufladzie.
+                    <strong>Domowe Archiwum Foto</strong> działa w 100% lokalnie na Twoim komputerze z systemem Windows.
+                    Wszystkie indeksy, wektory AI oraz lekkie miniatury <code>WebP</code> są przechowywane w katalogu <code>data/</code>, dzięki czemu możesz przeglądać, wyszukiwać i organizować całą kolekcję nawet wtedy, gdy zewnętrzne dyski USB i pendrive'y są odłączone (w trybie <strong>Offline</strong>).
                 </p>
                 <h3>Jak uruchomić program</h3>
                 <ol class="steps">
                     <li>Kliknij dwukrotnie plik <code>run.bat</code> (lub uruchom w PowerShell skrypt <code>.\start.ps1</code>).</li>
-                    <li>Poczekaj kilka sekund na uruchomienie lokalnego serwera WWW.</li>
-                    <li>Otwórz w przeglądarce adres <code>http://localhost:8000</code> (lub wpisz z innego urządzenia w domowej sieci Wi-Fi adres Twojego komputera na porcie <code>8000</code>).</li>
+                    <li>Poczekaj kilka sekund na start lokalnego serwera FastAPI.</li>
+                    <li>Otwórz w przeglądarce adres <code>http://localhost:8000</code>.</li>
                 </ol>
-                <h3>Co gdzie znajduje się na ekranie</h3>
+                <h3>Układ głównych przycisków na górnym pasku</h3>
                 <div class="grid-2">
                     <div class="mini-card">
                         <strong>Górny pasek narzędzi</strong>
-                        Szybki dostęp do: <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>, <span class="ui-btn">📋 Lista TODO (Offline)</span>, <span class="ui-btn">⚙️ Status i Log Operacji</span>, <span class="ui-btn">☁️ Google Drive Archiwum</span> oraz niniejszego <span class="ui-btn">📖 Przewodnik</span>.
+                        <ul>
+                            <li><span class="ui-btn">🛡️ Backup zdjęć/filmów</span> — planowanie i tworzenie kopii zapasowych w <code>daf_backup/RRRR/MM/DD/</code> oraz tworzenie albumów <em>Ważne</em>.</li>
+                            <li><span class="ui-btn">🚚 Przenieś backupy</span> — bezpieczne przenoszenie istniejących kopii zapasowych z jednego dysku na drugi.</li>
+                            <li><span class="ui-btn">⚙️ Status i Log Operacji</span> — podgląd zadań w tle, dziennik <code>operations.log</code>, kompaktowanie bazy (<code>VACUUM</code>) i czyszczenie miniatur.</li>
+                            <li><span class="ui-btn">💾 Kopia Bazy &amp; Chmura</span> — kopie bazy SQLite na dyskach USB oraz na Google Drive.</li>
+                        </ul>
                     </div>
                     <div class="mini-card">
                         <strong>Lewy panel boczny</strong>
-                        Lista wszystkich rozpoznanych dysków USB ze statusem <kbd>Online</kbd> / <kbd>Offline</kbd> i wolnym miejscem w GB, drzewo Twoich <strong>Albumów</strong>, tagi AI, lata oraz szybkie filtry problemów (duplikaty, anomalie dat, rozmyte, bez backupu, Kosz).
+                        <ul>
+                            <li><strong>Zbiory główne:</strong> Wszystkie multimedia, Nieprzypisane do albumów, <em>Brak backupu na innym dysku</em>, <em>Niezgodność dat</em>, <em>Duplikaty binarne</em>.</li>
+                            <li><strong>Wady jakości (do usunięcia):</strong> Rozwijana lista kategorii wad (uszkodzone, rozmyte, ciemne, prześwietlone, brak detali, niska rozdzielczość).</li>
+                            <li><strong>Zdjęcia bez danych Analizy AI:</strong> Szybki filtr zdjęć bez tagów, bez wektorów 512-D lub bez analizy ostrości.</li>
+                            <li><strong>Drzewo Albumów, Tagi AI oraz Nośniki USB</strong> (ze statusem 🟢 Online / 🔴 Offline i paskiem wolnego miejsca w GB).</li>
+                        </ul>
                     </div>
                 </div>
             </section>
@@ -291,211 +317,255 @@
             <section id="r2" class="chapter">
                 <h2>2. Podłączanie i skanowanie dysków USB / pendrive'ów</h2>
                 <p>
-                    System Windows potrafi przy kolejnym podpięciu nadać temu samemu pendrive'owi inną literę dysku (raz <code>E:\</code>, innym razem <code>G:\</code>).
-                    <strong>Domowe Archiwum Foto</strong> rozpoznaje nośniki po sprzętowym numerze seryjnym wolumenu (<strong>Windows VSN</strong>), dlatego nigdy nie myli dysków.
+                    System Windows potrafi nadać temu samemu pendrive'owi inną literę dysku po przepięciu do innego portu (np. <code>E:\</code> zamiast <code>F:\</code>).
+                    <strong>Domowe Archiwum Foto</strong> identyfikuje każdy nośnik po sprzętowym numerze seryjnym wolumenu (<strong>Windows VSN</strong>), dzięki czemu zawsze bezbłędnie rozpoznaje fizyczne urządzenie.
                 </p>
                 <ol class="steps">
                     <li>Podłącz dysk USB lub pendrive do komputera.</li>
-                    <li>Wpisz literę dysku lub konkretny folder (np. <code>E:\</code> albo <code>D:\Zdjecia</code>) w polu skanowania na górze ekranu.</li>
-                    <li>Kliknij <span class="ui-btn">Skanuj dysk</span>. Program policzy sumy kontrolne, wyciągnie najstarszą datę i utworzy lekkie miniatury <code>WebP</code> na dysku lokalnym.</li>
-                    <li>Jeśli przerwiesz duże skanowanie lub chcesz odświeżyć zmienione pliki, możesz włączyć <span class="ui-btn">Re-indeksuj</span> lub wznowić przerwane zadanie w panelu <span class="ui-btn">⚙️ Status i Log Operacji</span>.</li>
+                    <li>Wpisz literę dysku lub ścieżkę folderu (np. <code>E:\</code> albo <code>D:\Zdjecia</code>) w polu na górze ekranu i kliknij <span class="ui-btn">Skanuj dysk</span>.</li>
+                    <li>Program oblicza sumy kontrolne, ustala datę wykonania zdjęcia, tworzy miniaturę <code>WebP</code> oraz wektor wizualny 512-D.</li>
+                    <li>Aby nadać dyskowi czytelną nazwę (np. <em>Dysk_Rodzina_1TB</em>), najedź na dysk w lewym panelu bocznym i kliknij ikonę ołówka <span class="ui-btn">✏️</span>.</li>
                 </ol>
-                <div class="callout">
-                    <strong>Wskazówka:</strong> Po wybraniu dysku w lewym panelu bocznym możesz kliknąć ikonę ołówka / zmianę nazwy dysku i nadać mu czytelną etykietę, np. <em>Pendrive_Kopia_Rodzina</em> albo <em>Dysk_Toshiba_2TB</em>.
-                </div>
             </section>
 
             <section id="r3" class="chapter">
                 <h2>3. Przeglądanie galerii i 6 trybów wyszukiwania podobnych zdjęć</h2>
                 <p>
-                    Pasek filtrów na górze pozwala zawęzić widok według dysku, podfolderu, albumu, roku, typu pliku (<em>Zdjęcia / Wideo</em>), tagów oraz jakości obrazu.
-                    Możesz przełączać styl wyświetlania między osią czasu, gęstą siatką miniatur i tabelą techniczną.
+                    Górny pasek filtrów pozwala błyskawicznie przełączać widok: <strong>Oś czasu</strong> (pogrupowana dniami), <strong>Widok Gęsty (Kompakt)</strong> oraz <strong>Widok Tabela (Lista)</strong>, a także sortować zdjęcia według daty, rozmiaru, nazwy lub ostrości (od najbardziej rozmytych).
                 </p>
-                <h3>6 trybów wyszukiwania podobieństwa</h3>
-                <p>Kliknij zdjęcie, aby je powiększyć, a następnie wybierz <span class="ui-btn">🔍 Podobne</span> (lub skorzystaj z paska wyszukiwania semantycznego):</p>
+                <h3>6 trybów wyszukiwania wizualnego i semantycznego</h3>
+                <p>Kliknij przycisk <span class="ui-btn">🔍 Podobne</span> na kafelku zdjęcia lub w podglądzie pełnoekranowym, aby uruchomić ranking dopasowania w 6 trybach:</p>
                 <table>
                     <thead>
-                        <tr><th>Tryb wyszukiwania</th><th>Do czego służy najlepiej</th></tr>
+                        <tr><th>Tryb podobieństwa</th><th>Zastosowanie praktyczne</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><strong>Hybrydowe</strong></td><td>Łączy cechy obiektów AI, kolorystykę oraz podobieństwo wizualne sceny.</td></tr>
-                        <tr><td><strong>Duplikaty wizualne (CIE LAB)</strong></td><td>Znajduje niemal identyczne ujęcia zrobione seryjnie lub po lekkim skompresowaniu/przycięciu.</td></tr>
-                        <tr><td><strong>Te same obiekty AI</strong></td><td>Wyszukuje zdjęcia przedstawiające tę samą kategorię scen lub obiektów (np. pies, plaża, góry).</td></tr>
-                        <tr><td><strong>Paleta barw HSV</strong></td><td>Znajduje ujęcia o identycznej kolorystyce (np. zachody słońca, zimowe krajobrazy).</td></tr>
-                        <tr><td><strong>Ta sama sesja czasowa</strong></td><td>Grupuje fotografie wykonane w bardzo bliskim odstępie czasu z tego samego wydarzenia.</td></tr>
-                        <tr><td><strong>Kompozycja i Twarze</strong></td><td>Dopasowuje zdjęcia portretowe o podobnym układzie kadru.</td></tr>
+                        <tr><td><strong>🧠 Hybrydowe (Wszystkie cechy)</strong></td><td>Najlepszy tryb ogólny — łączy układ barw, tagi AI, czas wykonania i kompozycję.</td></tr>
+                        <tr><td><strong>🎯 Prawie identyczne / Seria (Układ 8x8 LAB)</strong></td><td>Wykrywa zdjęcia seryjne, te same ujęcia po przeskalowaniu, przycięciu lub rekompresji.</td></tr>
+                        <tr><td><strong>🏷️ Te same obiekty i scena (Tagi AI)</strong></td><td>Znajduje zdjęcia zawierające te same obiekty (np. pies, samochód, plaża, góry).</td></tr>
+                        <tr><td><strong>🎨 Paleta barw i klimat (Kolory HSV)</strong></td><td>Szuka fotografii o identycznej tonacji kolorystycznej (np. złota godzina, śnieg, błękit wody).</td></tr>
+                        <tr><td><strong>📅 Ta sama sesja / Wydarzenie (Czas + Obraz)</strong></td><td>Grupuje zdjęcia zrobione w oknie &plusmn;72 godzin z tego samego wydarzenia.</td></tr>
+                        <tr><td><strong>👤 Kompozycja, Kadr i Ludzie</strong></td><td>Dopasowuje portrety i zdjęcia grupowe o zbliżonej orientacji i układzie postaci.</td></tr>
                     </tbody>
                 </table>
             </section>
 
             <section id="r4" class="chapter">
-                <h2>4. Automatyczny Backup na inne urządzenie i 100% bezpieczna deduplikacja</h2>
+                <h2>4. Backup zdjęć i filmów (katalog <code>daf_backup/</code>)</h2>
                 <p>
-                    To najważniejszy mechanizm chroniący Twoje pamiątki przed utratą i bałaganem z dziesiątkami zbędnych kopii.
-                    Celem systemu jest stan idealny: <strong>dla każdego zdjęcia i filmu pozostaje wyłącznie 1 Oryginał + dokładnie 1 Backup na innym fizycznym dysku — i ani jednego duplikatu więcej.</strong>
+                    Moduł <span class="ui-btn">🛡️ Backup zdjęć/filmów</span> odpowiada <strong>wyłącznie za tworzenie i porządkowanie kopii zapasowych</strong> oraz wyróżnianie ważnych zdjęć w albumach (nigdy nie kasuje żadnych duplikatów).
                 </p>
-                <h3>Nowe tryby wyboru: Zakres operacji i wybrane pary dysków (A ↔ B)</h3>
-                <ul class="steps">
-                    <li><strong>Wybór zakresu operacji:</strong> przed uruchomieniem wybierasz, czy chcesz wykonać <em>Backup + Deduplikacja (oba)</em>, <em>Tylko Backup brakujących plików</em>, czy <em>Tylko Bezpieczna Deduplikacja 100%</em>.</li>
-                    <li><strong>Wybór konkretnych par urządzeń:</strong> na liście <em>Harmonogram par urządzeń (A ↔ B)</em> zaznaczasz tylko te pary nośników, które chcesz obsłużyć w tej sesji (pozostałe możesz zostawić odznaczone i obsłużyć przy kolejnym powrocie). Lista <em>Plików bez backupu na innym urządzeniu</em> automatycznie filtruje się według wybranych par dysków.</li>
-                </ul>
-
-                <h3>Trzy scenariusze pracy z Backupe'm i Deduplikacją</h3>
-                <div class="grid-2" style="grid-template-columns: 1fr;">
-                    <div class="mini-card">
-                        <strong>1. Zrobienie Offline (bez fizycznych zmian na dyskach)</strong>
-                        Kiedy Twoje pendrive'y i dyski zewnętrzne są odłączone, otwórz <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>. Program korzysta z zapisanej w bazie SQLite wolnej przestrzeni dysków (<code>free_bytes</code>), wylicza bilans miejsca (odzysk z duplikatów minus wymagany backup) i pozwala wybrać tryb (backup / deduplikacja / oba) oraz konkretne pary dysków. Kliknij <span class="ui-btn">📄 Przygotuj procedurę Offline i zapisz raport (.txt)</span> — w katalogu <code>data\reports\</code> (oraz jako pobrany plik tekstowy) powstaje szczegółowy plan wszystkich planowanych kopiowań i usunięć do sprawdzenia na spokojnie <strong>bez dotykania żadnych plików na dysku</strong>.
-                    </div>
-                    <div class="mini-card">
-                        <strong>2. Zrobienie od razu Online (ze zmianami fizycznymi)</strong>
-                        Podłącz wybrane dwa (lub więcej) dyski USB do komputera, otwórz okno <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span>, wybierz zakres operacji (Backup / Deduplikacja / Oba) oraz zaznacz gotowe pary oznaczone zieloną etykietą <kbd>ONLINE</kbd>. Kliknij <span class="ui-btn">🛡️ Wykonaj dla wybranych par (Backup / Deduplikacja)</span>. Program na bieżąco kopiuje brakujące backupy do <code>daf_backup\RRRR\RRRR-MM\</code>, przelicza wolne miejsce oraz kasuje wyłącznie w 100% zweryfikowane duplikaty w obu kierunkach (<code>A ↔ B</code>).
-                    </div>
-                    <div class="mini-card">
-                        <strong>3. Kontynuacja Offline (na podstawie poprzednio utworzonego raportu)</strong>
-                        Gdy wcześniej wygenerowałeś raport offline (<code>data\reports\raport_procedura_offline_ostatni.txt</code>), w dowolnym momencie wróć do okna <span class="ui-btn">🛡️ Backup i Deduplikacja (100%)</span> (na górze okna widoczna jest sekcja ostatniego zapisanego raportu oraz przycisk <span class="ui-btn">⬇️ Pobierz raport (.txt)</span>). Zweryfikuj zaplanowane operacje z pliku tekstowego, podłącz wskazane przez raport urządzenia, zaznacz w <em>Harmonogramie par</em> konkretną parę dysków z raportu i kliknij <span class="ui-btn">🛡️ Wykonaj dla wybranych par</span>. Dla większej liczby nośników wykonujesz kolejne pary etapami — wracając później i zaznaczając pozostałe pary lub drugi tryb (np. najpierw <em>Tylko Backup</em>, potem <em>Tylko Deduplikacja</em>).
-                    </div>
-                </div>
-
-                <h3>Zasady działania i gwarancje</h3>
-                <ul class="steps">
-                    <li><strong>Backup zawsze na innym urządzeniu:</strong> kopia zapasowa nigdy nie trafi na ten sam pendrive/dysk, na którym leży oryginał.</li>
-                    <li><strong>Zawsze w kartotece <code>daf_backup\</code>:</strong> oryginał zostaje tam, gdzie akurat jest, natomiast kopia na drugim dysku trafia (lub jest automatycznie przenoszona) do podkatalogu <code>daf_backup\RRRR\RRRR-MM\</code>. Zdjęcia z tego folderu nie pojawiają się w galerii multimediów.</li>
-                    <li><strong>Kontrola wolnego miejsca (Online i Offline):</strong> dla każdego dysku system zapisuje całkowitą i wolną przestrzeń w bazie SQLite. Nawet w trybie <em>Offline</em> znasz dostępną pojemność dysków oraz bilans miejsca (odzyskane z duplikatów minus wymagane na backupy).</li>
-                    <li><strong>Automatyczny album „Ważne”:</strong> jeśli w trakcie porządkowania okaże się, że na jednym dysku znajdował się oryginał i jego lokalny duplikat (lub gdy wśród wielu kopii wybierany jest oryginał z takiego dysku), program automatycznie dopisze ten oryginał do albumu <code>Ważne - &lt;Nazwa Urządzenia&gt; → RRRR → RRRR-MM</code>. W oknie <em>Backup i Deduplikacja</em> harmonogram par prezentuje liczbę takich plików (metryka <em>Do albumu „Ważne”</em> dla obu dysków pary), a pod harmonogramem dostępna jest dedykowana lista podglądu <em>Lista oryginałów dodawanych do albumu „Ważne…”</em>.</li>
-                </ul>
+                <h3>Zasada bilansu wszystkich unikalnych zdjęć</h3>
+                <p>Na górze okna Backupu zawsze widzisz 4 karty podsumowujące stan całego archiwum, które sumują się dokładnie co do sztuki:</p>
                 <div class="callout safe">
-                    <strong>Gwarancja 100% bezpieczeństwa przed skasowaniem duplikatu:</strong>
-                    Zanim program usunie choćby jeden nadmiarowy duplikat, weryfikuje niezależnie na wiele sposobów, że zachowywana kopia naprawdę istnieje i jest identyczna co do bajta:
-                    sprawdza różne ścieżki fizyczne, rozmiar pliku, pełny hash <strong>SHA-256</strong>, pełny hash <strong>BLAKE2b</strong>, pełny hash <strong>MD5</strong>, wykonuje bezpośrednie porównanie strumienia bajt po bajcie (<code>filecmp</code>) oraz test dekodowania obrazu. Jeśli dowolny test zawiedzie — usunięcie zostaje zablokowane.
+                    <code>Brakujące backupy (1 kopia)</code> + <code>Backupy zielone (inny dysk)</code> + <code>Backupy pomarańczowe (ten sam dysk)</code> = <strong><code>Wszystkie unikalne (Oryginały)</code></strong>
                 </div>
+
+                <h3>Wybór dysków docelowych i opcja „Zminimalizuj przeniesienia”</h3>
+                <ul class="steps">
+                    <li><strong>Wybór dysków docelowych na backup:</strong> w sekcji <em>Kontrola dostępnego miejsca na urządzeniach</em> system domyślnie zaznacza dyski mające <strong>najmniej oryginałów i najwięcej wolnego miejsca</strong> (aby służyły jako dedykowane dyski backupowe). Możesz ręcznie zaznaczyć lub odznaczyć dowolne dyski — plan i bilans wolnego miejsca po operacji przeliczą się automatycznie.</li>
+                    <li><strong>Statystyki na każdym dysku:</strong> przy każdym urządzeniu widzisz liczbę Oryginałów, liczbę prawidłowych backupów (już leżących w <code>daf_backup/</code>) oraz liczbę kopii wymagających przeniesienia (<span class="tag-pill tag-green">zielone</span> na tym dysku poza <code>daf_backup/</code> oraz <span class="tag-pill tag-orange">pomarańczowe</span> na tym samym dysku co oryginał).</li>
+                    <li><strong>Opcja <kbd>⚡ Zminimalizuj przeniesienia</kbd> (domyślnie włączona):</strong>
+                        <ul>
+                            <li>Gdy <strong>włączona</strong>: istniejące zielone kopie <code>BACKUP</code> (znajdujące się już na innym dysku niż oryginał) zostają na swoim urządzeniu i są jedynie przenoszone lokalnie do kartoteki <code>daf_backup/RRRR/MM/DD/</code> (jako <em>Kopie lokalne</em>).</li>
+                            <li>Gdy <strong>wyłączona</strong>: system konsoliduje wszystkie backupy z różnych dysków i przenosi je na wybrane dyski docelowe z minimalną liczbą oryginałów (jako <em>Kopie zdalne</em>).</li>
+                        </ul>
+                    </li>
+                </ul>
+
+                <h3>Harmonogram par urządzeń (A ↔ B) i wykonanie backupu</h3>
+                <ul class="steps">
+                    <li>W sekcji <strong>Harmonogram par urządzeń</strong> wyświetlane są <strong>wyłącznie pary posiadające zaplanowane operacje</strong>.</li>
+                    <li>Dla każdej pary widzisz czytelne rozbicie (również z podziałem na każdy z dwóch dysków):
+                        <ul>
+                            <li><strong>Kopie lokalne:</strong> zielone kopie <code>BACKUP</code> przenoszone w obrębie tego samego dysku do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                            <li><strong>Kopie zdalne:</strong> backupy przenoszone między urządzeniami do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                            <li><strong>Nowe kopie:</strong> brakujące kopie tworzone z Oryginału (dla zdjęć mających tylko 1 kopię lub mających tylko pomarańczowy backup na tym samym dysku) i zapisywane na innym dysku w <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                            <li><strong>Do albumu „Ważne”:</strong> oryginały posiadające dodatkową kopię na tym samym dysku, które zostaną wyróżnione w drzewie albumów <code>Ważne - &lt;NazwaDysku&gt; / RRRR / MM / DD</code>.</li>
+                        </ul>
+                    </li>
+                    <li>Kliknij <span class="ui-btn">🛡️ Zrób backup</span>. Każdy skopiowany plik przechodzi 100% weryfikację binarną. Pliki znajdujące się w <code>daf_backup/</code> są ukryte w galerii, aby nie zaśmiecać widoku przeglądania.</li>
+                </ul>
             </section>
 
             <section id="r5" class="chapter">
-                <h2>5. Albumy i Podalbumy (Organizacja kolekcji)</h2>
+                <h2>5. Przenoszenie backupów między urządzeniami</h2>
                 <p>
-                    Zamiast technicznego pojęcia grup używamy przejrzystych <strong>Albumów i Podalbumów</strong> (drzewa hierarchicznego w lewym panelu).
+                    Gdy kupisz nowy, większy dysk lub chcesz zwolnić miejsce na dotychczasowym dysku, kliknij przycisk <span class="ui-btn">🚚 Przenieś backupy</span> na górnym pasku.
                 </p>
-                <div class="grid-2">
-                    <div class="mini-card">
-                        <strong>Dodawanie zdjęć do albumu</strong>
-                        Zaznacz zdjęcia (lub ustaw zakres na cały filtr), kliknij <span class="ui-btn">📁 Przypisz do albumu</span>. Możesz <strong>wybrać istniejący album z listy rozwijanej</strong> albo wpisać nazwę nowego albumu.
-                    </div>
-                    <div class="mini-card">
-                        <strong>Zmiana nazwy albumu</strong>
-                        W sekcji zarządzania albumem wybierz album i użyj opcji <strong>Zmień nazwę</strong>, aby poprawić nazwę bez ruszania zdjęć.
-                    </div>
-                    <div class="mini-card">
-                        <strong>1-Klik Auto-Organizacja</strong>
-                        Dostępna <strong>wyłącznie wtedy, gdy wybierzesz konkretne urządzenie (dysk) oraz katalog</strong> w lewym panelu bocznym. Tworzy automatyczne drzewo podalbumów według dat (<code>Rok → Miesiąc</code>) lub struktury folderów dla wybranego wycinka dysku.
-                    </div>
-                    <div class="mini-card">
-                        <strong>Szybkie usuwanie albumu oraz przerzucanie</strong>
+                <ol class="steps">
+                    <li>W górnej części okna sprawdzisz, ile plików backupu (i ile MB/GB) znajduje się na każdym zarejestrowanym urządzeniu.</li>
+                    <li>Wybierz <strong>1. Urządzenie źródłowe (zabierz backupy z)</strong> oraz <strong>2. Urządzenie docelowe (przenieś backupy na)</strong>.</li>
+                    <li>System automatycznie wyliczy:
                         <ul>
-                            <li><strong>Szybkie usunięcie samego albumu:</strong> natychmiast usuwa album, a wszystkie zdjęcia wracają bezpiecznie do swobodnej puli (nie są kasowane z dysku!).</li>
-                            <li><strong>Przerzuć do innego albumu i usuń poprzedni:</strong> jednym kliknięciem przenosi wszystkie zdjęcia do docelowego albumu i kasuje stary pusty album.</li>
+                            <li><strong>Można bezpiecznie przenieść:</strong> pliki backupu, których Oryginał leży na innym dysku niż docelowy.</li>
+                            <li><strong>Pominięto (zasada różnych dysków):</strong> pliki backupu, których Oryginał znajduje się właśnie na wybranym dysku docelowym (system blokuje ich przeniesienie, aby Oryginał i Backup nigdy nie znalazły się na tym samym fizycznym nośniku!).</li>
+                            <li><strong>Prognozę wolnego miejsca:</strong> ile GB zostanie na dysku docelowym po operacji i ile MB zwolni się na dysku źródłowym.</li>
                         </ul>
-                    </div>
-                </div>
+                    </li>
+                    <li>Kliknij <span class="ui-btn">🚚 Przenieś X backupów</span> — każdy plik zostanie skopiowany do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym, zweryfikowany w 100% binarnie i dopiero wtedy usunięty z dysku źródłowego.</li>
+                </ol>
             </section>
 
             <section id="r6" class="chapter">
-                <h2>6. Tryb Offline i Lista TODO (Przenoszenie plików bez podłączonych dysków)</h2>
+                <h2>6. Duplikaty binarne — znaczenie tagów i 100% bezpieczne usuwanie</h2>
                 <p>
-                    W trybie <strong>Offline</strong> możesz porządkować swoją kolekcję z kanapy, nawet gdy wszystkie pendrive'y i dyski USB są odłączone:
-                    przypisywać do albumów, zmieniać daty, obracać zdjęcia, uruchamiać wyszukiwanie i planować przeniesienia plików między nośnikami.
+                    Do przeglądania i usuwania duplikatów służy pozycja <span class="ui-btn">👥 Duplikaty binarne</span> w lewym panelu bocznym. Zdjęcia są tam zgrupowane w klastry o tym samym skrócie SHA-256.
                 </p>
+                <h3>Znaczenie kolorowych tagów w klastrze</h3>
+                <table>
+                    <thead>
+                        <tr><th>Znacznik (Tag)</th><th>Kiedy jest nadawany i co oznacza</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="tag-pill tag-green">ORYGINAŁ ✓</span></td>
+                            <td><strong>1. kopia w klastrze (zabezpieczona):</strong> Główny plik oryginalny, który posiada już zweryfikowaną kopię zapasową w <code>daf_backup/</code> na innym urządzeniu fizycznym (po najechaniu myszką zobaczysz nazwę dysku z backupem).</td>
+                        </tr>
+                        <tr>
+                            <td><span class="tag-pill tag-blue">ORYGINAŁ</span></td>
+                            <td><strong>1. kopia w klastrze (bez kopii w <code>daf_backup/</code>):</strong> Główny plik oryginalny, który nie ma jeszcze kopii w kartotece <code>daf_backup/</code> na innym dysku.</td>
+                        </tr>
+                        <tr>
+                            <td><span class="tag-pill tag-green">BACKUP</span></td>
+                            <td><strong>2. kopia w klastrze (zielony BACKUP):</strong> Druga kopia zdjęcia znajdująca się na <strong>innym urządzeniu fizycznym</strong> niż Oryginał. Chroniona przed usunięciem.</td>
+                        </tr>
+                        <tr>
+                            <td><span class="tag-pill tag-orange">BACKUP</span></td>
+                            <td><strong>2. kopia w klastrze (pomarańczowy BACKUP):</strong> Druga kopia zdjęcia znajdująca się na <strong>tym samym urządzeniu</strong> co Oryginał (gdy brak kopii na innym dysku). Chroniona przed usunięciem, dopóki nie utworzysz backupu na innym dysku.</td>
+                        </tr>
+                        <tr>
+                            <td><span class="tag-pill tag-red">DUPLIKAT</span></td>
+                            <td><strong>3. i każda kolejna kopia w klastrze:</strong> Nadmiarowy duplikat przeznaczony do bezpiecznego usunięcia.</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>Jak bezpiecznie usunąć nadmiarowe duplikaty z wszystkich stron i dysków</h3>
                 <ol class="steps">
-                    <li>Zaznacz zdjęcia i kliknij <span class="ui-btn">🚚 Przenieś pliki</span> (wybierz docelowy dysk i opcjonalnie podfolder).</li>
-                    <li>Gdy dysk źródłowy lub docelowy jest odłączony (<em>Offline</em>), program zapisuje operację w bazie na <strong>Liście TODO</strong> oraz <strong>natychmiast aktualizuje logiczną lokalizację w bazie</strong> — od razu widzisz zdjęcia tak, jakby już leżały w nowym miejscu.</li>
-                    <li>Kliknij <span class="ui-btn">📋 Lista TODO (Offline)</span> na górnym pasku, aby w dowolnym momencie obejrzeć pełne zestawienie <strong>Skąd → Dokąd</strong> lub zapisać na dysku lokalnym raport tekstowy (<span class="ui-btn">📄 Zapisz raport zmian (.txt)</span>) przed fizycznym wykonaniem operacji.</li>
-                    <li>Gdy podłączysz potrzebne dyski, otwórz panel TODO i kliknij wykonanie przeniesień — operacje zostaną wykonane <strong>parami dysków w obie strony (A ↔ B)</strong> i system poprosi o kolejne dyski z listy.</li>
+                    <li>Kliknij <span class="ui-btn">🔄 Aktualizuj tagi klastrów</span>, aby odświeżyć role wszystkich kopii w bazie.</li>
+                    <li>Kliknij przycisk <span class="ui-btn">☑️ Zaznacz tylko nadmiarowe kopie</span>. System automatycznie zaznaczy wszystkie pliki z czerwonym tagiem <span class="tag-pill tag-red">DUPLIKAT</span> <strong>na wszystkich stronach wyników</strong> (zaznaczenie utrzymuje się podczas przechodzenia między stronami).</li>
+                    <li>Kliknij na górnym pasku akcji <span class="ui-btn">🗑️ Do Kosza</span> lub <span class="ui-btn">🔥 Usuń trwale</span>.</li>
+                    <li>Na górnym pasku pojawi się żywy, 2-etapowy pasek postępu:
+                        <ul>
+                            <li><strong>Etap 1/2:</strong> Tworzona jest bezpieczna kopia bazy SQLite (wykonywana <strong>tylko raz</strong> na początku całej procedury).</li>
+                            <li><strong>Etap 2/2:</strong> System usuwa duplikaty z aktualnie podłączonych dysków (ONLINE), sprawdzając każdy plik w 100% binarnie oraz upewniając się, że w klastrze pozostaje zarówno Oryginał, jak i Backup.</li>
+                        </ul>
+                    </li>
+                    <li>Jeżeli część zaznaczonych duplikatów znajduje się na odłączonych dyskach (OFFLINE), system wyświetli żółty komunikat z dokładną liczbą duplikatów do usunięcia na kolejnym dysku, np.:<br>
+                        <code>🔌 Podłącz kolejny dysk: Dysk_B (F:\) — do usunięcia na tym dysku: 45 duplikatów</code>.<br>
+                        Podłącz wskazany dysk i kliknij <span class="ui-btn">▶️ Kontynuuj na podłączonym dysku</span> (system nie powtarza już backupu bazy i od razu usuwa duplikaty z podłączonego dysku).</li>
                 </ol>
-                <div class="callout warn">
-                    <strong>Pełne bezpieczeństwo wycofania (Rollback):</strong> Jeśli fizyczne przeniesienie nie powiedzie się (np. brak pliku lub miejsca) albo sam klikniesz <strong>Anuluj / Zrezygnuj</strong> na liście TODO, baza danych automatycznie przywróci poprzednie lokalizacje wszystkich niewykonanych plików i wyczyści listę TODO.
-                </div>
             </section>
 
             <section id="r7" class="chapter">
-                <h2>7. Podgląd multimediów, obracanie, przesuwanie po powiększeniu i Pełny Ekran</h2>
-                <p>Kliknij miniaturę zdjęcia lub filmu, aby otworzyć pełnoekranowy podgląd (Lightbox):</p>
-                <ul class="steps">
-                    <li><strong>Obracanie z zapamiętaniem w bazie (pojedynczo, listą i grupą):</strong> w podglądzie Lightbox użyj przycisków <span class="ui-btn">⟲ Obróć -90°</span> i <span class="ui-btn">⟳ Obróć +90°</span>. W głównej galerii zaznacz listę zdjęć (albo ustaw zakres na cały filtr) i kliknij <span class="ui-btn">⟳ Obróć +90°</span> na pasku akcji masowych, lub użyj <span class="ui-btn">⟳ Obróć album +90°</span> na pasku aktywnego albumu. Wybrany kąt zapisuje się trwale w SQLite.</li>
-                    <li><strong>Powiększanie i przesuwanie myszką:</strong> klikaj <span class="ui-btn">🔍+</span> / <span class="ui-btn">🔍-</span> (lub kręć kółkiem myszy) i <strong>przeciągaj obraz lewym przyciskiem myszy</strong>, aby obejrzeć detale w dowolnym fragmencie kadru. Przycisk <span class="ui-btn">1:1</span> resetuje widok.</li>
-                    <li><strong>Czysty Pełny Ekran:</strong> przycisk <span class="ui-btn">⛶ Pełny ekran (Czysty)</span> maksymalnie dopasowuje zdjęcie do całego ekranu (100% szerokości/wysokości z zachowaniem oryginalnych proporcji <em>aspect ratio</em>), ukrywając wszystkie paski i opisy. Wciśnij klawisz <kbd>ESC</kbd>, aby wrócić do normalnego widoku.</li>
-                    <li><strong>Tryb TV:</strong> przycisk <span class="ui-btn">📺 Tryb TV</span> uruchamia płynny pokaz slajdów ze sterowaniem strzałkami <kbd>←</kbd> <kbd>→</kbd> lub pilotem Google TV.</li>
-                </ul>
+                <h2>7. Albumy, Podalbumy i Przenoszenie plików (Online)</h2>
+                <div class="grid-2">
+                    <div class="mini-card">
+                        <strong>Przypisywanie do albumów i drzewo hierarchiczne</strong>
+                        Zaznacz zdjęcia i kliknij <span class="ui-btn">📁 Przypisz do albumu</span>. Możesz wybrać istniejący album z pełnej ścieżki drzewa lub utworzyć nowy album / podalbum.
+                    </div>
+                    <div class="mini-card">
+                        <strong>1-Klik Auto-Organizacja (dla wybranego dysku i folderu)</strong>
+                        Wybierz w lewym panelu konkretny dysk USB, a następnie kliknij wybrany katalog fizyczny nad galerią. Pojawią się przyciski tworzące jednym kliknięciem drzewo albumów wg Katalogów lub wg Daty (<code>Rok → Miesiąc</code>).
+                    </div>
+                    <div class="mini-card">
+                        <strong>Szybkie usuwanie lub scalanie albumów</strong>
+                        Na pasku aktywnego albumu możesz kliknąć <span class="ui-btn">⚡ Usuń sam album</span> (zdjęcia natychmiast wracają do swobodnej puli bez kasowania z dysku) albo <span class="ui-btn">➡️ Przerzuć zdjęcia i usuń ten album</span>.
+                    </div>
+                    <div class="mini-card">
+                        <strong>Fizyczne przenoszenie plików (Online)</strong>
+                        Przycisk <span class="ui-btn">🚚 Przenieś pliki</span> (oraz konsolidacja albumu na dysk) przenosi fizycznie pliki pomiędzy aktualnie podłączonymi (Online) dyskami i folderami.
+                    </div>
+                </div>
             </section>
 
             <section id="r8" class="chapter">
-                <h2>8. Zmiana daty zdjęć oraz zarządzanie listą niezgodności dat</h2>
-                <p>
-                    Program analizuje <strong>wszystkie dostępne źródła daty</strong> według reguły:
-                    (a) jeśli istnieje data <strong>EXIF / wideo</strong>, jest ona używana bez niezgodności;
-                    (b) gdy brak EXIF, wybierana jest <strong>data utworzenia pliku</strong>, o ile zgadza się z nazwą pliku oraz folderem (w nazwie folderu dzień może się różnić, ale <strong>miesiąc i rok muszą się zgadzać</strong>) i nie została zmieniona przy kopiowaniu;
-                    (c) przy rozbieżności wybierana jest <strong>najstarsza data z istniejących źródeł</strong> oraz oznaczana jest <strong>Niezgodność dat</strong>. Wszystkie 5 źródeł daty zobaczysz w oknie szczegółów pliku.
-                </p>
-                <ol class="steps">
-                    <li>Zaznacz wybrane zdjęcia (albo wybierz cały <strong>Album</strong>) i kliknij <span class="ui-btn">📅 Zmień datę / Niezgodności</span>, albo uruchom analizę zbiorczą w <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> &rarr; <em>📅 Analiza niezgodności dat</em>.</li>
-                    <li><strong>Ustawienie nowej daty:</strong> wpisz prawidłową datę i zatwierdź — wszystkie wskazane zdjęcia otrzymają nową datę w bazie i zostaną <strong>automatycznie zdjęte z listy niezgodności dat</strong> (zmiana odświeża się natychmiast również w otwartym oknie szczegółów pliku).</li>
-                    <li><strong>Usunięcie z listy niezgodności bez zmiany daty:</strong> jeśli obecna data pliku jest dla Ciebie właściwa i chcesz tylko wyczyścić flagę ostrzeżenia, kliknij opcję zdjęcia flagi bez zmiany samej daty.</li>
-                </ol>
+                <h2>8. Podgląd multimediów, obracanie, zoom, Pokaz TV i Czysty Pełny Ekran</h2>
+                <p>Kliknij dowolną miniaturę, aby otworzyć pełnoekranowy Lightbox:</p>
+                <ul class="steps">
+                    <li><strong>Obracanie (<kbd>R</kbd> lub przyciski &plusmn;90&deg;):</strong> Obraca pojedyncze zdjęcie, zaznaczoną listę lub cały album i trwale zapisuje kąt w bazie SQLite.</li>
+                    <li><strong>Zoom i przesuwanie myszą (Pan):</strong> Użyj kółka myszy (lub przycisków <span class="ui-btn">🔍+</span> / <span class="ui-btn">🔍-</span>), a następnie przeciągaj powiększone zdjęcie lewym przyciskiem myszy. Kliknięcie <span class="ui-btn">1:1</span> resetuje powiększenie.</li>
+                    <li><strong>Czysty Pełny Ekran (<kbd>F</kbd> lub <span class="ui-btn">⛶ Pełny ekran (Czysty)</span>):</strong> Ukrywa wszystkie paski i przyciski, dopasowując zdjęcie maksymalnie do ekranu monitora z zachowaniem proporcji. Klawisz <kbd>ESC</kbd> wraca do widoku z paskiem.</li>
+                    <li><strong>Pokaz slajdów TV (<span class="ui-btn">📺 Pokaz TV</span>):</strong> Automatycznie przełącza kolejne zdjęcia co 5 sekund (a filmy po zakończeniu odtwarzania) na pełnym ekranie.</li>
+                </ul>
             </section>
 
             <section id="r9" class="chapter">
-                <h2>9. Analiza AI na żądanie, jakość zdjęć oraz Panel Statusu</h2>
+                <h2>9. Zmiana daty zdjęć oraz zarządzanie listą niezgodności dat</h2>
                 <p>
-                    Aby nie zużywać pamięci RAM ani procesora podczas zwykłego przeglądania i skanowania dysków, modele AI oraz analizy duplikatów / brakujących backupów uruchamiają się <strong>wyłącznie na Twoje żądanie</strong> (w oknie <em>Analizuj AI</em> oraz w module <em>Backup i Deduplikacja</em>), a po zakończeniu natychmiast zwalniają pamięć RAM.
-                    Dla każdej dłuższej operacji od pierwszej sekundy wyświetla się animowany baner postępu na górnym pasku aplikacji.
-                </p>
-                <h3>Rozbita Analiza AI + Zdjęcia bez danych Analizy AI</h3>
-                <p>W lewym panelu bocznym w sekcji <strong>⚡ Zdjęcia bez danych Analizy AI</strong> jednym kliknięciem wyfiltrujesz zdjęcia według brakującego typu analizy (<em>Brak tagów AI</em>, <em>Brak wektorów 512-D</em>, <em>Niezbadana jakość / ostrość</em>). Następnie kliknij <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> i wybierz tryb:</p>
-                <ul class="steps">
-                    <li><strong>Tagowanie obiektów i scen</strong> (MobileNetV2 ONNX + Haar), <strong>Wektory podobieństwa 512-D</strong>, albo <strong>Wszystkie analizy naraz</strong>.</li>
-                    <li><strong>Rozszerzona detekcja ostrości, uszkodzeń i zdjęć do usunięcia:</strong> analizuje nie tylko rozmycie (Laplacian/Sobel), lecz także skrajne niedoświetlenie (zbyt ciemne kadry), prześwietlenie (wypalona biel), jednorodne puste klatki bez detali oraz uszkodzenia / bardzo niską rozdzielczość — dopisując czytelne tagi <code>do_usuniecia</code> (np. <code>do_usuniecia:rozmyte</code>, <code>do_usuniecia:niedoswietlone</code>, <code>do_usuniecia:przeswietlone</code>).</li>
-                    <li><strong>Szybka vs Dokładna analiza duplikatów (na żądanie):</strong> szybka sprawdza indeks SHA-256 / hash wideo w SQLite, natomiast dokładna 100% weryfikuje pliki bajt po bajcie bezpośrednio na podłączonych dyskach.</li>
-                    <li><strong>Analiza zdjęć bez kopii zapasowej (na żądanie):</strong> odświeża zestawienie plików nieposiadających backupu na innym urządzeniu fizycznym.</li>
-                    <li><strong>Analiza niezgodności dat (na żądanie):</strong> przelicza źródła dat (EXIF, utworzenie pliku, nazwa pliku, nazwa folderu) dla wybranego zakresu lub całej kolekcji i aktualizuje flagi niezgodności dat.</li>
-                </ul>
-                <h3>Pełna kontrola nad procesami i Log na dysku</h3>
-                <p>
-                    Otwórz <span class="ui-btn">⚙️ Status i Log Operacji</span>, aby kontrolować każde uruchomione lub przerwane zadanie (analizę AI, skanowanie, backup i deduplikację, przenoszenie do kosza, trwałe usuwanie plików):
+                    System ustala efektywną datę zdjęcia według priorytetu:
+                    (1) jeśli istnieje data <strong>EXIF</strong>, jest używana od razu bez flagi niezgodności;
+                    (2) w przeciwnym razie sprawdzana jest zgodność daty utworzenia pliku z datą w nazwie pliku oraz nazwie folderu (dzień w nazwie folderu może się różnić, o ile zgadza się rok i miesiąc);
+                    (3) w razie rozbieżności (np. zmiana daty utworzenia przy kopiowaniu na Windows) wybierana jest <strong>najstarsza wiarygodna data</strong> i włączane jest ostrzeżenie <strong>⚠️ Niezgodność dat</strong>.
                 </p>
                 <ul class="steps">
-                    <li><strong>Zatrzymaj:</strong> bezpiecznie wstrzymuje działanie w połowie bez utraty dotychczasowego postępu.</li>
-                    <li><strong>Wznów:</strong> kontynuuje niedokończony proces od pozostałych plików.</li>
-                    <li><strong>Usuń z listy:</strong> anuluje zapamiętane zadanie z kolejki.</li>
-                    <li><strong>Log operacji:</strong> wszystkie zdarzenia są równolegle zapisywane w trwałym pliku na dysku <code>data/logs/operations.log</code> oraz prezentowane w tabeli w tym panelu.</li>
+                    <li>Kliknij <span class="ui-btn">📅 Zmień datę / Niezgodności</span>, aby nadać wybranym zdjęciom lub całemu albumowi nową datę (co automatycznie usuwa je z listy niezgodności).</li>
+                    <li>Jeśli obecna data jest poprawna, kliknij <span class="ui-btn">✓ Zatwierdź obecną datę</span>, aby usunąć ostrzeżenie bez zmiany samej daty.</li>
                 </ul>
             </section>
 
             <section id="r10" class="chapter">
-                <h2>10. Archiwum Google Drive — wysyłanie i przywracanie bazy SQLite</h2>
+                <h2>10. Analiza AI na żądanie, Wady jakości oraz Konserwacja bazy</h2>
+                <h3>Wykrywanie wad jakościowych (Kandydaci do usunięcia)</h3>
                 <p>
-                    Panel <span class="ui-btn">☁️ Google Drive Archiwum</span> łączy lokalną bazę z Twoim kontem Google Drive (OAuth 2.0 na podstawie pliku <code>data/credentials.json</code>).
+                    Po uruchomieniu <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>🔍 Detekcja ostrości (Blur), ekspozycji i uszkodzeń</em> (analiza wymaga, aby dysk ze zdjęciami był podłączony Online), system bada pliki źródłowe i przypisuje precyzyjne podkategorie w lewym menu <strong>⚠️ Wady jakości (do usunięcia)</strong>:
                 </p>
-                <h3>Wysyłanie zdjęć oraz kopii bazy do chmury</h3>
-                <ol class="steps">
-                    <li>Wybierz istniejącą kartotekę na Google Drive albo wpisz nazwę nowej.</li>
-                    <li>Kliknij <span class="ui-btn">☁️ Wyślij wybrane zdjęcia do kartoteki</span> (opcjonalnie z trybem archiwum kasującym oryginał z dysku dopiero po potwierdzeniu zgodności rozmiaru i sumy <code>MD5</code>) lub <span class="ui-btn">📦 Wyślij Backup Bazy SQLite</span>.</li>
-                </ol>
-                <h3>Przywracanie bazy danych z backupu na Google Drive</h3>
-                <ol class="steps">
-                    <li>W oknie <span class="ui-btn">☁️ Google Drive Archiwum</span> wskaż kartotekę zawierającą wysłane wcześniej pliki kopii bazy (<code>.db</code>).</li>
-                    <li>W sekcji <strong>♻️ Przywracanie bazy SQLite z backupu na Google Drive</strong> wybierz plik kopii z listy i kliknij <span class="ui-btn">♻️ Pobierz i przywróć wybraną bazę z Google Drive</span> (albo kliknij <span class="ui-btn">♻️ Przywróć tę bazę</span> bezpośrednio w tabeli zawartości folderu).</li>
-                    <li>System pobierze plik, sprawdzi kryptograficznie sumę kontrolną <strong>MD5</strong> oraz rozmiar, przetestuje integralność SQLite (<code>PRAGMA integrity_check</code>), zachowa profilaktycznie Twoją obecną bazę jako lokalną kopię <code>pre_restore</code> w <code>data/backups/</code> i atomowo odtworzy całą bazę.</li>
-                </ol>
+                <ul>
+                    <li><code>💥 Uszkodzone pliki</code> — błędy nagłówka lub struktury pliku.</li>
+                    <li><code>🌫️ Rozmyte / brak ostrości</code> — niski wskaźnik ostrości przedmiotu na siatce 8&times;8 (Laplacian &lt; 45.0).</li>
+                    <li><code>🌑 Niedoświetlone (ciemne)</code> oraz <code>☀️ Prześwietlone (jasne)</code> — skrajne błędy ekspozycji.</li>
+                    <li><code>⚪ Brak detali (płaskie)</code> — jednolite tło (np. przypadkowe zdjęcie w kieszeni lub dekielka obiektywu).</li>
+                    <li><code>🔍 Niska rozdz. (&lt;160px)</code> — mikroskopijne ikony lub miniatury.</li>
+                </ul>
+
+                <h3>Konserwacja bazy SQLite i miniatur w oknie „⚙️ Status i Log Operacji”</h3>
+                <p>W oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> (oraz w oknie Kopii Bazy) znajdziesz narzędzia utrzymania porządku na dysku systemowym:</p>
+                <ul>
+                    <li><span class="ui-btn">🗜️ Kompaktuj bazę (VACUUM)</span> — fizycznie przebudowuje plik <code>media_vault.db</code> i odzyskuje wolne strony po usuniętych duplikatach lub wyindeksowanych dyskach.</li>
+                    <li><span class="ui-btn">🖼️ Usuń osierocone miniatury</span> — skanuje katalog <code>data/thumbnails/</code> i usuwa pliki <code>.webp</code>, które nie należą już do żadnego rekordu w bazie (zachowując miniatury zdjęć znajdujących się w Koszu).</li>
+                </ul>
             </section>
 
             <section id="r11" class="chapter">
-                <h2>11. Lokalny Kosz i bezpieczne usuwanie</h2>
-                <p>
-                    Domyślne usuwanie nie kasuje zdjęć bezpowrotnie — przenosi je do lokalnego, odwracalnego <strong>Kosza</strong> w katalogu <code>data/kosz</code>:
-                </p>
+                <h2>11. Kopia Zapasowa Bazy Danych (Nośniki USB / HDD &amp; Google Drive)</h2>
+                <p>Otwórz okno <span class="ui-btn">💾 Kopia Bazy &amp; Chmura</span> na górnym pasku:</p>
                 <ul class="steps">
-                    <li>Przełącz widok w lewym panelu bocznym na <strong>Kosz</strong>, aby przejrzeć usunięte elementy.</li>
-                    <li>Możesz przywrócić wybrane zdjęcia lub cały album z powrotem na pierwotną ścieżkę (jeśli dysk jest podłączony) albo opróżnić Kosz trwale.</li>
-                    <li>Przed każdą operacją masowego kasowania program automatycznie wykonuje kopię zapasową bazy danych w <code>data/backups/</code>.</li>
+                    <li><strong>Wybór zawartości kopii:</strong> możesz wybrać kopię <strong>Pełną (z wektorami CLIP)</strong> lub <strong>Lekką (bez wektorów CLIP)</strong> oraz włączyć <strong>Kompresję w locie gzip (<code>.db.gz</code>)</strong>, która zmniejsza rozmiar pliku bazy o ok. 80%.</li>
+                    <li><strong>Zapis na wybranym nośniku USB / HDD:</strong> zapisuje plik kopii w bezpiecznym podkatalogu <code>daf_backup/db_backups/</code> na wybranym dysku zewnętrznym (z żywym paskiem postępu i buforowaniem na szybkim dysku SSD).</li>
+                    <li><strong>Zapis w chmurze Google Drive:</strong> wysyła kopię bazy z weryfikacją sumy kontrolnej <code>MD5</code> i <strong>automatycznie usuwa starsze kopie bazy z Google Drive</strong>, zachowując w chmurze zawsze wyłącznie 1 najnowszą kopię.</li>
+                    <li><strong>Przywracanie bazy (z USB lub Google Drive):</strong> jednym kliknięciem weryfikuje integralność pliku <code>.db</code> / <code>.db.gz</code>, zabezpiecza bieżącą bazę jako kopię <code>pre_restore</code> i atomowo odtwarza stan archiwum.</li>
                 </ul>
+            </section>
+
+            <section id="r12" class="chapter">
+                <h2>12. Lokalny Kosz i bezpieczne odzyskiwanie plików</h2>
+                <p>
+                    Przycisk <span class="ui-btn">🗑️ Do Kosza</span> przenosi pliki fizycznie do lokalnego folderu <code>data/kosz/</code> z zachowaniem pełnej informacji o macierzystym dysku, ścieżce względnej i albumie.
+                    W widoku <strong>🗑️ Kosz (Usunięte)</strong> możesz w każdej chwili kliknąć <span class="ui-btn">♻️ Przywróć zaznaczone na pierwotne miejsce</span> lub trwale opróżnić Kosz.
+                </p>
+            </section>
+
+            <section id="r13" class="chapter">
+                <h2>13. Najważniejsze zasady i doświadczenia z pracy z systemem</h2>
+                <div class="grid-2">
+                    <div class="mini-card">
+                        <strong>1. Zawsze zaczynaj od Backupu przed czyszczeniem duplikatów</strong>
+                        Najpierw użyj <span class="ui-btn">🛡️ Backup zdjęć/filmów</span>, aby każdy unikalny plik miał bezpieczną kopię w <code>daf_backup/</code> (zielony znacznik <span class="tag-pill tag-green">ORYGINAŁ ✓</span>). Dopiero potem przejdź do <span class="ui-btn">👥 Duplikaty binarne</span> i usuń nadmiarowe 3+ kopie.
+                    </div>
+                    <div class="mini-card">
+                        <strong>2. Dedykowany dysk na backup oszczędza czas</strong>
+                        System domyślnie wybiera na backup dysk z najmniejszą liczbą oryginałów i największą wolną przestrzenią. Trzymanie kopii zapasowych na 1–2 dedykowanych dyskach eliminuje konieczność żonglowania wieloma pendrive'ami.
+                    </div>
+                    <div class="mini-card">
+                        <strong>3. Usuwanie duplikatów prosi tylko o dyski z duplikatami</strong>
+                        Nawet gdy dysk z Oryginałem lub Backupem jest odłączony, system potrafi zweryfikować nadmiarowy duplikat na podłączonym dysku względem zapisanych w bazie pełnych skrótów kryptograficznych SHA-256 i usunąć go od razu — bez proszenia o podłączanie pustego dysku backupowego.
+                    </div>
+                    <div class="mini-card">
+                        <strong>4. Kompaktuj bazę (VACUUM) po dużych porządkach</strong>
+                        Po usunięciu tysięcy duplikatów lub wyindeksowaniu starego dysku uruchom w oknie Statusu <span class="ui-btn">🗜️ Kompaktuj bazę (VACUUM)</span> oraz <span class="ui-btn">🖼️ Usuń osierocone miniatury</span>, aby zmniejszyć rozmiar bazy i przyspieszyć jej backup.
+                    </div>
+                </div>
             </section>
         </main>
     </div>

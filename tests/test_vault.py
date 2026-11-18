@@ -4306,6 +4306,113 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertEqual(r_res.status_code, 200)
                 self.assertIsNotNone(db.get(MediaItem, extra_items[0].id))  # Original MUST survive!
 
+                # Edge case: unverified online video duplicate whose Original + Backup are both on OFFLINE DiskD_RefOnly (del_cnt=0).
+                # Must NOT raise AttributeError on None next_offline_prompt or leave job stuck in WAITING_FOR_DEVICE.
+                import uuid as _uuid
+                vid_payload = b"ftypisom_edge_video_payload_" * 40
+                p_vid_dup = self.drive_a / "v_dup.mp4"
+                p_vid_dup.write_bytes(vid_payload)
+                now_vid_dt = datetime.datetime(2024, 6, 1, 12, 0, 0)
+                vid_specs = [
+                    (vol_d.id, "v_orig.mp4", "v_orig.mp4", "original", False),
+                    (vol_d.id, "daf_backup/2024/06/01/v_orig.mp4", "v_orig.mp4", "backup_same_dev", True),
+                    (vol_a.id, "v_dup.mp4", "v_dup.mp4", "duplicate", False),
+                ]
+                vid_items = [
+                    MediaItem(
+                        id=str(_uuid.uuid4()),
+                        volume_id=v_id,
+                        relative_path=rel_p,
+                        file_name=fname,
+                        file_size_bytes=len(vid_payload),
+                        file_hash="hash_edge_vid_001",
+                        hash_algorithm="sha256_fast_sample",
+                        verified_sha256=None,
+                        media_type="video",
+                        mime_type="video/mp4",
+                        fs_ctime=now_vid_dt,
+                        fs_mtime=now_vid_dt,
+                        effective_date=now_vid_dt,
+                        thumbnail_relative_path="dummy_vid_thumb.webp",
+                        duplicate_role=d_role,
+                        is_backup_copy=is_bkp,
+                    )
+                    for v_id, rel_p, fname, d_role, is_bkp in vid_specs
+                ]
+                db.add_all(vid_items)
+                db.commit()
+                res_vid_edge = svc.execute_safe_duplicate_removal(
+                    [vid_items[2].id], delete_mode="permanent", force_duplicate_verification=True
+                )
+                self.assertEqual(res_vid_edge["blocked_verify"], 1)
+                self.assertEqual(res_vid_edge["offline_items"], [])
+                self.assertEqual(res_vid_edge["offline_drives"], [])
+                self.assertIsNone(res_vid_edge["next_offline_prompt"])
+                r_vid_edge = actions_router._build_safe_removal_html_response(
+                    "/actions/delete-permanently", "permanent", res_vid_edge, safe_job.id, db
+                )
+                self.assertEqual(r_vid_edge.status_code, 200)
+                db.refresh(safe_job)
+                self.assertEqual(safe_job.status, "COMPLETED")
+                self.assertTrue(p_vid_dup.exists())
+
+                # Reconcile already-unlinked duplicate on ONLINE drive (interrupted run recovery)
+                # + verify concurrent GET /actions/status-panel polling works cleanly during duplicate deletion
+                p_rec_o = create_synthetic_jpeg(self.drive_a / "rec_orig.jpg", color=(33, 66, 99))
+                p_rec_b = self.drive_b / "daf_backup" / "2024" / "07" / "01" / "rec_orig.jpg"
+                p_rec_b.parent.mkdir(parents=True, exist_ok=True)
+                p_rec_b.write_bytes(p_rec_o.read_bytes())
+                p_rec_ghost = self.drive_a / "rec_ghost_dup.jpg"
+                p_rec_live = self.drive_a / "rec_live_dup.jpg"
+                p_rec_ghost.write_bytes(p_rec_o.read_bytes())
+                p_rec_live.write_bytes(p_rec_o.read_bytes())
+                rec_items = [
+                    FileScannerService.process_file(p_rec_o, vol_a),
+                    FileScannerService.process_file(p_rec_b, vol_b),
+                    FileScannerService.process_file(p_rec_ghost, vol_a),
+                    FileScannerService.process_file(p_rec_live, vol_a),
+                ]
+                db.add_all(rec_items)
+                db.commit()
+                svc.flag_duplicate_clusters()
+
+                # Simulate crash after physical unlink of ghost duplicate before DB commit
+                p_rec_ghost.unlink()
+                poll_statuses: list[int] = []
+                actions_router.DUP_DELETE_STATE["running"] = True
+                try:
+                    def _poll_during_delete(_done: int, _tot: int, _msg: str, _drv: str) -> None:
+                        r_poll_mid = self.client.get("/actions/status-panel")
+                        poll_statuses.append(r_poll_mid.status_code)
+
+                    with patch.object(
+                        StorageAutomationService,
+                        "refresh_volumes_online_status",
+                        wraps=svc.refresh_volumes_online_status,
+                    ) as spy_refresh:
+                        res_rec = svc.execute_safe_duplicate_removal(
+                            [rec_items[2].id, rec_items[3].id],
+                            delete_mode="permanent",
+                            force_duplicate_verification=True,
+                            job_id=safe_job.id,
+                            trash_dir=self.root / "kosz",
+                            thumbnails_dir=self.thumbs_dir,
+                            progress_cb=_poll_during_delete,
+                        )
+                        # Called once at start of execute_safe_duplicate_removal, NEVER inside status-panel polls
+                        self.assertEqual(spy_refresh.call_count, 1)
+                finally:
+                    actions_router.DUP_DELETE_STATE["running"] = False
+
+                self.assertTrue(poll_statuses)
+                self.assertTrue(all(sc == 200 for sc in poll_statuses))
+                self.assertEqual(res_rec["missing_on_disk"], 1)
+                self.assertEqual(res_rec["processed_count"], 2)
+                self.assertIsNone(db.get(MediaItem, rec_items[2].id))
+                self.assertIsNone(db.get(MediaItem, rec_items[3].id))
+                self.assertIsNotNone(db.get(MediaItem, rec_items[0].id))
+                self.assertIsNotNone(db.get(MediaItem, rec_items[1].id))
+
     def test_maintenance_vacuum_and_orphan_thumbnails(self):
         with self.TestingSessionLocal() as db:
             vol = WindowsVolume(

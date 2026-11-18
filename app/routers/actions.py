@@ -964,7 +964,10 @@ def _get_maintenance_stats(db: Session) -> Dict[str, float]:
 def get_status_and_logs_panel(request: Request, db: Session = Depends(get_db)):
     summary = ProcessManager.get_jobs_summary(db)
     logs = OperationLogger.get_recent_logs(db, limit=100)
-    volumes = StorageAutomationService(db).refresh_volumes_online_status()
+    if DUP_DELETE_STATE["running"] or AI_BATCH_STATE["running"] or summary["has_running"]:
+        volumes = list(db.scalars(select(WindowsVolume)).all())
+    else:
+        volumes = StorageAutomationService(db).refresh_volumes_online_status()
     maint_stats = _get_maintenance_stats(db)
     return render_template(
         request,
@@ -3022,7 +3025,7 @@ def _build_safe_removal_html_response(
     offline_ids = res["offline_ids"]
     nxt = res["next_offline_prompt"]
 
-    if offline_items:
+    if offline_items and nxt:
         nxt_del = int(nxt.get("delete_count", nxt.get("count", 0)) or 0)
         nxt_ref = int(nxt.get("verify_only_count", 0) or 0)
         if nxt_del > 0:
