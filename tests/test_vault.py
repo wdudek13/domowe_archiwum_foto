@@ -5219,11 +5219,36 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 self.assertIn("DJI_20250101_green.jpg", r_sem_all.text)
                 self.assertIn("DJI_20250101_orange.jpg", r_sem_all.text)
 
-                # Home HTML includes reset of 'q' and stopPropagation on #main-search-input
+                # Home HTML includes reset of 'q', stopPropagation on #main-search-input, online_only, and Odśwież button without keyup auto-search
                 r_home_html = self.client.get("/")
                 self.assertEqual(r_home_html.status_code, 200)
                 self.assertIn("['q', 'volume_id'", r_home_html.text)
                 self.assertIn("onchange=\"event.stopPropagation()\"", r_home_html.text)
+                self.assertIn('id="search-refresh-btn"', r_home_html.text)
+                self.assertIn("🔄 Odśwież", r_home_html.text)
+                self.assertNotIn("keyup changed delay:250ms", r_home_html.text)
+                self.assertIn("name=\"online_only\"", r_home_html.text)
+
+                # Filter: online_only=true keeps only online drives and retains return-to-all button
+                r_online_only = self.client.get("/media/search?online_only=true")
+                self.assertEqual(r_online_only.status_code, 200)
+                self.assertIn("queue_08.jpg", r_online_only.text)
+                self.assertIn("DJI_20250101_001.jpg", r_online_only.text)
+                self.assertNotIn("queue_00.jpg", r_online_only.text)
+                self.assertNotIn("queue_10.jpg", r_online_only.text)
+                self.assertIn("Wszystkie urządzenia", r_online_only.text)
+                self.assertIn("Tylko dostępne online", r_online_only.text)
+
+                # Selecting a single offline (or online) volume still renders return-to-all button
+                r_vol_sel = self.client.get(f"/media/search?volume_id={vol_off1.id}")
+                self.assertEqual(r_vol_sel.status_code, 200)
+                self.assertIn("Wszystkie urządzenia", r_vol_sel.text)
+                self.assertIn("queue_00.jpg", r_vol_sel.text)
+                self.assertNotIn("queue_08.jpg", r_vol_sel.text)
+
+                r_vol_on_sel = self.client.get(f"/media/search?volume_id={vol_on.id}")
+                self.assertEqual(r_vol_on_sel.status_code, 200)
+                self.assertIn("Wszystkie urządzenia", r_vol_on_sel.text)
 
 
 if __name__ == "__main__":

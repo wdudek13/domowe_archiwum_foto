@@ -277,6 +277,7 @@ def apply_media_filters(
     backup_types: Optional[List[str]] = None,
     backup_mode: str = "hide",
     anomaly_type: str = "all",
+    online_only: bool = False,
 ):
     if trashed_only:
         stmt = stmt.where(MediaItem.is_trashed == True)
@@ -336,6 +337,10 @@ def apply_media_filters(
         stmt = stmt.where(MediaItem.media_type == media_type)
     if volume_id:
         stmt = stmt.where(MediaItem.volume_id == volume_id)
+    if online_only:
+        stmt = stmt.where(
+            MediaItem.volume_id.in_(select(WindowsVolume.id).where(WindowsVolume.is_online == True))
+        )
     if folder_prefix and folder_prefix.strip():
         fp_clean = folder_prefix.strip()
         stmt = stmt.where(
@@ -724,6 +729,7 @@ def build_search_context(request: Request, db: Session) -> dict:
     backup_types = qp.getlist("backup_types") if hasattr(qp, "getlist") else []
     backup_mode = qp.get("backup_mode", "hide")
     anomaly_type = qp.get("anomaly_type", "all")
+    online_only = to_bool(qp.get("online_only"))
     sort_by = qp.get("sort_by", "date_desc")
     view_mode = qp.get("view_mode", "grid")
     page_int = max(1, to_int(qp.get("page")) or 1)
@@ -736,7 +742,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         unvectored_only, unanalyzed_quality_only, quality_defect=quality_defect,
         redundant_clusters_only=redundant_clusters_only, backups_to_move_only=backups_to_move_only,
         backup_filter=backup_filter, backup_types=backup_types, backup_mode=backup_mode,
-        anomaly_type=anomaly_type,
+        anomaly_type=anomaly_type, online_only=online_only,
     )
     joins_tags = bool((q and q.strip()) or (tag and tag.strip()) or (quality_defect and quality_defect.strip()))
     if joins_tags:
@@ -890,6 +896,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         "active_quality_defect": quality_defect,
         "active_volume_id": vol_id_int,
         "active_folder": folder_prefix,
+        "online_only": online_only,
         "trashed_only": trashed_only,
         "duplicates_only": duplicates_only,
         "redundant_clusters_only": redundant_clusters_only,

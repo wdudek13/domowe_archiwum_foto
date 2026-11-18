@@ -123,6 +123,7 @@ def _resolve_bulk_ids_fast(
     backup_types: Optional[List[str]] = None,
     backup_mode: str = "hide",
     anomaly_type: str = "all",
+    online_only: bool = False,
 ) -> List[str]:
     """Fast ID-only resolution that avoids loading tens of thousands of ORM rows on HTTP POST."""
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
@@ -160,6 +161,7 @@ def _resolve_bulk_ids_fast(
             backup_types=backup_types,
             backup_mode=backup_mode,
             anomaly_type=anomaly_type,
+            online_only=online_only,
         ).distinct()
     return [str(x) for x in db.scalars(stmt).all()]
 
@@ -192,6 +194,7 @@ def resolve_target_items(
     backup_types: Optional[List[str]] = None,
     backup_mode: str = "hide",
     anomaly_type: str = "all",
+    online_only: bool = False,
 ) -> List[MediaItem]:
     eff_ids = _merge_selected_ids(selected_ids, selected_ids_json)
     if scope == "selected" and eff_ids:
@@ -230,6 +233,7 @@ def resolve_target_items(
             backup_types=backup_types,
             backup_mode=backup_mode,
             anomaly_type=anomaly_type,
+            online_only=online_only,
         ).distinct()
     if limit:
         stmt = stmt.limit(limit)
@@ -4230,6 +4234,7 @@ async def clear_quality_defect_action(request: Request, db: Session = Depends(ge
             backup_types=[str(x) for x in form.getlist("backup_types")],
             backup_mode=_form_str(form, "backup_mode", "hide") or "hide",
             anomaly_type=_form_str(form, "anomaly_type", "all") or "all",
+            online_only=_form_bool(form, "online_only"),
         )
 
     if not item_ids:

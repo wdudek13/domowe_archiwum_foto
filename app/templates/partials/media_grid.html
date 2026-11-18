@@ -7,7 +7,22 @@
                 <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Album: {{ active_group.name }} (ID: {{ active_group.id }})</span>
             {% endif %}
             {% if active_volume %}
-                <span class="bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">💾 Urządzenie: {{ active_volume.volume_label }} ({{ active_volume.last_known_drive_letter }})</span>
+                <span class="inline-flex items-center space-x-1 bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">
+                    <span>💾 Urządzenie: {{ active_volume.volume_label }} ({{ active_volume.last_known_drive_letter }})</span>
+                    <button type="button"
+                            title="Wróć do wszystkich urządzeń"
+                            onclick="applySidebarFilter({volume_id: '', folder_prefix: ''})"
+                            class="text-sky-300 hover:text-white font-bold ml-1">✕</button>
+                </span>
+            {% endif %}
+            {% if online_only %}
+                <span class="inline-flex items-center space-x-1 bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">
+                    <span>🟢 Tylko dostępne online</span>
+                    <button type="button"
+                            title="Wyłącz filtr urządzeń online"
+                            onclick="applySidebarFilter({online_only: false})"
+                            class="text-emerald-300 hover:text-white font-bold ml-1">✕</button>
+                </span>
             {% endif %}
             {% if active_tag %}
                 {% if active_tag.startswith('do_usuniecia') %}
@@ -30,7 +45,13 @@
                 <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">⚠️ Wada jakości: {{ active_quality_defect }}</span>
             {% endif %}
             {% if active_folder %}
-                <span class="bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">📂 Katalog: {{ active_folder }}</span>
+                <span class="inline-flex items-center space-x-1 bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">
+                    <span>📂 Katalog: {{ active_folder }}</span>
+                    <button type="button"
+                            title="Wyczyść filtr katalogu"
+                            onclick="applySidebarFilter({folder_prefix: ''})"
+                            class="text-amber-300 hover:text-white font-bold ml-1">✕</button>
+                </span>
             {% endif %}
             {% if unbacked_only %}
                 <span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">🛡️ Pliki bez backupu na innym urządzeniu</span>
@@ -70,12 +91,27 @@
     </div>
 
     <!-- Kolejność dysków offline wymaganych do zobaczenia oryginałów -->
-    {% if offline_drives_info is defined and offline_drives_info.has_offline %}
-    <div class="bg-slate-900/90 border border-amber-700/60 px-4 py-2.5 rounded-xl text-xs space-y-1.5">
+    {% if (offline_drives_info is defined and offline_drives_info.has_offline) or active_volume or online_only %}
+    <div class="bg-slate-900/90 border border-amber-700/60 px-4 py-2.5 rounded-xl text-xs space-y-2">
         <div class="font-bold text-amber-300 flex items-center justify-between flex-wrap gap-2">
-            <span>🔌 Dyski offline wymagane do podglądu oryginałów w kolejności (wg liczby plików):</span>
-            <span class="text-[10px] font-normal text-slate-400">Podłącz nośnik Windows, aby wyświetlić oryginalne pliki RAW/JPG/wideo zamiast miniatur</span>
+            <div>
+                <span>🔌 Dyski offline wymagane do podglądu oryginałów w kolejności (wg liczby plików):</span>
+                <span class="block text-[10px] font-normal text-slate-400">Podłącz nośnik Windows, aby wyświetlić oryginalne pliki RAW/JPG/wideo zamiast miniatur</span>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+                <button type="button"
+                        onclick="applySidebarFilter({volume_id: '', folder_prefix: '', online_only: false})"
+                        class="px-2.5 py-1 rounded-lg border font-semibold transition {% if not active_volume and not online_only %}bg-sky-700 text-white border-sky-400{% else %}bg-slate-800 hover:bg-slate-700 text-sky-200 border-sky-700/60{% endif %}">
+                    {% if active_volume or online_only %}↩ Wszystkie urządzenia (wyczyść filtr dysku){% else %}💾 Wszystkie urządzenia{% endif %}
+                </button>
+                <button type="button"
+                        onclick="applySidebarFilter({volume_id: '', folder_prefix: '', online_only: {{ 'false' if online_only else 'true' }}})"
+                        class="px-2.5 py-1 rounded-lg border font-semibold transition {% if online_only %}bg-emerald-600 text-white border-emerald-400 shadow{% else %}bg-slate-800 hover:bg-emerald-950/60 text-emerald-300 border-emerald-700/60{% endif %}">
+                    🟢 Tylko dostępne online
+                </button>
+            </div>
         </div>
+        {% if offline_drives_info is defined and offline_drives_info.has_offline %}
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-2 text-[11px]">
             <div class="bg-slate-950/70 border border-borderBg/80 rounded-lg px-2.5 py-1.5">
                 <div class="text-slate-300 font-semibold mb-1">
@@ -85,12 +121,13 @@
                 <div class="flex flex-wrap gap-1.5">
                     {% for d in offline_drives_info.page_drives %}
                     <button type="button"
-                            onclick="applySidebarFilter({volume_id: '{{ d.volume_id }}'})"
-                            title="Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }})"
-                            class="inline-flex items-center space-x-1 bg-amber-950/70 hover:bg-amber-900/80 border border-amber-700/60 text-amber-200 px-2 py-0.5 rounded-md font-mono transition">
+                            onclick="{% if active_volume_id == d.volume_id %}applySidebarFilter({volume_id: '', folder_prefix: ''}){% else %}applySidebarFilter({volume_id: '{{ d.volume_id }}', folder_prefix: '', online_only: false}){% endif %}"
+                            title="{% if active_volume_id == d.volume_id %}Kliknij ponownie, aby wrócić do wszystkich urządzeń{% else %}Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }}){% endif %}"
+                            class="inline-flex items-center space-x-1 px-2 py-0.5 rounded-md font-mono transition border {% if active_volume_id == d.volume_id %}bg-sky-800 border-sky-400 text-white ring-1 ring-sky-400{% else %}bg-amber-950/70 hover:bg-amber-900/80 border-amber-700/60 text-amber-200{% endif %}">
                         <span class="font-bold text-amber-400">{{ d.order }}.</span>
                         <span>{{ d.volume_label }} ({{ d.drive_letter }})</span>
                         <span class="text-slate-300 font-sans">&mdash; {{ d.count }} szt.</span>
+                        {% if active_volume_id == d.volume_id %}<span class="text-sky-200 font-sans ml-1">✓</span>{% endif %}
                     </button>
                     {% endfor %}
                 </div>
@@ -106,12 +143,13 @@
                 <div class="flex flex-wrap gap-1.5">
                     {% for d in offline_drives_info.view_drives %}
                     <button type="button"
-                            onclick="applySidebarFilter({volume_id: '{{ d.volume_id }}'})"
-                            title="Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }})"
-                            class="inline-flex items-center space-x-1 bg-slate-800/90 hover:bg-slate-700 border border-amber-700/40 text-amber-100 px-2 py-0.5 rounded-md font-mono transition">
+                            onclick="{% if active_volume_id == d.volume_id %}applySidebarFilter({volume_id: '', folder_prefix: ''}){% else %}applySidebarFilter({volume_id: '{{ d.volume_id }}', folder_prefix: '', online_only: false}){% endif %}"
+                            title="{% if active_volume_id == d.volume_id %}Kliknij ponownie, aby wrócić do wszystkich urządzeń{% else %}Kliknij, aby filtrować pliki z dysku {{ d.volume_label }} (S/N: {{ d.serial }}){% endif %}"
+                            class="inline-flex items-center space-x-1 px-2 py-0.5 rounded-md font-mono transition border {% if active_volume_id == d.volume_id %}bg-sky-800 border-sky-400 text-white ring-1 ring-sky-400{% else %}bg-slate-800/90 hover:bg-slate-700 border-amber-700/40 text-amber-100{% endif %}">
                         <span class="font-bold text-amber-400">{{ d.order }}.</span>
                         <span>{{ d.volume_label }} ({{ d.drive_letter }})</span>
                         <span class="text-slate-300 font-sans">&mdash; {{ d.count }} szt.</span>
+                        {% if active_volume_id == d.volume_id %}<span class="text-sky-200 font-sans ml-1">✓</span>{% endif %}
                     </button>
                     {% endfor %}
                 </div>
@@ -120,6 +158,7 @@
                 {% endif %}
             </div>
         </div>
+        {% endif %}
     </div>
     {% endif %}
 
