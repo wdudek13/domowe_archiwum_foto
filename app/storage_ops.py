@@ -537,6 +537,19 @@ class StorageAutomationService:
         item.group_id = day_grp.id
         return day_grp
 
+    @staticmethod
+    def _is_recycle_bin_metadata_item(item: MediaItem) -> bool:
+        """
+        Windows $RECYCLE.BIN stores $I* binary index headers alongside $R* data files with the
+        original media extension (e.g. $IQDWKV0.JPG). Those $I* headers are not valid media files
+        and repeatedly fail 100% backup verification if queued as originals.
+        """
+        rel = (item.relative_path or "").replace("\\", "/").lower()
+        if "$recycle.bin" not in rel:
+            return False
+        fname = (item.file_name or "").upper()
+        return fname.startswith("$I") or bool(item.is_corrupted)
+
     def detect_files_without_backup(self, recluster: bool = True) -> List[MediaItem]:
         """
         Returns all non-trashed primary MediaItems that do NOT have a backup copy
@@ -559,6 +572,8 @@ class StorageAutomationService:
         unbacked: List[MediaItem] = []
         for fhash, cluster in by_hash.items():
             primary = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
+            if self._is_recycle_bin_metadata_item(primary):
+                continue
             has_other_device_backup = any(
                 (x.volume_id != primary.volume_id and x.is_backup_copy) for x in cluster
             )
@@ -848,10 +863,14 @@ class StorageAutomationService:
         single_device_warning = len(volumes) < 2
         skipped_non_target_relocs = 0
         skipped_non_target_important = 0
+        skipped_corrupted_or_recycle = 0
 
         for cinfo in cluster_infos:
             cluster = cinfo["cluster"]
             best_orig: MediaItem = cinfo["orig"]
+            if self._is_recycle_bin_metadata_item(best_orig):
+                skipped_corrupted_or_recycle += 1
+                continue
             orig_vol = volumes.get(best_orig.volume_id)
             fsize = int(best_orig.file_size_bytes or 0)
 
@@ -1156,6 +1175,7 @@ class StorageAutomationService:
             "important_plan_total": len(important_candidates),
             "skipped_non_target_relocs": skipped_non_target_relocs,
             "skipped_non_target_important": skipped_non_target_important,
+            "skipped_corrupted_or_recycle": skipped_corrupted_or_recycle,
         }
 
         return {
@@ -1166,6 +1186,7 @@ class StorageAutomationService:
             "effective_target_volume_ids": effective_target_ids,
             "minimize_transfers": bool(minimize_transfers),
             "strict_target_writes_only": bool(strict_target_writes_only),
+            "skipped_corrupted_or_recycle": skipped_corrupted_or_recycle,
             "stats": {
                 "total_unique": total_unique_count,
                 "missing_backups": missing_backup_count,
@@ -1209,6 +1230,7 @@ class StorageAutomationService:
         target_volume_ids: Optional[List[int]] = None,
         minimize_transfers: bool = True,
         strict_target_writes_only: bool = False,
+        attempted_pair_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the automated Backup workflow for selected volume pairs and target drives:
@@ -1272,11 +1294,17 @@ class StorageAutomationService:
             self.db.commit()
 
         connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        attempted_pairs_set: Set[str] = {
+            str(k).strip() for k in (attempted_pair_keys or []) if str(k).strip()
+        }
+        newly_attempted_pair_keys: List[str] = list(dict.fromkeys(attempted_pairs_set))
         backups_created = 0
         backups_relocated = 0
         backups_remote_moved = 0
         verification_blocks = 0
+        missing_source_files = 0
         skipped_unselected_pairs = 0
+        skipped_already_attempted_pairs = 0
         space_warnings: List[str] = []
         completed_pairs: List[str] = []
         pending_offline_pairs: List[Dict[str, Any]] = []
@@ -1287,6 +1315,11 @@ class StorageAutomationService:
 
             if selected_pairs_set is not None and pair_entry["pair_key"] not in selected_pairs_set:
                 skipped_unselected_pairs += 1
+                continue
+
+            pair_key_str = pair_entry.get("pair_key_str") or f"{pair_entry['pair_key'][0]}:{pair_entry['pair_key'][1]}"
+            if pair_key_str in attempted_pairs_set:
+                skipped_already_attempted_pairs += 1
                 continue
 
             va: Optional[WindowsVolume] = pair_entry["vol_a"]
@@ -1305,6 +1338,7 @@ class StorageAutomationService:
                     continue
                 curr_path = vol_root / bkp_item.relative_path
                 if not curr_path.exists():
+                    missing_source_files += 1
                     continue
                 sub_day = bkp_item.effective_date.strftime("%Y/%m/%d")
                 target_bkp_dir = vol_root / self.BACKUP_DIR_NAME / sub_day
@@ -1339,8 +1373,10 @@ class StorageAutomationService:
                 continue
 
             # Cross-device Remote Moves (Kopie zdalne) with 100% verification
+            aborted_by_stop = False
             for rmove in tasks["backups_remote_move"]:
                 if job_id and ProcessManager.is_stop_requested(job_id):
+                    aborted_by_stop = True
                     break
                 if strict_target_writes_only and rmove["dst_vol_id"] not in allowed_write_vols:
                     continue
@@ -1353,6 +1389,7 @@ class StorageAutomationService:
                     continue
                 src_path = src_root_v / bkp_item.relative_path
                 if not src_path.exists():
+                    missing_source_files += 1
                     continue
                 has_space, free_bytes = self.check_volume_free_space(
                     str(dst_root), bkp_item.file_size_bytes
@@ -1401,6 +1438,7 @@ class StorageAutomationService:
             # New Backup Copying (Nowe kopie) with 100% verification
             for copy_task in tasks["backups_to_copy"]:
                 if job_id and ProcessManager.is_stop_requested(job_id):
+                    aborted_by_stop = True
                     break
                 if strict_target_writes_only and copy_task["dst_vol_id"] not in allowed_write_vols:
                     continue
@@ -1414,6 +1452,7 @@ class StorageAutomationService:
 
                 src_path = src_root_v / orig_item.relative_path
                 if not src_path.exists():
+                    missing_source_files += 1
                     continue
 
                 has_space, free_bytes = self.check_volume_free_space(
@@ -1495,6 +1534,9 @@ class StorageAutomationService:
                     )
 
             self.db.commit()
+            if not aborted_by_stop and pair_key_str not in attempted_pairs_set:
+                attempted_pairs_set.add(pair_key_str)
+                newly_attempted_pair_keys.append(pair_key_str)
             pair_label = (
                 f"{va.volume_label} ({va.last_known_drive_letter})"
                 if va.id == vb.id
@@ -1504,6 +1546,7 @@ class StorageAutomationService:
 
         self.flag_duplicate_clusters()
         remaining_unbacked = len(self.detect_files_without_backup(recluster=False))
+        skipped_recycle = int(plan.get("skipped_corrupted_or_recycle", 0))
 
         pending_pairs_summary: List[Dict[str, Any]] = []
         for p_entry in pending_offline_pairs:
@@ -1542,8 +1585,16 @@ class StorageAutomationService:
             f"Nowe kopie (backupy): {backups_created} | Kopie lokalne do '{self.BACKUP_DIR_NAME}/': {backups_relocated} | "
             f"Kopie zdalne: {backups_remote_moved} | Dodano do albumu 'Ważne': {important_assigned}"
         )
+        if verification_blocks > 0:
+            summary_msg += f" | Blokady weryfikacji 100%: {verification_blocks}"
+        if missing_source_files > 0:
+            summary_msg += f" | Brakujące pliki źródłowe na dysku: {missing_source_files}"
+        if skipped_recycle > 0:
+            summary_msg += f" | Pominięto wpisy systemowe Kosza ($RECYCLE.BIN): {skipped_recycle}"
         if skipped_unselected_pairs > 0:
             summary_msg += f" | Pominięto niewybrane pary dysków: {skipped_unselected_pairs}"
+        if skipped_already_attempted_pairs > 0:
+            summary_msg += f" | Pominięto już obsłużone pary w tym zadaniu: {skipped_already_attempted_pairs}"
         if strict_target_writes_only:
             summary_msg += " | Tryb ochrony: zapisy wyłącznie na wybranych dyskach docelowych"
 
@@ -1557,9 +1608,13 @@ class StorageAutomationService:
                 "backups_remote_moved": backups_remote_moved,
                 "important_assigned": important_assigned,
                 "verification_blocks": verification_blocks,
+                "missing_source_files": missing_source_files,
+                "skipped_corrupted_or_recycle": skipped_recycle,
                 "completed_pairs": completed_pairs,
                 "pending_pairs": len(pending_offline_pairs),
                 "skipped_unselected_pairs": skipped_unselected_pairs,
+                "skipped_already_attempted_pairs": skipped_already_attempted_pairs,
+                "attempted_pair_keys": newly_attempted_pair_keys,
             },
             db=self.db,
         )
@@ -1572,8 +1627,12 @@ class StorageAutomationService:
             "duplicates_deleted": 0,
             "important_assigned": important_assigned,
             "verification_blocks": verification_blocks,
+            "missing_source_files": missing_source_files,
+            "skipped_corrupted_or_recycle": skipped_recycle,
             "space_warnings": space_warnings,
             "completed_pairs": completed_pairs,
+            "attempted_pair_keys": newly_attempted_pair_keys,
+            "skipped_already_attempted_pairs": skipped_already_attempted_pairs,
             "pending_offline_pairs_count": len(pending_offline_pairs),
             "pending_pairs_summary": pending_pairs_summary,
             "skipped_unselected_pairs": skipped_unselected_pairs,

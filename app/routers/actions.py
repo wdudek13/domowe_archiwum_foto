@@ -348,9 +348,9 @@ def execute_scan(path_str: str, force_rescan: bool = False, job_id: Optional[int
             repaired_thumbs = 0
             updated_existing = 0
 
-            # Exclude daf_albums/ and daf_backup/ when walking top-level folders
+            # Exclude daf_albums/, daf_backup/, and Windows system/recycle folders when walking
             scan_target_low = target.name.lower()
-            skip_dir_names = {"daf_albums"}
+            skip_dir_names = {"daf_albums", "$recycle.bin", "system volume information"}
             if scan_target_low not in ("daf_backup", "backup"):
                 skip_dir_names.add("daf_backup")
 
@@ -1266,7 +1266,10 @@ def control_background_process(
                     target_volume_ids=params.get("target_volume_ids"),
                     minimize_transfers=bool(params.get("minimize_transfers", True)),
                     strict_target_writes_only=bool(params.get("strict_target_writes_only", False)),
+                    attempted_pair_keys=params.get("attempted_pair_keys"),
                 )
+                params["attempted_pair_keys"] = exec_res.get("attempted_pair_keys", [])
+                job.params_json = json.dumps(params, ensure_ascii=False)
                 if exec_res.get("pending_offline_pairs_count", 0) > 0:
                     ProcessManager.update_progress(
                         job.id,
@@ -1783,7 +1786,14 @@ def execute_backup_action(
         .order_by(BackgroundJob.id.desc())
         .limit(1)
     ).first()
+    prior_attempted_pairs: List[str] = []
     if existing_wait_job:
+        try:
+            old_params = json.loads(existing_wait_job.params_json or "{}")
+            prior_attempted_pairs = list(old_params.get("attempted_pair_keys") or [])
+        except Exception:
+            prior_attempted_pairs = []
+        job_params["attempted_pair_keys"] = prior_attempted_pairs
         job_id = existing_wait_job.id
         existing_wait_job.params_json = json.dumps(job_params, ensure_ascii=False)
         existing_wait_job.status = "RUNNING"
@@ -1805,7 +1815,12 @@ def execute_backup_action(
         target_volume_ids=parsed_targets,
         minimize_transfers=eff_minimize,
         strict_target_writes_only=eff_strict_target,
+        attempted_pair_keys=prior_attempted_pairs,
     )
+    active_job = db.get(BackgroundJob, job_id)
+    if active_job:
+        job_params["attempted_pair_keys"] = exec_result.get("attempted_pair_keys", [])
+        active_job.params_json = json.dumps(job_params, ensure_ascii=False)
     if exec_result["pending_offline_pairs_count"] > 0:
         ProcessManager.update_progress(
             job_id,
@@ -3228,6 +3243,7 @@ def _build_safe_removal_html_response(
     offline_ids = res["offline_ids"]
     nxt = res["next_offline_prompt"]
 
+    verify_res: Optional[Dict[str, Any]] = None
     if offline_items and nxt:
         nxt_del = int(nxt.get("delete_count", nxt.get("count", 0)) or 0)
         nxt_ref = int(nxt.get("verify_only_count", 0) or 0)
@@ -3250,10 +3266,22 @@ def _build_safe_removal_html_response(
         )
     else:
         verb = "Przeniesiono do Kosza" if delete_mode == "trash" else "Trwale usunięto z dysku"
+        finish_msg = f"{verb}: {processed} (fizycznie: {physical}, zablokowano bezpieczeństwem: {blocked_safety + blocked_verify})."
+        if delete_mode != "trash" and not res.get("stopped_by_user"):
+            verify_res = StorageAutomationService(db).verify_deleted_duplicates_integrity()
+            finish_msg += f" | ✅ Weryfikacja: {verify_res['report_text']}"
+            OperationLogger.log(
+                "DUP_POST_VERIFY",
+                verify_res["report_text"],
+                status="OK" if verify_res["missing_orig_count"] == 0 else "WARN",
+                details=verify_res,
+                db=db,
+                commit=False,
+            )
         ProcessManager.finish_job(
             job_id,
             status="COMPLETED",
-            message=f"{verb}: {processed} (fizycznie: {physical}, zablokowano bezpieczeństwem: {blocked_safety + blocked_verify}).",
+            message=finish_msg,
             db=db,
         )
     db.commit()
@@ -3274,6 +3302,16 @@ def _build_safe_removal_html_response(
     if blocked_verify > 0:
         parts.append(f" | ⚠️ Zablokowano (błąd weryfikacji 100%): {blocked_verify}")
     parts.append("</span>")
+
+    if verify_res is not None:
+        v_ok = verify_res["missing_orig_count"] == 0
+        v_cls = "border-emerald-500/70 bg-emerald-950/80 text-emerald-100" if v_ok else "border-amber-500/70 bg-amber-950/80 text-amber-100"
+        v_icon = "✅" if v_ok else "⚠️"
+        parts.append(
+            f"<div class='mt-1.5 px-3 py-1.5 rounded-lg border {v_cls} text-[11px] leading-snug'>"
+            f"<strong>{v_icon} Automatyczna weryfikacja 100% Oryginałów po usunięciu:</strong> "
+            f"{html_mod.escape(verify_res['report_text'])}</div>"
+        )
 
     if nxt and offline_ids:
         vals_payload = html_mod.escape(

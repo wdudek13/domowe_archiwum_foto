@@ -5485,6 +5485,245 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 )
                 self.assertEqual(len(bkp_items), 2)
 
+    def test_scanner_and_backup_skip_recycle_bin_and_avoid_requeueing_attempted_pairs(self):
+        """
+        1) Scanner skips $RECYCLE.BIN and System Volume Information folders.
+        2) Existing $RECYCLE.BIN/$I* rows in DB are excluded from backup planning (no infinite verification block loops).
+        3) Multi-pair backup_exec jobs remember attempted_pair_keys across resumes so a pair already processed
+           online (e.g. with a missing physical source file) is NOT requested again when resuming later pairs.
+        """
+        from app.scanner import FileScannerService
+
+        self.assertTrue(FileScannerService.is_in_excluded_album_export_folder("$RECYCLE.BIN/$IQDWKV0.JPG"))
+        self.assertTrue(FileScannerService.is_in_excluded_album_export_folder("System Volume Information/IndexerVolumeGuid"))
+
+        recycle_dir = self.drive_a / "$RECYCLE.BIN"
+        recycle_dir.mkdir(parents=True, exist_ok=True)
+        (recycle_dir / "$IQDWKV0.JPG").write_bytes(b"\x02\x00\x00\x00" + b"\x00" * 120)
+        sys_dir = self.drive_a / "System Volume Information"
+        sys_dir.mkdir(parents=True, exist_ok=True)
+        (sys_dir / "meta.jpg").write_bytes(b"\x01\x02\x03")
+        create_synthetic_jpeg(self.drive_a / "valid_photo.jpg", color=(40, 80, 120))
+
+        with patch.object(
+            WindowsVolumeInspector,
+            "get_volume_info",
+            return_value=("AA01-0001", "ScanVolA", str(self.drive_a)),
+        ), patch.object(
+            WindowsVolumeInspector,
+            "get_connected_vsn_map",
+            return_value={"AA01-0001": (str(self.drive_a), "ScanVolA")},
+        ):
+            r_scan = self.client.post("/actions/scan", data={"path": str(self.drive_a)})
+            self.assertEqual(r_scan.status_code, 200)
+
+        with self.TestingSessionLocal() as db:
+            items = list(db.scalars(select(MediaItem).where(MediaItem.is_trashed == False)).all())
+            names = [it.file_name for it in items]
+            self.assertIn("valid_photo.jpg", names)
+            self.assertNotIn("$IQDWKV0.JPG", names)
+            self.assertNotIn("meta.jpg", names)
+
+            # Prepare 3 drives: Vol1 (missing physical file + pre-existing $RECYCLE.BIN/$I row), Vol2 (valid unbacked), BackupVol
+            vol1 = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == "AA01-0001"))
+            vol1.total_space_bytes = 50 * 1024**3
+            vol1.free_space_bytes = 40 * 1024**3
+            # Delete valid_photo.jpg physically after scan to simulate missing source file on Vol1
+            (self.drive_a / "valid_photo.jpg").unlink()
+
+            # Also insert an existing $RECYCLE.BIN/$I* row that might have been scanned by an older version
+            recycle_item = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol1.id,
+                relative_path="$RECYCLE.BIN/$IQDWKV0.JPG",
+                file_name="$IQDWKV0.JPG",
+                file_size_bytes=544,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="recycle_header_hash_1",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2025, 1, 1),
+                fs_mtime=datetime.datetime(2025, 1, 1),
+                effective_date=datetime.datetime(2025, 1, 1),
+                thumbnail_relative_path="rec_thumb.webp",
+                is_corrupted=True,
+                duplicate_role="original",
+            )
+            db.add(recycle_item)
+
+            drive_c = self.root / "drive_c"
+            drive_c.mkdir(parents=True, exist_ok=True)
+            vol2 = WindowsVolume(
+                volume_serial_number="CC02-0002",
+                volume_label="ScanVolC",
+                last_known_drive_letter=str(drive_c),
+                is_online=False,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_bkp = WindowsVolume(
+                volume_serial_number="BB03-0003",
+                volume_label="BackupDest",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=100 * 1024**3,
+                free_space_bytes=90 * 1024**3,
+            )
+            db.add_all([vol2, vol_bkp])
+            db.commit()
+            db.refresh(vol2)
+            db.refresh(vol_bkp)
+
+            p_c = create_synthetic_jpeg(drive_c / "c_photo.jpg", color=(90, 20, 40))
+            it_c = FileScannerService.process_file(p_c, vol2)
+            db.add(it_c)
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            plan = svc.build_backup_and_dedup_plan(target_volume_ids=[vol_bkp.id])
+            self.assertEqual(plan["skipped_corrupted_or_recycle"], 1)
+            planned_names = [t["file_name"] for p in plan["scheduled_pairs"] for t in p["tasks"]["backups_to_copy"]]
+            self.assertNotIn("$IQDWKV0.JPG", planned_names)
+            self.assertIn("valid_photo.jpg", planned_names)
+            self.assertIn("c_photo.jpg", planned_names)
+
+            # Run 1: Vol1 + BackupDest online, Vol2 offline -> checks Vol1<->BackupDest (missing_source_files=1), waits ONLY for Vol2<->BackupDest
+            vsn_run1 = {
+                "AA01-0001": (str(self.drive_a), "ScanVolA"),
+                "BB03-0003": (str(self.drive_b), "BackupDest"),
+            }
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_run1):
+                r1 = self.client.post(
+                    "/actions/execute-backup",
+                    data={
+                        "target_vols_submitted": "true",
+                        "target_volume_ids": [str(vol_bkp.id)],
+                        "minimize_submitted": "true",
+                        "minimize_transfers": "true",
+                    },
+                )
+                self.assertEqual(r1.status_code, 200)
+                self.assertIn("Brakujące pliki źródłowe na dysku", r1.text)
+                self.assertIn("ScanVolC", r1.text)
+                job = db.scalars(
+                    select(BackgroundJob).where(BackgroundJob.job_type == "backup_exec").order_by(BackgroundJob.id.desc()).limit(1)
+                ).first()
+                self.assertEqual(job.status, "WAITING_FOR_DEVICE")
+                params_1 = json.loads(job.params_json)
+                pair_v1_bkp = f"{min(vol1.id, vol_bkp.id)}:{max(vol1.id, vol_bkp.id)}"
+                self.assertIn(pair_v1_bkp, params_1.get("attempted_pair_keys", []))
+
+            # Run 2: Swap drives -> disconnect Vol1, connect Vol2 + BackupDest -> resume must NOT ask for ScanVolA again!
+            vsn_run2 = {
+                "CC02-0002": (str(drive_c), "ScanVolC"),
+                "BB03-0003": (str(self.drive_b), "BackupDest"),
+            }
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_run2):
+                r2 = self.client.post(
+                    "/actions/process-control",
+                    data={"action": "resume", "job_id": str(job.id)},
+                )
+                self.assertEqual(r2.status_code, 200)
+                db.expire_all()
+                job_after = db.get(BackgroundJob, job.id)
+                self.assertEqual(job_after.status, "COMPLETED")
+                self.assertNotIn("ScanVolA", job_after.last_message)
+                bkp_c = list(
+                    db.scalars(
+                        select(MediaItem).where(MediaItem.is_backup_copy == True, MediaItem.volume_id == vol_bkp.id)
+                    ).all()
+                )
+                self.assertEqual(len(bkp_c), 1)
+                self.assertEqual(bkp_c[0].file_name, "c_photo.jpg")
+
+    def test_auto_verify_after_duplicate_removal_and_no_standalone_button(self):
+        """
+        Permanent duplicate removal must automatically run verify_deleted_duplicates_integrity()
+        upon completion and include the verification report in the response and job message,
+        while the separate standalone verification button is removed from maintenance tools.
+        """
+        import time
+        from app.scanner import FileScannerService
+        from app.routers import actions as actions_mod
+
+        r_sp = self.client.get("/actions/status-panel")
+        self.assertEqual(r_sp.status_code, 200)
+        self.assertNotIn("Weryfikuj usunięte duplikaty (100% Oryginałów)", r_sp.text)
+
+        p_orig = create_synthetic_jpeg(self.drive_a / "auto_ver_orig.jpg", color=(25, 110, 175))
+        p_bkp = self.drive_b / "daf_backup" / "2025" / "02" / "02" / "auto_ver_orig.jpg"
+        p_bkp.parent.mkdir(parents=True, exist_ok=True)
+        p_bkp.write_bytes(p_orig.read_bytes())
+        p_dup = self.drive_a / "auto_ver_dup.jpg"
+        p_dup.write_bytes(p_orig.read_bytes())
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA11-1111",
+                volume_label="AutoVerA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB22-2222",
+                volume_label="AutoVerB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+
+            it_orig = FileScannerService.process_file(p_orig, vol_a)
+            it_bkp = FileScannerService.process_file(p_bkp, vol_b)
+            it_dup = FileScannerService.process_file(p_dup, vol_a)
+            it_orig.duplicate_role = "original"
+            it_orig.is_primary_duplicate = True
+            it_bkp.is_backup_copy = True
+            it_bkp.duplicate_role = "backup_green"
+            it_bkp.is_primary_duplicate = False
+            it_dup.duplicate_role = "duplicate"
+            it_dup.is_primary_duplicate = False
+            db.add_all([it_orig, it_bkp, it_dup])
+            db.commit()
+            dup_id = it_dup.id
+
+        vsn_both = {
+            "AA11-1111": (str(self.drive_a), "AutoVerA"),
+            "BB22-2222": (str(self.drive_b), "AutoVerB"),
+        }
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+            r_del = self.client.post(
+                "/actions/delete-permanently",
+                data={
+                    "scope": "selected",
+                    "selected_ids": [dup_id],
+                    "duplicates_only": "true",
+                    "skip_db_backup": "true",
+                },
+            )
+            self.assertEqual(r_del.status_code, 200)
+            self.assertIn("Automatyczna weryfikacja 100% Oryginałów po usunięciu", r_del.text)
+            self.assertIn("Liczba usuniętych duplikatów: 1", r_del.text)
+            self.assertIn("1 z 1 (100.0%)", r_del.text)
+
+        with self.TestingSessionLocal() as db:
+            job = db.scalars(
+                select(BackgroundJob)
+                .where(BackgroundJob.job_type == "delete_permanently")
+                .order_by(BackgroundJob.id.desc())
+                .limit(1)
+            ).first()
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "COMPLETED")
+            self.assertIn("1 z 1 (100.0%)", job.last_message)
+            self.assertFalse(p_dup.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

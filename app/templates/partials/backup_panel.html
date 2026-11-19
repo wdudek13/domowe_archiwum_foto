@@ -11,6 +11,24 @@
             ✓ Obsłużone pary dysków: <strong>{{ execution_result.completed_pairs|join(', ') }}</strong>
         </div>
         {% endif %}
+        {% if execution_result.verification_blocks > 0 or execution_result.missing_source_files > 0 or execution_result.skipped_corrupted_or_recycle > 0 %}
+        <div class="p-2 bg-slate-950/70 border border-amber-700/60 rounded text-amber-200 text-[11px] space-y-0.5">
+            {% if execution_result.verification_blocks > 0 %}
+            <div>⚠️ Blokady weryfikacji 100% (np. uszkodzone pliki lub metadane): <strong>{{ execution_result.verification_blocks }}</strong> — pary już sprawdzone nie są ponownie kolejkowane w bieżącym zadaniu.</div>
+            {% endif %}
+            {% if execution_result.missing_source_files > 0 %}
+            <div>⚠️ Brakujące pliki źródłowe na fizycznym dysku: <strong>{{ execution_result.missing_source_files }}</strong> (uruchom weryfikację spójności bazy z dyskiem, aby je oczyścić).</div>
+            {% endif %}
+            {% if execution_result.skipped_corrupted_or_recycle > 0 %}
+            <div>ℹ️ Pominięto wpisy systemowe Kosza Windows (<code>$RECYCLE.BIN/$I*</code>): <strong>{{ execution_result.skipped_corrupted_or_recycle }}</strong>.</div>
+            {% endif %}
+        </div>
+        {% endif %}
+        {% if execution_result.backups_created > 0 and plan.stats.redundant_duplicates > 0 %}
+        <div class="p-2 bg-sky-950/70 border border-sky-700/60 rounded text-sky-200 text-[11px]">
+            ℹ️ Po utworzeniu nowych kopii zapasowych na innym dysku, wcześniejsze lokalne kopie z tego samego dysku (<code>pomarańczowe</code>) stały się bezpiecznymi duplikatami do usunięcia — stąd <strong>{{ plan.stats.redundant_duplicates }}</strong> w widoku „Duplikaty binarne”.
+        </div>
+        {% endif %}
         {% if execution_result.space_warnings %}
         <div class="p-2 bg-rose-950/80 border border-rose-700 rounded text-rose-200 space-y-1">
             {% for w in execution_result.space_warnings %}
