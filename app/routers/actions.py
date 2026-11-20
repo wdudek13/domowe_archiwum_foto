@@ -150,11 +150,11 @@ def _check_view_total_mismatch(
     action_label: str,
     as_modal: bool = False,
 ) -> Optional[HTMLResponse]:
-    """H-01: Blocks filtered bulk operations if resolved IDs exceed the count displayed in the active UI view."""
+    """H-01 + BUG-02: Blocks filtered bulk operations if resolved IDs differ from the count displayed in the active UI view."""
     if fp.get("scope") != "filtered":
         return None
     view_total = to_int(_form_str(form, "view_total_matching"))
-    if view_total is not None and len(item_ids) > view_total:
+    if view_total is not None and len(item_ids) != view_total:
         msg = (
             f"Wykryto rozbieżność filtra: wyznaczono {len(item_ids)} plików, "
             f"podczas gdy w aktywnym widoku było {view_total}. Odśwież widok i spróbuj ponownie."
@@ -4756,8 +4756,15 @@ async def delete_files_permanently_from_disk(
         deleted_disk, removed_db = _execute_delete_permanently_items(db, item_ids, job_id=job_id)
 
         if grp_to_delete and not ProcessManager.is_stop_requested(job_id):
-            db.delete(grp_to_delete)
-            db.commit()
+            # BUG-01: Delete album (and subalbums) ONLY if 0 items remain in its subtree (e.g. none skipped offline or protected)
+            subtree_ids = StorageAutomationService(db).get_group_subtree_ids(grp_to_delete.id)
+            rem_cnt = db.scalar(
+                select(func.count(MediaItem.id)).where(MediaItem.group_id.in_(subtree_ids))
+            ) or 0
+            if rem_cnt == 0:
+                for gid in reversed(subtree_ids):
+                    db.execute(delete(MediaGroup).where(MediaGroup.id == gid))
+                db.commit()
 
         return HTMLResponse(
             f"<span class='text-rose-400 text-xs font-semibold'>"
