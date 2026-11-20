@@ -426,7 +426,7 @@
             const countSpan = document.getElementById('selected-counter');
             const scopeSelect = document.getElementById('bulk-scope-select');
             if (countSpan) countSpan.textContent = '0';
-            if (scopeSelect) scopeSelect.value = 'filtered';
+            if (scopeSelect) scopeSelect.value = 'selected';
         }
 
         function syncPersistedSelectionFromDom() {
@@ -442,7 +442,7 @@
             const countSpan = document.getElementById('selected-counter');
             const scopeSelect = document.getElementById('bulk-scope-select');
             if (countSpan) countSpan.textContent = totalSelected;
-            if (scopeSelect) scopeSelect.value = totalSelected > 0 ? 'selected' : 'filtered';
+            if (scopeSelect && totalSelected > 0) scopeSelect.value = 'selected';
         }
 
         async function selectAllRedundantDuplicates() {

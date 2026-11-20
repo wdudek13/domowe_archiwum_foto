@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
 
@@ -114,10 +114,28 @@ class ProcessManager:
     """
 
     _lock = threading.Lock()
+    _storage_mutation_lock = threading.Lock()
+    _active_storage_op: Optional[str] = None
     _stop_flags: Dict[int, bool] = {}
     _active_threads: Dict[int, threading.Thread] = {}
     _job_cache: Dict[int, Dict[str, Any]] = {}
     _last_db_sync: Dict[int, float] = {}
+
+    @classmethod
+    def try_acquire_storage_lock(cls, op_name: str) -> Tuple[bool, Optional[str]]:
+        """V-13: Non-blocking global storage mutation guard to prevent concurrent conflicting disk/DB writes."""
+        if cls._storage_mutation_lock.acquire(blocking=False):
+            cls._active_storage_op = op_name
+            return True, None
+        return False, cls._active_storage_op or "inna operacja dyskowa"
+
+    @classmethod
+    def release_storage_lock(cls) -> None:
+        cls._active_storage_op = None
+        try:
+            cls._storage_mutation_lock.release()
+        except RuntimeError:
+            pass
 
     @classmethod
     def create_job(

@@ -146,6 +146,30 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.engine.dispose()
         self.temp_dir.cleanup()
 
+    def _delete_permanently_two_phase(self, data: dict, headers=None, allow_originals: bool = True):
+        """Executes Zero-Trust Two-Phase Commit: /actions/delete-preview -> token -> /actions/delete-permanently."""
+        import re
+
+        r_prev = self.client.post("/actions/delete-preview", data=data)
+        m_tok = re.search(r"name='deletion_token' value='([^']+)'", r_prev.text)
+        if not m_tok:
+            return r_prev
+        m_cnt = re.search(r"name='confirmed_count' value='([^']+)'", r_prev.text)
+        post_data = {
+            "scope": "selected",
+            "deletion_token": m_tok.group(1),
+            "confirmed_count": m_cnt.group(1) if m_cnt else "",
+            "duplicates_only": str(data.get("duplicates_only", "false")),
+        }
+        if "skip_db_backup" in data:
+            post_data["skip_db_backup"] = data["skip_db_backup"]
+        if "run_sync" in data:
+            post_data["run_sync"] = data["run_sync"]
+        if allow_originals and "confirm_originals_text" in r_prev.text:
+            post_data["allow_originals"] = "true"
+            post_data["confirm_originals_text"] = "USUŃ"
+        return self.client.post("/actions/delete-permanently", data=post_data, headers=headers or {})
+
     # =========================================================================
     # 1. HASHING, 100% MULTI-LAYER VERIFICATION, DATE RESOLUTION & SCANNER
     # =========================================================================
@@ -519,9 +543,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(r_dup_ids.status_code, 200)
             dup_ids_list = r_dup_ids.json()["ids"]
             self.assertTrue(len(dup_ids_list) >= 1)
-            r_del_dups = self.client.post(
-                "/actions/delete-permanently",
-                data={
+            r_del_dups = self._delete_permanently_two_phase(
+                {
                     "scope": "selected",
                     "duplicates_only": "true",
                     "selected_ids_json": json.dumps(dup_ids_list),
@@ -3034,9 +3057,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             r_red = self.client.get("/actions/redundant-duplicate-ids?duplicates_only=true")
             red_ids = r_red.json()["ids"]
             self.assertTrue(len(red_ids) >= 1)
-            r_del_red = self.client.post(
-                "/actions/delete-permanently",
-                data={
+            r_del_red = self._delete_permanently_two_phase(
+                {
                     "scope": "selected",
                     "duplicates_only": "true",
                     "selected_ids_json": json.dumps(red_ids),
@@ -3870,9 +3892,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             db.commit()
 
             with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value={"VSN-NEW-B": (str(self.drive_b), "Dysk_B"), "VSN-NEW-C": (str(drive_c), "Dysk_Dedykowany_Backup_C")}):
-                r_off_dup = self.client.post(
-                    "/actions/delete-permanently",
-                    data={"scope": "selected", "duplicates_only": "true", "selected_ids": [it_tr4.id]},
+                r_off_dup = self._delete_permanently_two_phase(
+                    {"scope": "selected", "duplicates_only": "true", "selected_ids": [it_tr4.id]},
                 )
                 self.assertEqual(r_off_dup.status_code, 200)
                 self.assertIn("Podłącz kolejny dysk", r_off_dup.text)
@@ -4120,10 +4141,9 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 # Req 2 (Bug): Async permanent duplicate deletion returns live polling progress bar & finishes cleanly
                 it_dup_extra = db.get(MediaItem, items[2].id)
                 self.assertEqual(it_dup_extra.duplicate_role, "duplicate")
-                r_async_del = self.client.post(
-                    "/actions/delete-permanently",
+                r_async_del = self._delete_permanently_two_phase(
+                    {"scope": "selected", "selected_ids": [it_dup_extra.id], "duplicates_only": "true"},
                     headers={"HX-Request": "true"},
-                    data={"scope": "selected", "selected_ids": [it_dup_extra.id], "duplicates_only": "true"},
                 )
                 self.assertEqual(r_async_del.status_code, 200)
                 self.assertTrue(
@@ -4153,14 +4173,13 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 db.commit()
                 svc.flag_duplicate_clusters()
                 huge_ids = [it_extra2.id] + [f"00000000-0000-0000-0000-{i:012d}" for i in range(36000)]
-                r_huge = self.client.post(
-                    "/actions/delete-permanently",
-                    headers={"HX-Request": "true"},
-                    data={
+                r_huge = self._delete_permanently_two_phase(
+                    {
                         "scope": "selected",
                         "selected_ids_json": json.dumps(huge_ids),
                         "duplicates_only": "true",
                     },
+                    headers={"HX-Request": "true"},
                 )
                 self.assertEqual(r_huge.status_code, 200)
                 r_st_panel = self.client.get("/actions/status-panel")
@@ -4234,14 +4253,13 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
 
                 # Mark DiskD offline AFTER scanning (A, B, C online; D and E offline)
                 dup_target_ids = [extra_items[2].id, extra_items[5].id, extra_items[6].id]
-                r_off_plan = self.client.post(
-                    "/actions/delete-permanently",
-                    headers={"HX-Request": "true"},
-                    data={
+                r_off_plan = self._delete_permanently_two_phase(
+                    {
                         "scope": "selected",
                         "selected_ids": dup_target_ids,
                         "duplicates_only": "true",
                     },
+                    headers={"HX-Request": "true"},
                 )
                 self.assertEqual(r_off_plan.status_code, 200)
                 for _ in range(100):
@@ -4541,9 +4559,10 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
                 res_v3 = svc.execute_safe_duplicate_removal(
                     [v3_items[2].id], delete_mode="permanent", force_duplicate_verification=True
                 )
-                self.assertEqual(res_v3["physical_count"], 1)
-                self.assertEqual(res_v3["processed_count"], 1)
-                self.assertFalse(p_v3_on.exists())
+                # V-07 protection: offline video duplicate with partial_3x64k and verified_sha256=None MUST be blocked!
+                self.assertEqual(res_v3["physical_count"], 0)
+                self.assertEqual(res_v3["blocked_verify"], 1)
+                self.assertTrue(p_v3_on.exists())
 
                 # Verify once all 3rd+ duplicates are removed, Duplikaty binarne shows 0 while 2-copy clusters remain under Backupy do przeniesienia
                 for rem_dup in db.scalars(select(MediaItem).where(MediaItem.is_trashed == False, MediaItem.duplicate_role == "duplicate")).all():
@@ -5700,9 +5719,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             "BB22-2222": (str(self.drive_b), "AutoVerB"),
         }
         with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
-            r_del = self.client.post(
-                "/actions/delete-permanently",
-                data={
+            r_del = self._delete_permanently_two_phase(
+                {
                     "scope": "selected",
                     "selected_ids": [dup_id],
                     "duplicates_only": "true",
@@ -6039,9 +6057,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertTrue(p_unbacked.exists())
 
             # 2) scope=filtered with unbacked_only=true deletes ONLY unbacked items, NEVER backed-up family_safe.jpg
-            r_unb = self.client.post(
-                "/actions/delete-permanently",
-                data={"scope": "filtered", "unbacked_only": "true", "skip_db_backup": "true"},
+            r_unb = self._delete_permanently_two_phase(
+                {"scope": "filtered", "unbacked_only": "true", "skip_db_backup": "true"},
             )
             self.assertEqual(r_unb.status_code, 200)
             self.assertTrue(p_backed_orig.exists())
@@ -6052,7 +6069,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         with self.TestingSessionLocal() as db:
             self.assertIsNotNone(db.get(MediaItem, orig_id))
             self.assertIsNone(db.get(MediaItem, unb_id))
-            self.assertIsNone(db.get(MediaItem, off_fake_id))
+            # V-03 protection: offline volume DB record MUST remain intact during permanent delete
+            self.assertIsNotNone(db.get(MediaItem, off_fake_id))
 
     def test_daf_backup_immutability_shared_thumb_protection_and_delete_preview(self):
         """
@@ -6131,10 +6149,9 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertIn("LabelOrigA", r_prev.text)
             self.assertIn("Ochrona daf_backup/", r_prev.text)
 
-            # 3) Direct delete-permanently on [orig_id, bkp_id] MUST NOT delete daf_backup/ item OR shared thumbnail!
-            r_del = self.client.post(
-                "/actions/delete-permanently",
-                data={"scope": "selected", "selected_ids": [orig_id, bkp_id], "skip_db_backup": "true"},
+            # 3) Two-phase delete-permanently on [orig_id, bkp_id] MUST NOT delete daf_backup/ item OR shared thumbnail!
+            r_del = self._delete_permanently_two_phase(
+                {"scope": "selected", "selected_ids": [orig_id, bkp_id], "skip_db_backup": "true"},
             )
             self.assertEqual(r_del.status_code, 200)
             self.assertTrue(p_bkp.exists())
@@ -6143,6 +6160,374 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         with self.TestingSessionLocal() as db:
             self.assertIsNone(db.get(MediaItem, orig_id))
             self.assertIsNotNone(db.get(MediaItem, bkp_id))
+
+    def test_zero_trust_security_audit_v01_to_v14_and_two_phase_delete(self):
+        """
+        Verifies Zero-Trust File Safety fixes from the security audit:
+        - V-03 & Sec 6: delete-permanently and empty-trash NEVER delete DB records for OFFLINE drives.
+        - V-04: Weak filters (media_type=image alone) are rejected for scope=filtered deletion.
+        - V-06: backup/ folder is protected identically to daf_backup/.
+        - V-09: BackupManager._rotate preserves oversized rescue snapshots (>20% larger).
+        - Sec 7: Two-Phase Commit deletion_token + Original Protection Gate (requires 'USUŃ').
+        """
+        import re
+        from app.backup import BackupManager
+        from app.scanner import FileScannerService
+        from app.storage_ops import _safe_unlink
+
+        # V-06 + NEW-BUG-03: Top-level backup/ folder is protected, while nested user subfolder DCIM/backup/ is NOT!
+        p_legacy_bkp = self.drive_b / "backup" / "2024" / "legacy_bkp.jpg"
+        p_legacy_bkp.parent.mkdir(parents=True, exist_ok=True)
+        create_synthetic_jpeg(p_legacy_bkp, color=(12, 34, 56))
+        with self.assertRaises(PermissionError):
+            _safe_unlink(p_legacy_bkp, volume_root=self.drive_b)
+        self.assertTrue(p_legacy_bkp.exists())
+
+        p_nested_user_bkp = self.drive_a / "DCIM" / "backup" / "user_photo.jpg"
+        p_nested_user_bkp.parent.mkdir(parents=True, exist_ok=True)
+        create_synthetic_jpeg(p_nested_user_bkp, color=(56, 34, 12))
+        _safe_unlink(p_nested_user_bkp, volume_root=self.drive_a)
+        self.assertFalse(p_nested_user_bkp.exists())
+
+        # V-09: Oversized rescue snapshot preserved across rotation
+        rot_dir = self.root / "rot_test_backups"
+        rot_dir.mkdir(parents=True, exist_ok=True)
+        big_snap = rot_dir / "media_vault_pre_permanent_disk_delete_20261119_194555.db.gz"
+        big_snap.write_bytes(b"X" * 5000)
+        os.utime(big_snap, (1000, 1000))
+        for i in range(4):
+            sm = rot_dir / f"media_vault_small_{i}.db.gz"
+            sm.write_bytes(b"Y" * 1000)
+            os.utime(sm, (2000 + i * 10, 2000 + i * 10))
+        bm = BackupManager(backup_dir=rot_dir, max_retained_backups=2)
+        bm._rotate()
+        self.assertTrue(big_snap.exists(), "Oversized rescue snapshot must never be auto-rotated out!")
+
+        # V-03, V-04, Sec 6, Sec 7: offline DB preservation + Two-Phase Commit deletion_token
+        p_on = create_synthetic_jpeg(self.drive_a / "zt_online.jpg", color=(90, 10, 10))
+        p_off_file = create_synthetic_jpeg(self.drive_b / "zt_offline.jpg", color=(10, 90, 10))
+        with self.TestingSessionLocal() as db:
+            vol_on = WindowsVolume(
+                volume_serial_number="AA88-1111",
+                volume_label="ZTrustOnline",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_off = WindowsVolume(
+                volume_serial_number="BB88-2222",
+                volume_label="ZTrustOffline",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=False,
+            )
+            db.add_all([vol_on, vol_off])
+            db.commit()
+            db.refresh(vol_on)
+            db.refresh(vol_off)
+
+            it_on = FileScannerService.process_file(p_on, vol_on)
+            it_off = FileScannerService.process_file(p_off_file, vol_off)
+            it_on.duplicate_role = "original"
+            it_off.duplicate_role = "original"
+            db.add_all([it_on, it_off])
+            db.commit()
+            on_id, off_id = it_on.id, it_off.id
+
+        vsn_only_a = {"AA88-1111": (str(self.drive_a), "ZTrustOnline")}
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_only_a):
+            # V-04: media_type=image alone MUST NOT bypass scope=filtered guard in delete-preview
+            r_weak = self.client.post(
+                "/actions/delete-preview",
+                data={"scope": "filtered", "media_type": "image"},
+            )
+            self.assertIn("Zablokowano trwałe usuwanie", r_weak.text)
+
+            # NEW-BUG-01: Direct POST /actions/delete-permanently without deletion_token MUST BE BLOCKED!
+            r_direct_bypass = self.client.post(
+                "/actions/delete-permanently",
+                data={"scope": "selected", "selected_ids": [on_id], "skip_db_backup": "true"},
+            )
+            self.assertIn("wymagany jest ważny token potwierdzenia", r_direct_bypass.text)
+            self.assertTrue(p_on.exists())
+
+            # V-03: Deleting an OFFLINE item via valid Two-Phase Commit MUST NOT remove its DB record!
+            r_off_del = self._delete_permanently_two_phase(
+                {"scope": "selected", "selected_ids": [off_id], "skip_db_backup": "true"},
+            )
+            self.assertEqual(r_off_del.status_code, 200)
+            with self.TestingSessionLocal() as db:
+                self.assertIsNotNone(db.get(MediaItem, off_id), "Offline drive DB record must NOT be deleted!")
+            self.assertTrue(p_off_file.exists())
+
+            # Sec 6: Logical trash + empty-trash on OFFLINE item preserves DB record; on ONLINE deletes physical file
+            r_tr_off = self.client.post("/actions/move-to-trash", data={"scope": "selected", "selected_ids": [off_id]})
+            self.assertEqual(r_tr_off.status_code, 200)
+            r_emp = self.client.post("/actions/empty-trash", data={"selected_ids": [off_id]})
+            self.assertEqual(r_emp.status_code, 200)
+            self.assertIn("Pominięto dyski OFFLINE", r_emp.text)
+            with self.TestingSessionLocal() as db:
+                self.assertIsNotNone(db.get(MediaItem, off_id))
+
+            # Sec 7 + NEW-BUG-01: Two-Phase Commit delete-preview -> token + Original Gate ('USUŃ')
+            r_prev = self.client.post("/actions/delete-preview", data={"scope": "selected", "selected_ids": [on_id]})
+            self.assertEqual(r_prev.status_code, 200)
+            m_tok = re.search(r"name='deletion_token' value='([^']+)'", r_prev.text)
+            self.assertIsNotNone(m_tok)
+            tok = m_tok.group(1)
+
+            # Wrong/missing 'USUŃ' text -> blocked AND token MUST NOT be destroyed!
+            r_no_gate = self.client.post(
+                "/actions/delete-permanently",
+                data={"deletion_token": tok, "confirmed_count": "1", "allow_originals": "true", "confirm_originals_text": "TYPO", "skip_db_backup": "true"},
+            )
+            self.assertIn("Zablokowano usunięcie Oryginałów", r_no_gate.text)
+            self.assertTrue(p_on.exists())
+
+            # Retrying with the EXACT SAME token + 'USUŃ' MUST succeed (NEW-BUG-01 fix)!
+            r_ok = self.client.post(
+                "/actions/delete-permanently",
+                data={
+                    "deletion_token": tok,
+                    "confirmed_count": "1",
+                    "allow_originals": "true",
+                    "confirm_originals_text": "USUŃ",
+                    "skip_db_backup": "true",
+                },
+            )
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertFalse(p_on.exists())
+
+            # Replaying the SAME token a second time AFTER success MUST fail as expired/consumed!
+            r_replay = self.client.post(
+                "/actions/delete-permanently",
+                data={
+                    "deletion_token": tok,
+                    "confirmed_count": "1",
+                    "allow_originals": "true",
+                    "confirm_originals_text": "USUŃ",
+                    "skip_db_backup": "true",
+                },
+            )
+            self.assertIn("Token potwierdzenia wygasł", r_replay.text)
+
+    def test_code_review_regression_fixes_new_bug_01_to_03_and_brak_01_to_04(self):
+        """
+        End-to-end verification of all 7 fixes from the code review audit:
+        - NEW-BUG-01 & NEW-BUG-02: Offline continuation token + accurate duplicates_only=false & 'plików' label.
+        - NEW-BUG-03: is_path_in_daf_backup matches root backup/ only, never nested DCIM/backup/.
+        - BRAK-01 (V-01): Unified filter resolution & unfiltered scope=filtered guard across move-files/move-to-trash/assign-group/rotate-media/gdrive-sync.
+        - BRAK-02 (V-13): Global ProcessManager storage mutex blocks concurrent disk/DB mutations cleanly.
+        - BRAK-03 (V-02): Online backup_green outside daf_backup/ in a 2-copy cluster is blocked even with force_duplicate_verification=False.
+        - BRAK-04 (V-14): >999 IDs chunked cleanly in clear-quality-defect, restore-from-trash, and rotate-media.
+        """
+        import html as html_mod
+        import re
+        from app.routers import actions as actions_router
+        from app.scanner import FileScannerService
+        from app.storage_ops import is_path_in_daf_backup
+
+        # NEW-BUG-03 direct path assertions
+        self.assertTrue(is_path_in_daf_backup(Path("E:\\backup\\2024\\a.jpg")))
+        self.assertTrue(is_path_in_daf_backup(Path("E:\\daf_backup\\2024\\a.jpg")))
+        self.assertFalse(is_path_in_daf_backup(Path("E:\\DCIM\\WhatsApp\\backup\\IMG_01.jpg")))
+
+        # Setup Drive A (online) and Drive B (online, later offline)
+        p_orig_2c = create_synthetic_jpeg(self.drive_a / "pair_orig.jpg", color=(11, 22, 33))
+        p_bkp_out = self.drive_b / "outside_copy" / "pair_bkp_green.jpg"
+        p_bkp_out.parent.mkdir(parents=True, exist_ok=True)
+        p_bkp_out.write_bytes(p_orig_2c.read_bytes())
+
+        p_unb_only = create_synthetic_jpeg(self.drive_a / "solo_unbacked.jpg", color=(200, 120, 40))
+        p_off_orig = create_synthetic_jpeg(self.drive_b / "offline_solo_orig.jpg", color=(40, 120, 200))
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA44-1111",
+                volume_label="CRDriveA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB44-2222",
+                volume_label="CRDriveB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+
+            it_orig_2c = FileScannerService.process_file(p_orig_2c, vol_a)
+            it_bkp_out = FileScannerService.process_file(p_bkp_out, vol_b)
+            it_unb_only = FileScannerService.process_file(p_unb_only, vol_a)
+            it_off_orig = FileScannerService.process_file(p_off_orig, vol_b)
+            db.add_all([it_orig_2c, it_bkp_out, it_unb_only, it_off_orig])
+            db.commit()
+
+            svc = StorageAutomationService(db)
+            svc.flag_duplicate_clusters()
+            db.expire_all()
+
+            orig_2c_id = it_orig_2c.id
+            bkp_out_id = it_bkp_out.id
+            unb_id = it_unb_only.id
+            off_orig_id = it_off_orig.id
+            vol_a_id, vol_b_id = vol_a.id, vol_b.id
+
+            bkp_row = db.get(MediaItem, bkp_out_id)
+            self.assertEqual(bkp_row.duplicate_role, "backup_green")
+            self.assertFalse(bkp_row.is_backup_copy)
+
+        vsn_both = {
+            "AA44-1111": (str(self.drive_a), "CRDriveA"),
+            "BB44-2222": (str(self.drive_b), "CRDriveB"),
+        }
+        vsn_only_a = {"AA44-1111": (str(self.drive_a), "CRDriveA")}
+
+        # BRAK-03: Online backup_green outside daf_backup/ in a 2-copy cluster MUST be blocked even with force_duplicate_verification=False!
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+            with self.TestingSessionLocal() as db:
+                res_bkp_blk = StorageAutomationService(db).execute_safe_duplicate_removal(
+                    [bkp_out_id],
+                    delete_mode="permanent",
+                    force_duplicate_verification=False,
+                    trash_dir=self.root / "kosz",
+                    thumbnails_dir=self.thumbs_dir,
+                )
+                self.assertEqual(res_bkp_blk["blocked_safety"], 1)
+                self.assertEqual(res_bkp_blk["processed_count"], 0)
+            self.assertTrue(p_bkp_out.exists(), "2-copy online backup_green outside daf_backup/ must NOT be deleted!")
+
+        # NEW-BUG-01 & NEW-BUG-02: Non-duplicate offline Original -> continuation button uses duplicates_only=false, 'plików', and valid deletion_token!
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_only_a):
+            with self.TestingSessionLocal() as db:
+                vb = db.get(WindowsVolume, vol_b_id)
+                vb.is_online = False
+                db.commit()
+                res_off_nondup = StorageAutomationService(db).execute_safe_duplicate_removal(
+                    [off_orig_id],
+                    delete_mode="permanent",
+                    force_duplicate_verification=False,
+                    trash_dir=self.root / "kosz",
+                    thumbnails_dir=self.thumbs_dir,
+                )
+                self.assertEqual(len(res_off_nondup["offline_ids"]), 1)
+                j_cont = ProcessManager.create_job("delete_permanently", "ContNonDup", [off_orig_id], db=db)
+                resp_cont = actions_router._build_safe_removal_html_response(
+                    "/actions/delete-permanently",
+                    "permanent",
+                    res_off_nondup,
+                    j_cont,
+                    db,
+                    force_duplicate_verification=False,
+                )
+                html_txt = resp_cont.body.decode("utf-8")
+                self.assertIn("<strong>1</strong> plików", html_txt)
+                self.assertNotIn("duplikatów", html_txt)
+                m_vals = re.search(r'hx-vals="([^"]+)"', html_txt)
+                self.assertIsNotNone(m_vals)
+                cont_vals = json.loads(html_mod.unescape(m_vals.group(1)))
+                self.assertEqual(cont_vals["duplicates_only"], "false")
+                self.assertIn("deletion_token", cont_vals)
+
+        # Reconnect Drive B and click the exact continuation button -> must delete p_off_orig cleanly (no infinite loop!)
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+            r_exec_cont = self.client.post("/actions/delete-permanently", data=cont_vals)
+            self.assertEqual(r_exec_cont.status_code, 200)
+            self.assertFalse(p_off_orig.exists(), "Continuation token for non-duplicate Original must delete once drive is online!")
+
+        # BRAK-01: Unfiltered scope=filtered blocked on move-files, move-to-trash, gdrive-sync; unbacked_only respected!
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+            r_mv_blk = self.client.post("/actions/move-files", data={"scope": "filtered", "target_volume_id": str(vol_b_id)})
+            self.assertIn("Zablokowano przenoszenie plików", r_mv_blk.text)
+
+            r_tr_blk = self.client.post("/actions/move-to-trash", data={"scope": "filtered"})
+            self.assertIn("Zablokowano przenoszenie do Kosza", r_tr_blk.text)
+
+            r_gd_blk = self.client.post("/actions/gdrive-sync", data={"mode": "media", "scope": "filtered"})
+            self.assertIn("Zablokowano synchronizację Google Drive", r_gd_blk.text)
+
+            # Empty scope=selected MUST NOT fall back to entire database!
+            r_empty_sel = self.client.post("/actions/move-to-trash", data={"scope": "selected"})
+            self.assertIn("Brak wybranych elementów", r_empty_sel.text)
+
+            # assign-group with scope=filtered + unbacked_only=true assigns ONLY solo_unbacked.jpg, NEVER pair_orig.jpg!
+            r_ag = self.client.post(
+                "/actions/assign-group",
+                data={"group_name": "OnlyUnbackedAlb", "scope": "filtered", "unbacked_only": "true"},
+            )
+            self.assertIn("Przypisano 1 plików", r_ag.text)
+            with self.TestingSessionLocal() as db:
+                self.assertIsNotNone(db.get(MediaItem, unb_id).group_id)
+                self.assertIsNone(db.get(MediaItem, orig_2c_id).group_id)
+
+            # rotate-media with scope=filtered + unbacked_only=true rotates ONLY solo_unbacked.jpg!
+            r_rot = self.client.post(
+                "/actions/rotate-media",
+                data={"scope": "filtered", "unbacked_only": "true", "delta": "90"},
+            )
+            self.assertEqual(r_rot.status_code, 200)
+            with self.TestingSessionLocal() as db:
+                self.assertEqual(db.get(MediaItem, unb_id).rotation_angle, 90)
+                self.assertEqual(db.get(MediaItem, orig_2c_id).rotation_angle, 0)
+
+            # move-files with scope=filtered + unbacked_only=true moves ONLY solo_unbacked.jpg to Drive B/MovedUnb!
+            r_mv_unb = self.client.post(
+                "/actions/move-files",
+                data={
+                    "scope": "filtered",
+                    "unbacked_only": "true",
+                    "target_volume_id": str(vol_b_id),
+                    "target_subfolder": "MovedUnb",
+                },
+            )
+            self.assertIn("Przeniesiono fizycznie: 1 plików", r_mv_unb.text)
+            self.assertTrue(p_orig_2c.exists())
+            self.assertFalse(p_unb_only.exists())
+            self.assertTrue((self.drive_b / "MovedUnb" / "solo_unbacked.jpg").exists())
+
+        # BRAK-02 (V-13): Global storage mutex blocks concurrent mutating endpoints
+        ok_lk, _ = ProcessManager.try_acquire_storage_lock("Symulowana Operacja Testowa")
+        self.assertTrue(ok_lk)
+        try:
+            r_lk_org = self.client.post("/actions/organize-originals", data={})
+            self.assertIn("Operacja zablokowana", r_lk_org.text)
+            self.assertIn("Symulowana Operacja Testowa", r_lk_org.text)
+
+            r_lk_vac = self.client.post("/actions/vacuum-db", data={})
+            self.assertIn("Operacja zablokowana", r_lk_vac.text)
+
+            r_lk_emp = self.client.post("/actions/empty-trash", data={})
+            self.assertIn("Operacja zablokowana", r_lk_emp.text)
+
+            r_lk_scan = actions_router.execute_scan(str(self.drive_a))
+            self.assertEqual(r_lk_scan["status"], "error")
+            self.assertIn("Operacja zablokowana", r_lk_scan["message"])
+        finally:
+            ProcessManager.release_storage_lock()
+
+        # Once released, organize-originals succeeds normally
+        r_lk_free = self.client.post("/actions/organize-originals", data={})
+        self.assertEqual(r_lk_free.status_code, 200)
+        self.assertNotIn("Operacja zablokowana", r_lk_free.text)
+
+        # BRAK-04 (V-14): >999 IDs chunking across clear-quality-defect, restore-from-trash, rotate-media
+        big_id_list = [unb_id] + [f"fake-id-v14-{i:04d}" for i in range(1050)]
+        r_v14_qd = self.client.post(
+            "/actions/clear-quality-defect",
+            data={"scope": "selected", "selected_ids_json": json.dumps(big_id_list)},
+        )
+        self.assertEqual(r_v14_qd.status_code, 200)
+        r_v14_rot = self.client.post(
+            "/actions/rotate-media",
+            data={"scope": "selected", "selected_ids_json": json.dumps(big_id_list), "delta": "90"},
+        )
+        self.assertEqual(r_v14_rot.status_code, 200)
+        r_v14_res = self.client.post(
+            "/actions/restore-from-trash",
+            data={"restore_mode": "selected", "selected_ids": big_id_list},
+        )
+        self.assertEqual(r_v14_res.status_code, 200)
 
 
 if __name__ == "__main__":

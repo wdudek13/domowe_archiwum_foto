@@ -20,36 +20,49 @@ from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 logger = logging.getLogger("StorageOps")
 
 
-def is_path_in_daf_backup(path: Path) -> bool:
+def is_path_in_daf_backup(path: Path, volume_root: Optional[Path] = None) -> bool:
     """
-    Returns True if `path` resides inside a `daf_backup/` media backup folder (excluding SQLite
-    `db_backups` rotation files and uncommitted `.daf_tmp` staging files).
-    Application policy: existing files inside `daf_backup/` are strictly READ-ONLY / APPEND-ONLY
-    (new files may be added, existing files may NEVER be modified, overwritten, moved, or deleted).
+    Returns True if `path` resides inside a protected media backup folder:
+    - `daf_backup/` at any depth (unique DAF system folder), OR
+    - top-level `backup/` directly under the volume/drive root (matching scanner.py & is_item_in_daf_backup,
+      without falsely blocking unrelated user subfolders like `E:\\DCIM\\backup\\...`).
+    Excludes SQLite `db_backups` rotation files and uncommitted `.daf_tmp` / `.daf_move_tmp` staging files.
     """
-    parts = [p.lower() for p in Path(path).parts]
-    if "daf_backup" not in parts:
+    p_obj = Path(path)
+    lname = p_obj.name.lower()
+    if lname.endswith(".daf_tmp") or lname.endswith(".daf_move_tmp"):
         return False
-    if "db_backups" in parts:
+
+    rel_parts: List[str] = []
+    if volume_root is not None:
+        try:
+            rel_parts = [p.lower() for p in p_obj.resolve().relative_to(Path(volume_root).resolve()).parts]
+        except ValueError:
+            rel_parts = []
+    if not rel_parts:
+        anchor = p_obj.anchor
+        rel_parts = [p.lower() for p in p_obj.parts if p not in ("", anchor, "\\", "/")]
+
+    if "db_backups" in rel_parts:
         return False
-    if Path(path).name.lower().endswith(".daf_tmp"):
-        return False
-    return True
+    if "daf_backup" in rel_parts:
+        return True
+    return bool(rel_parts and rel_parts[0] == "backup")
 
 
 def is_item_in_daf_backup(item: MediaItem) -> bool:
-    """Returns True if a MediaItem represents a protected backup file inside `daf_backup/`."""
+    """Returns True if a MediaItem represents a protected backup file inside `daf_backup/` or top-level `backup/`."""
     if getattr(item, "is_backup_copy", False):
         return True
     rel = (getattr(item, "relative_path", "") or "").replace("\\", "/").lower()
     parts = [p for p in rel.split("/") if p]
-    return "daf_backup" in parts
+    return ("daf_backup" in parts) or (bool(parts) and parts[0] == "backup")
 
 
-def _safe_unlink(path: Path) -> None:
-    """Deletes a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks daf_backup/."""
-    if is_path_in_daf_backup(path):
-        raise PermissionError(f"Ochrona daf_backup: zabronione usuwanie istniejącego pliku w daf_backup/: {path}")
+def _safe_unlink(path: Path, volume_root: Optional[Path] = None) -> None:
+    """Deletes a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks daf_backup/ & top-level backup/."""
+    if is_path_in_daf_backup(path, volume_root=volume_root):
+        raise PermissionError(f"Ochrona daf_backup: zabronione usuwanie istniejącego pliku w katalogu backupu: {path}")
     try:
         path.unlink()
     except PermissionError:
@@ -57,12 +70,39 @@ def _safe_unlink(path: Path) -> None:
         path.unlink()
 
 
-def _safe_move(src: Path, dst: Path) -> None:
-    """Moves a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks mutating daf_backup/."""
-    if is_path_in_daf_backup(src):
-        raise PermissionError(f"Ochrona daf_backup: zabronione przenoszenie/usuwanie pliku z daf_backup/: {src}")
-    if is_path_in_daf_backup(dst) and dst.exists():
-        raise PermissionError(f"Ochrona daf_backup: zabronione nadpisywanie istniejącego pliku w daf_backup/: {dst}")
+def _safe_move(src: Path, dst: Path, src_volume_root: Optional[Path] = None, dst_volume_root: Optional[Path] = None) -> None:
+    """
+    Moves a file on disk safely (V-08):
+    - Hard-blocks mutating/deleting existing files in `daf_backup/` or top-level `backup/`.
+    - For cross-drive moves (`src.drive != dst.drive`), performs transactional copy to `.daf_move_tmp`,
+      100% SHA-256 + media verification, atomic replace to `dst`, and only then unlinks `src`.
+    """
+    if is_path_in_daf_backup(src, volume_root=src_volume_root):
+        raise PermissionError(f"Ochrona daf_backup: zabronione przenoszenie/usuwanie pliku z katalogu backupu: {src}")
+    if is_path_in_daf_backup(dst, volume_root=dst_volume_root) and dst.exists():
+        raise PermissionError(f"Ochrona daf_backup: zabronione nadpisywanie istniejącego pliku w katalogu backupu: {dst}")
+
+    src_drive = str(src.resolve().drive).lower() if src.exists() else str(src.drive).lower()
+    dst_drive = str(dst.parent.resolve().drive).lower() if dst.parent.exists() else str(dst.drive).lower()
+    if src_drive and dst_drive and src_drive != dst_drive and src.exists() and src.is_file():
+        tmp_dst = dst.with_name(f"{dst.name}.daf_move_tmp")
+        if tmp_dst.exists():
+            try:
+                tmp_dst.unlink()
+            except OSError:
+                pass
+        shutil.copy2(str(src), str(tmp_dst))
+        verified, reason, _ = FastHasher.verify_files_identical_100_percent(src, tmp_dst)
+        if not verified:
+            try:
+                tmp_dst.unlink()
+            except OSError:
+                pass
+            raise OSError(f"Weryfikacja 100% po przeniesieniu między dyskami nie powiodła się ({src} -> {dst}): {reason}")
+        tmp_dst.replace(dst)
+        _safe_unlink(src, volume_root=src_volume_root)
+        return
+
     try:
         shutil.move(str(src), str(dst))
     except PermissionError:
@@ -119,10 +159,13 @@ class StorageAutomationService:
         self,
         vol: Optional[WindowsVolume],
         connected_map: Optional[Dict[str, Tuple[str, str]]] = None,
+        strict_vsn: bool = False,
     ) -> Optional[Path]:
         """
         Verifies via live OS VSN enumeration that `vol` is truly mounted right now and resolves
         its current drive root. Prevents accidental disk operations if Windows reassigned drive letters.
+        When `strict_vsn=True` (V-12), hardware VSNs / drive roots NEVER fall back to bare drive letters
+        even if OS VSN enumeration returned empty.
         """
         if vol is None:
             return None
@@ -150,7 +193,7 @@ class StorageAutomationService:
 
         is_drive_root = bool(re.fullmatch(r"[A-Za-z]:\\?", dl))
         is_hw_vsn = bool(re.fullmatch(r"[0-9A-F]{4}-[0-9A-F]{4}", vsn))
-        if connected_map and (is_drive_root or is_hw_vsn):
+        if (connected_map or strict_vsn) and (is_drive_root or is_hw_vsn):
             vol.is_online = False
             return None
 
@@ -1531,7 +1574,7 @@ class StorageAutomationService:
                     while target_bkp_path.exists():
                         target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
                         c += 1
-                    _safe_move(curr_path, target_bkp_path)
+                    _safe_move(curr_path, target_bkp_path, src_volume_root=vol_root, dst_volume_root=vol_root)
                     self._preserve_original_path_before_move(bkp_item, bkp_vol)
                     bkp_item.file_name = target_bkp_path.name
                     bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
@@ -1595,9 +1638,9 @@ class StorageAutomationService:
                 if not verified:
                     verification_blocks += 1
                     continue
-                if ((not strict_target_writes_only) or (src_vol.id in allowed_write_vols)) and not is_path_in_daf_backup(src_path):
+                if ((not strict_target_writes_only) or (src_vol.id in allowed_write_vols)) and not is_path_in_daf_backup(src_path, volume_root=src_root_v):
                     try:
-                        _safe_unlink(src_path)
+                        _safe_unlink(src_path, volume_root=src_root_v)
                     except OSError as exc:
                         logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
                 self._preserve_original_path_before_move(bkp_item, src_vol)
@@ -1943,8 +1986,8 @@ class StorageAutomationService:
             self.flag_duplicate_clusters()
 
         target_items: List[MediaItem] = []
-        for idx in range(0, len(item_ids), 5000):
-            chunk_ids = item_ids[idx : idx + 5000]
+        for idx in range(0, len(item_ids), 900):
+            chunk_ids = item_ids[idx : idx + 900]
             target_items.extend(
                 self.db.scalars(
                     select(MediaItem).where(MediaItem.id.in_(chunk_ids), MediaItem.is_trashed == False)
@@ -1994,8 +2037,8 @@ class StorageAutomationService:
         volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
         touched_hashes = list({it.file_hash for it in target_items})
         cluster_members: List[MediaItem] = []
-        for idx in range(0, len(touched_hashes), 5000):
-            h_chunk = touched_hashes[idx : idx + 5000]
+        for idx in range(0, len(touched_hashes), 900):
+            h_chunk = touched_hashes[idx : idx + 900]
             cluster_members.extend(
                 self.db.scalars(
                     select(MediaItem)
@@ -2077,25 +2120,40 @@ class StorageAutomationService:
                     else:
                         if delete_mode == "trash":
                             it.is_trashed = True
+                            self.db.commit()
+                            removed_ids.add(it.id)
+                            processed_count += 1
                         else:
-                            self.db.delete(it)
-                        self.db.commit()
-                        removed_ids.add(it.id)
-                        processed_count += 1
+                            # V-03 protection: NEVER delete DB records for an OFFLINE drive during permanent deletion!
+                            _mark_offline(it, vid)
                     _report_step(drive_label, f"[{step_idx}/{total_candidates}] {drive_label} (offline): {it.file_name}")
                 continue
 
             drive_processed_cnt = 0
+            consecutive_io_errors = 0
             for cand in vol_items:
                 if job_id and ProcessManager.is_stop_requested(job_id):
                     stopped_by_user = True
+                    break
+                if consecutive_io_errors >= 5:
+                    stopped_by_user = True
+                    OperationLogger.log(
+                        "DUP_IO_CIRCUIT_BREAKER",
+                        f"Wyłącznik awaryjny I/O na dysku {drive_label}: przerwano po 5 kolejnych błędach zapisu/usuwania.",
+                        status="WARN",
+                        db=self.db,
+                        commit=True,
+                    )
                     break
 
                 step_idx += 1
                 _report_step(drive_label, f"[{step_idx}/{total_candidates}] Weryfikacja 100%: {cand.file_name} ({drive_label})")
 
                 cluster = by_hash.get(cand.file_hash, [])
-                needs_dup_check = force_duplicate_verification or (cand.duplicate_role == "duplicate")
+                # BRAK-03 / V-02: Protect backup_green & backup_orange identically on ONLINE and OFFLINE drives!
+                needs_dup_check = force_duplicate_verification or (
+                    cand.duplicate_role in ("duplicate", "backup_green", "backup_orange")
+                )
 
                 if needs_dup_check:
                     surviving = [
@@ -2118,8 +2176,16 @@ class StorageAutomationService:
 
                     cand_path = vol_root / cand.relative_path
                     if not cand_path.exists():
-                        if vol_root.exists():
-                            # Duplicate file was already physically deleted before previous session -> reconcile DB record
+                        # V-05 protection: NEVER reconcile/delete DB record unless a surviving copy is physically verified online!
+                        verified_surviving_online = False
+                        for rc in [orig, bkp] + [x for x in surviving if x.id not in (orig.id, bkp.id)]:
+                            rv_root = verified_roots.get(rc.volume_id)
+                            if rv_root is not None:
+                                rp = rv_root / rc.relative_path
+                                if rp.exists() and rp.is_file() and rp.stat().st_size == rc.file_size_bytes:
+                                    verified_surviving_online = True
+                                    break
+                        if vol_root.exists() and verified_surviving_online:
                             if delete_mode == "trash":
                                 cand.is_trashed = True
                             else:
@@ -2129,6 +2195,8 @@ class StorageAutomationService:
                             removed_ids.add(cand.id)
                             processed_count += 1
                             drive_processed_cnt += 1
+                        else:
+                            blocked_verify += 1
                         missing_on_disk += 1
                         continue
 
@@ -2156,11 +2224,11 @@ class StorageAutomationService:
                     if ref_item is not None and ref_path is not None:
                         is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, cand_path)
                     else:
+                        # V-07 protection: NEVER delete videos offline using partial_3x64k — require full verified_sha256!
                         can_verify_from_meta = (
                             orig.file_size_bytes == bkp.file_size_bytes == cand.file_size_bytes
                             and (
-                                cand.media_type == "image"
-                                or orig.hash_algorithm == "partial_3x64k"
+                                (cand.media_type == "image" and orig.hash_algorithm in ("sha256", "sha256_verified"))
                                 or bool(orig.verified_sha256 or bkp.verified_sha256)
                             )
                         )
@@ -2200,7 +2268,7 @@ class StorageAutomationService:
                     if full_sha:
                         orig.verified_sha256 = full_sha
 
-                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(cand_path):
+                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(cand_path, volume_root=vol_root):
                         blocked_safety += 1
                         continue
                     if delete_mode == "trash":
@@ -2208,8 +2276,10 @@ class StorageAutomationService:
                         cand.is_trashed = True
                     else:
                         try:
-                            _safe_unlink(cand_path)
+                            _safe_unlink(cand_path, volume_root=vol_root)
+                            consecutive_io_errors = 0
                         except OSError as exc:
+                            consecutive_io_errors += 1
                             blocked_verify += 1
                             OperationLogger.log(
                                 "DUP_DELETE_LOCKED",
@@ -2240,7 +2310,7 @@ class StorageAutomationService:
                 else:
                     # Standard non-duplicate removal
                     src_p = vol_root / cand.relative_path
-                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(src_p):
+                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(src_p, volume_root=vol_root):
                         blocked_safety += 1
                         continue
                     if delete_mode == "trash":
@@ -2249,7 +2319,7 @@ class StorageAutomationService:
                     else:
                         if src_p.exists():
                             try:
-                                _safe_unlink(src_p)
+                                _safe_unlink(src_p, volume_root=vol_root)
                                 physical_count += 1
                             except OSError as exc:
                                 logger.debug("Permanent delete unlink warning: %s", exc)
@@ -2574,9 +2644,9 @@ class StorageAutomationService:
                 verification_blocks += 1
                 continue
 
-            if not is_path_in_daf_backup(src_path):
+            if not is_path_in_daf_backup(src_path, volume_root=src_root):
                 try:
-                    _safe_unlink(src_path)
+                    _safe_unlink(src_path, volume_root=src_root)
                 except OSError as exc:
                     logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
 
@@ -2648,6 +2718,11 @@ class StorageAutomationService:
                 continue
 
             src_file = src_root / it.relative_path
+            if src_vol and target_vol and src_vol.id != target_vol.id:
+                has_space, _ = self.check_volume_free_space(str(dst_root), int(it.file_size_bytes or 0))
+                if not has_space:
+                    skipped_offline += 1
+                    continue
             dst_dir = (dst_root / clean_sub) if clean_sub else dst_root
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst_file = dst_dir / it.file_name
@@ -2657,7 +2732,7 @@ class StorageAutomationService:
                 while dst_file.exists():
                     dst_file = dst_dir / f"{src_file.stem}_{c}{src_file.suffix}"
                     c += 1
-                _safe_move(src_file, dst_file)
+                _safe_move(src_file, dst_file, src_volume_root=src_root, dst_volume_root=dst_root)
 
             self._preserve_original_path_before_move(it, src_vol)
             it.volume_id = target_vol.id
@@ -2960,8 +3035,8 @@ class StorageAutomationService:
         self.backup_mgr.create_backup("pre_missing_cleanup")
 
         targets: List[MediaItem] = []
-        for idx in range(0, len(item_ids), 2000):
-            chunk = item_ids[idx : idx + 2000]
+        for idx in range(0, len(item_ids), 900):
+            chunk = item_ids[idx : idx + 900]
             stmt = select(MediaItem).where(MediaItem.id.in_(chunk), MediaItem.is_trashed == False)
             if volume_id is not None:
                 stmt = stmt.where(MediaItem.volume_id == volume_id)
@@ -3093,7 +3168,7 @@ class StorageAutomationService:
                     dst_path = dst_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
                 try:
-                    _safe_move(src_path, dst_path)
+                    _safe_move(src_path, dst_path, src_volume_root=root, dst_volume_root=root)
                 except OSError as exc:
                     logger.debug("Organize original move error for %s: %s", src_path, exc)
                     errors += 1

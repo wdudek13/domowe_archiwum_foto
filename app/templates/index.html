@@ -110,8 +110,8 @@
         <div class="flex flex-wrap items-center gap-2.5">
             <span class="text-[10px] uppercase tracking-wider font-semibold text-slate-500">Zakres akcji</span>
             <select id="bulk-scope-select" name="scope" class="bg-slate-950/60 border border-indigo-500/50 text-indigo-200 font-semibold rounded-lg px-2.5 py-1">
+                <option value="selected" selected>Tylko zaznaczone kafelki</option>
                 <option value="filtered">Cały aktualny filtr / zbiór</option>
-                <option value="selected">Tylko zaznaczone kafelki</option>
             </select>
             <span class="inline-flex items-center gap-1.5 bg-indigo-950/50 border border-indigo-800/60 rounded-full px-2.5 py-0.5 text-slate-300">Zaznaczono: <strong id="selected-counter" class="text-white font-mono">0</strong></span>
             <button type="button" onclick="selectAllVisible(true)" class="text-indigo-300 hover:text-white hover:underline">Zaznacz stronę</button>

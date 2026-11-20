@@ -18,7 +18,7 @@ class BackupManager:
         self,
         db_path: Optional[Path] = None,
         backup_dir: Optional[Path] = None,
-        max_retained_backups: int = 5,
+        max_retained_backups: int = 20,
         max_retained: Optional[int] = None,
     ):
         self.db_path = Path(db_path if db_path is not None else db_module.DB_PATH)
@@ -254,12 +254,26 @@ class BackupManager:
             key=os.path.getmtime,
             reverse=True,
         )
-        if len(backups) > self.max_retained_backups:
-            for old_backup in backups[self.max_retained_backups:]:
-                try:
-                    old_backup.unlink()
-                except OSError as exc:
-                    logger.debug("Could not remove rotated backup %s: %s", old_backup, exc)
+        if len(backups) <= self.max_retained_backups:
+            return
+        try:
+            raw_sz = backups[0].stat().st_size
+            newest_size = raw_sz if isinstance(raw_sz, int) else 0
+        except OSError:
+            newest_size = 0
+        for old_backup in backups[self.max_retained_backups:]:
+            try:
+                # V-09 protection: never automatically rotate out a snapshot that is >20% larger
+                # than the newest DB backup (protects pre-incident rescue snapshots).
+                old_sz = old_backup.stat().st_size
+                if newest_size > 0 and isinstance(old_sz, int) and old_sz > int(newest_size * 1.20):
+                    logger.warning(
+                        "Preserving oversized rescue backup snapshot from rotation: %s", old_backup.name
+                    )
+                    continue
+                old_backup.unlink()
+            except OSError as exc:
+                logger.debug("Could not remove rotated backup %s: %s", old_backup, exc)
 
     @staticmethod
     def list_backups_in_dir(directory: Path) -> List[Dict[str, Any]]:

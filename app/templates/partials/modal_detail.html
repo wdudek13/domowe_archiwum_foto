@@ -229,14 +229,18 @@
                                 <span class="text-amber-300 font-semibold">{{ dup.volume.volume_label }}</span>
                                 <span class="font-mono text-slate-300">({{ dup.relative_path }})</span>
                             </div>
+                            {% if dup.duplicate_role == 'duplicate' and not dup.is_backup_copy %}
                             <button type="button"
                                     hx-post="/actions/move-to-trash"
-                                    hx-vals='{"scope": "selected", "selected_ids": "{{ dup.id }}"}'
+                                    hx-vals='{"scope": "selected", "selected_ids": "{{ dup.id }}", "duplicates_only": "true"}'
                                     hx-target="#global-notification"
                                     onclick="this.closest('div.flex').remove();"
                                     class="bg-rose-800 hover:bg-rose-600 text-white px-2 py-0.5 rounded flex-shrink-0">
-                                🗑️ Usuń tę kopię
+                                🗑️ Usuń ten duplikat
                             </button>
+                            {% else %}
+                            <span class="text-[9px] text-emerald-400/90 font-semibold px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/50 flex-shrink-0">🛡️ Chroniony</span>
+                            {% endif %}
                         </div>
                         {% endfor %}
                     </div>
