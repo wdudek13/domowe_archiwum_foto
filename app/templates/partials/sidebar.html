@@ -1,14 +1,25 @@
 {% macro render_group_nodes(nodes) %}
     {% for node in nodes %}
-    <div class="pl-{{ node.depth * 3 }} py-0.5" data-album-node data-album-name="{{ node.group.name|lower }}">
-        <div class="flex items-center justify-between px-2 py-1 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
-            <button type="button"
-                    onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
-                    class="truncate flex items-center space-x-1.5 flex-1 text-left">
-                <span class="text-amber-400">📁</span>
-                <span class="truncate">{{ node.group.name }}</span>
-            </button>
-            <div class="flex items-center space-x-1">
+    <div class="{% if node.depth > 0 %}pl-3 border-l border-borderBg/50 ml-1.5{% endif %} py-0.5" data-album-node data-album-depth="{{ node.depth }}" data-album-name="{{ node.group.name|lower }}">
+        <div class="flex items-center justify-between px-1.5 py-1 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
+            <div class="flex items-center space-x-1 flex-1 min-w-0">
+                {% if node.children %}
+                <button type="button"
+                        data-album-toggle
+                        title="Rozwiń / zwiń podalbumy"
+                        onclick="window.toggleAlbumBranch(this)"
+                        class="w-4 h-4 flex items-center justify-center text-[10px] text-slate-400 hover:text-indigo-300 font-mono flex-shrink-0">▸</button>
+                {% else %}
+                <span class="w-4 h-4 inline-block flex-shrink-0"></span>
+                {% endif %}
+                <button type="button"
+                        onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
+                        class="truncate flex items-center space-x-1.5 flex-1 min-w-0 text-left">
+                    <span class="text-amber-400 flex-shrink-0">📁</span>
+                    <span class="truncate">{{ node.group.name }}</span>
+                </button>
+            </div>
+            <div class="flex items-center space-x-1 flex-shrink-0">
                 <button type="button"
                         title="Zmień nazwę albumu"
                         onclick="const n = prompt('Podaj nową nazwę dla albumu {{ node.group.name }}:', '{{ node.group.name }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/group-manage', {values: {action: 'rename', target_group_id: '{{ node.group.id }}', new_name: n.trim()}, target: '#global-notification'});"
@@ -17,7 +28,9 @@
             </div>
         </div>
         {% if node.children %}
+        <div data-album-children class="hidden">
             {{ render_group_nodes(node.children) }}
+        </div>
         {% endif %}
     </div>
     {% endfor %}
@@ -209,25 +222,48 @@
             </div>
         </div>
         <script>
+            window.toggleAlbumBranch = function(btn) {
+                const node = btn && btn.closest ? btn.closest('[data-album-node]') : null;
+                if (!node) return;
+                const ch = node.querySelector(':scope > [data-album-children]');
+                if (!ch) return;
+                const willShow = ch.classList.contains('hidden');
+                ch.classList.toggle('hidden', !willShow);
+                ch.dataset.userOpen = willShow ? '1' : '0';
+                btn.textContent = willShow ? '▾' : '▸';
+            };
             window.filterAlbumTree = function(rawQ) {
                 const list = document.getElementById('album-tree-list');
                 if (!list) return;
                 const q = (rawQ || '').trim().toLowerCase();
                 const nodes = Array.from(list.querySelectorAll('[data-album-node]'));
+                const branches = Array.from(list.querySelectorAll('[data-album-children]'));
                 if (!q) {
                     nodes.forEach(n => n.classList.remove('hidden'));
+                    branches.forEach(ch => {
+                        const open = ch.dataset.userOpen === '1';
+                        ch.classList.toggle('hidden', !open);
+                        const btn = ch.parentElement ? ch.parentElement.querySelector(':scope > div [data-album-toggle]') : null;
+                        if (btn) btn.textContent = open ? '▾' : '▸';
+                    });
                     return;
                 }
-                // First hide all, then reveal matching nodes plus their ancestors & descendants
+                // First hide all nodes & branches, then reveal matching nodes plus their ancestors & descendants
                 nodes.forEach(n => n.classList.add('hidden'));
+                branches.forEach(ch => ch.classList.add('hidden'));
                 nodes.forEach(n => {
                     const name = (n.getAttribute('data-album-name') || '').toLowerCase();
                     if (name.includes(q)) {
                         n.classList.remove('hidden');
                         n.querySelectorAll('[data-album-node]').forEach(ch => ch.classList.remove('hidden'));
+                        n.querySelectorAll('[data-album-children]').forEach(ch => ch.classList.remove('hidden'));
                         let p = n.parentElement ? n.parentElement.closest('[data-album-node]') : null;
                         while (p) {
                             p.classList.remove('hidden');
+                            const pCh = p.querySelector(':scope > [data-album-children]');
+                            if (pCh) pCh.classList.remove('hidden');
+                            const btn = p.querySelector(':scope > div [data-album-toggle]');
+                            if (btn) btn.textContent = '▾';
                             p = p.parentElement ? p.parentElement.closest('[data-album-node]') : null;
                         }
                     }
@@ -235,6 +271,57 @@
             };
         </script>
     </div>
+
+    {% if (named_persons is defined and named_persons) or (face_slot_counts is defined and face_slot_counts.all > 0) %}
+    <div>
+        <button type="button"
+                onclick="const b=this.nextElementSibling, c=this.querySelector('[data-chev]'); b.classList.toggle('hidden'); if(c) c.textContent=b.classList.contains('hidden')?'▸':'▾';"
+                class="daf-section-toggle mb-1">
+            <span>👤 Osoby i Twarze</span>
+            <span data-chev class="text-slate-500 font-mono">▾</span>
+        </button>
+        <div class="space-y-2">
+            {% if named_persons is defined and named_persons %}
+            <div class="flex flex-wrap gap-1 max-h-40 overflow-y-auto">
+                {% for p_name, p_cnt in named_persons %}
+                <button type="button"
+                        onclick='applySidebarFilter({_reset: true, tag: {{ ("osoba:" ~ p_name)|tojson }}})'
+                        class="px-2 py-0.5 rounded-full bg-emerald-950/80 hover:bg-emerald-800 border border-emerald-700/70 text-[10px] text-emerald-200 font-medium transition">
+                    👤 {{ p_name }} <span class="text-emerald-400 font-mono">({{ p_cnt }})</span>
+                </button>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if face_slot_counts is defined and face_slot_counts.all > 0 %}
+            <div class="pt-1 border-t border-borderBg/50 space-y-1">
+                <div class="text-[9px] uppercase tracking-wider text-slate-500 px-0.5" title="Filtruje zdjęcia wg liczby wykrytych twarzy (nie są to konkretne osoby)">Filtr wg liczby wykrytych twarzy:</div>
+                <div class="flex flex-wrap gap-1">
+                    <button type="button"
+                            onclick="applySidebarFilter({_reset: true, tag: 'twarz:all'})"
+                            class="px-2 py-0.5 rounded-full bg-purple-950/70 hover:bg-purple-800 border border-purple-700/60 text-[10px] text-purple-200 transition">
+                        👥 Z twarzami <span class="text-purple-400 font-mono">({{ face_slot_counts.all }})</span>
+                    </button>
+                    {% if face_slot_counts.unnamed > 0 %}
+                    <button type="button"
+                            onclick="applySidebarFilter({_reset: true, tag: 'twarz:nienazwane'})"
+                            class="px-2 py-0.5 rounded-full bg-slate-900 hover:bg-purple-950 border border-purple-800/50 text-[10px] text-slate-300 transition">
+                        ❓ Nienazwane <span class="text-purple-400 font-mono">({{ face_slot_counts.unnamed }})</span>
+                    </button>
+                    {% endif %}
+                    {% for slot_key, slot_lbl, slot_cnt in face_slot_counts.slots %}
+                    <button type="button"
+                            onclick="applySidebarFilter({_reset: true, tag: '{{ slot_key }}'})"
+                            title="Wszystkie zdjęcia, na których wykryto co najmniej tyle twarzy"
+                            class="px-2 py-0.5 rounded-full bg-slate-900 hover:bg-purple-950 border border-purple-700/50 text-[10px] text-purple-200 transition">
+                        👤 {% if slot_key == 'twarz:1' %}1+ osoba ({{ slot_lbl }}){% elif slot_key == 'twarz:2' %}2+ osoby ({{ slot_lbl }}){% elif slot_key == 'twarz:3' %}3+ osoby ({{ slot_lbl }}){% else %}4+ osoby (Grupowe){% endif %} <span class="text-purple-400 font-mono">({{ slot_cnt }})</span>
+                    </button>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
 
     <div>
         <button type="button"

@@ -1,7 +1,26 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="space-y-4">
-    <div class="daf-sticky-toolbar bg-cardBg border border-borderBg p-3 rounded-xl shadow-card flex flex-wrap gap-3 items-center justify-between">
+<div class="flex flex-col flex-1 min-h-0 gap-2.5">
+    <!-- Zwijalny panel filtrów, skanera i operacji masowych (zawsze dostępny nad niezależnie przewijaną siatką) -->
+    <div id="top-controls-wrapper" class="flex-shrink-0 space-y-2">
+        <div id="top-controls-bar" class="bg-cardBg/95 border border-borderBg px-3 py-1.5 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs">
+            <button type="button"
+                    onclick="window.toggleTopControlsPanel()"
+                    class="inline-flex items-center gap-1.5 text-indigo-300 hover:text-white font-semibold transition">
+                <span id="top-controls-toggle-chev" class="font-mono text-slate-400">▾</span>
+                <span id="top-controls-toggle-label">Zwiń panel filtrów, skanera i akcji</span>
+            </button>
+            <div class="flex flex-wrap items-center gap-2 text-[11px]">
+                <span id="active-summary-compact" class="inline-flex items-center gap-1 bg-slate-950/70 border border-emerald-800/50 rounded-full px-2.5 py-0.5 text-slate-300">Zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong></span>
+                <span class="inline-flex items-center gap-1.5 bg-indigo-950/60 border border-indigo-800/60 rounded-full px-2.5 py-0.5 text-slate-300">Zaznaczono: <strong id="selected-counter-compact" class="text-white font-mono">0</strong></span>
+                <button type="button" onclick="selectAllVisible(true)" class="text-indigo-300 hover:text-white hover:underline">Zaznacz stronę</button>
+                <span class="text-slate-600">·</span>
+                <button type="button" onclick="selectAllVisible(false)" class="text-slate-400 hover:text-white hover:underline">Odznacz</button>
+            </div>
+        </div>
+
+        <div id="top-controls-panel" class="space-y-2.5">
+            <div class="bg-cardBg border border-borderBg p-3 rounded-xl shadow-card flex flex-wrap gap-3 items-center justify-between">
         <form hx-post="/actions/scan" hx-target="#global-notification" class="flex flex-wrap items-center gap-2 text-xs bg-slate-950/40 border border-borderBg/70 rounded-xl px-2 py-1.5">
             <span class="text-[10px] uppercase tracking-wider font-semibold text-slate-500 pl-1">Skaner</span>
             <input type="text" name="path" placeholder="Ścieżka dysku/folderu, np. E:\ lub D:\Zdjecia" required
@@ -198,9 +217,17 @@
             </button>
         </div>
     </div>
+            <div id="active-summary-slot">
+                {% include "partials/media_grid_summary.html" %}
+            </div>
+        </div>
+    </div>
 
-    <div id="media-grid" hx-get="/media/search" hx-trigger="refresh-all from:body" hx-include="#filter-form">
-        {% include "partials/media_grid.html" %}
+    <div id="media-grid-scroll" class="flex-1 min-h-0 overflow-y-auto pr-1">
+        <div id="media-grid" hx-get="/media/search" hx-trigger="refresh-all from:body" hx-include="#filter-form">
+            {% set _render_summary_inline = false %}
+            {% include "partials/media_grid.html" %}
+        </div>
     </div>
 </div>
 

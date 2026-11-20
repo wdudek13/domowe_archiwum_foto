@@ -4656,7 +4656,7 @@ async def preview_delete_permanently(
         f"<input type='checkbox' name='allow_originals' value='true' required class='rounded bg-slate-900 border-rose-500 text-rose-600'>"
         f"<span>Zezwól na trwałe usunięcie <strong>{orig_cnt}</strong> Oryginałów</span>"
         f"</label>"
-        f"<input type='text' name='confirm_originals_text' required pattern='USUŃ|USUN' placeholder='Wpisz: USUŃ' "
+        f"<input type='text' name='confirm_originals_text' required pattern='[Uu][Ss][Uu][ŃńNn]' placeholder='Wpisz: USUŃ' "
         f"class='bg-slate-950 border border-rose-600 rounded px-2 py-1 text-xs text-white w-28 font-mono'>"
         f"</div>"
         if orig_cnt > 0 else ""
@@ -4665,7 +4665,9 @@ async def preview_delete_permanently(
     can_confirm = bool(eligible_ids or grp_obj)
     confirm_btn = (
         f"<form hx-post='/actions/delete-permanently' hx-target='#global-notification' "
-        f"onsubmit=\"this.closest('.fixed').remove()\" class='flex flex-wrap items-center justify-end gap-2'>"
+        f"hx-on::before-request=\"const ov=this.closest('.fixed'); if(ov) ov.classList.add('hidden');\" "
+        f"hx-on::after-request=\"const ov=this.closest('.fixed'); if(ov) ov.remove();\" "
+        f"class='flex flex-wrap items-center justify-end gap-2'>"
         f"<input type='hidden' name='scope' value='selected'>"
         f"<input type='hidden' name='deletion_token' value='{del_token}'>"
         f"<input type='hidden' name='confirmed_count' value='{len(eligible_ids)}'>"
@@ -5185,9 +5187,11 @@ async def add_manual_tags_action(
     tags_disp = ", ".join(parsed_tags)
     msg = f"Dodano ręczne tagi ({tags_disp}) do {len(item_ids)} zdjęć (nowych wpisów: {added_cnt})."
     OperationLogger.log("MANUAL_TAG_ADD", msg, status="OK", db=db)
+    keep_view = (_form_str(form, "keep_view") or "").strip().lower() in ("1", "true", "yes")
+    trig = "refresh-sidebar" if keep_view else "refresh-all"
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>🏷️ {html_mod.escape(msg)}</span>",
-        headers={"HX-Trigger": "refresh-all"},
+        headers={"HX-Trigger": trig},
     )
 
 
@@ -5205,13 +5209,19 @@ async def remove_tag_action(
     tag_name = (_form_str(form, "tag") or "").strip()
 
     removed = 0
+    removed_tag_names: List[Tuple[str, str]] = []
     if tag_id is not None:
+        q_row = select(MediaTag.media_id, MediaTag.tag).where(MediaTag.id == tag_id)
+        if media_id:
+            q_row = q_row.where(MediaTag.media_id == media_id)
+        removed_tag_names = [(str(r[0]), str(r[1])) for r in db.execute(q_row).all()]
         stmt = delete(MediaTag).where(MediaTag.id == tag_id)
         if media_id:
             stmt = stmt.where(MediaTag.media_id == media_id)
         res = db.execute(stmt)
         removed = int(res.rowcount or 0)
     elif media_id and tag_name:
+        removed_tag_names = [(media_id, tag_name)]
         res = db.execute(
             delete(MediaTag).where(MediaTag.media_id == media_id, MediaTag.tag == tag_name)
         )
@@ -5219,8 +5229,19 @@ async def remove_tag_action(
     else:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Wskaż tag do usunięcia.</span>")
 
+    # Sync MediaFace.person_name if a removed tag was an `osoba:<Name>` tag
+    for r_mid, r_tag in removed_tag_names:
+        if r_tag.startswith("osoba:"):
+            p_nm = r_tag[6:].strip()
+            if p_nm:
+                db.execute(
+                    update(MediaFace)
+                    .where(MediaFace.media_id == r_mid, MediaFace.person_name == p_nm)
+                    .values(person_name=None)
+                )
+
     db.commit()
-    lbl = tag_name or f"#{tag_id}"
+    lbl = tag_name or (removed_tag_names[0][1] if removed_tag_names else f"#{tag_id}")
     msg = f"Usunięto tag „{lbl}” ({removed} szt.)."
     OperationLogger.log("MANUAL_TAG_REMOVE", msg, status="OK", db=db)
     return HTMLResponse(
@@ -5235,15 +5256,34 @@ async def name_person_action(
     db: Session = Depends(get_db),
 ):
     """
-    Task 4: Assigns a human name (`person_name`) to faces on selected or matched photos
-    and adds the searchable `osoba:<name>` tag (`source_model='face_cluster'`).
+    Task 4 & UX #5: Changes, adds, or clears comma-separated person tags (`osoba:<name>`,
+    `source_model='face_cluster'`) and `MediaFace.person_name` on selected or matched photos.
+    - `person_action="replace"` (default): replaces person assignments with comma-separated names (e.g. "Ania, Ala")
+      so the photo appears separately under EACH person on the left sidebar! Empty input clears persons.
+    - `person_action="add"`: appends comma-separated person tags without removing existing ones.
+    - `person_action="clear"`: removes all `osoba:*` tags and clears `MediaFace.person_name` on selected photos.
     """
     import html as html_mod
 
     form = await _read_large_form(request)
-    person_name = (_form_str(form, "person_name") or "").strip()[:120]
-    if not person_name:
-        return HTMLResponse("<span class='text-amber-400 text-xs'>Podaj imię lub nazwę osoby (np. Babcia Zosia, Marek).</span>")
+    raw_names = (_form_str(form, "person_name") or "").strip()
+    person_action = (_form_str(form, "person_action") or "replace").strip().lower()
+    if person_action not in ("replace", "add", "clear"):
+        person_action = "replace"
+
+    parsed_names: List[str] = []
+    seen_norm = set()
+    for part in raw_names.replace(";", ",").split(","):
+        cleaned = part.strip()[:56]
+        if cleaned.lower().startswith("osoba:"):
+            cleaned = cleaned[6:].strip()
+        norm = normalize_pl(cleaned)
+        if cleaned and norm not in seen_norm:
+            parsed_names.append(cleaned)
+            seen_norm.add(norm)
+
+    if person_action == "add" and not parsed_names:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Podaj imię lub kilka imion po przecinku (np. Ania, Ala).</span>")
 
     selected_ids = _merge_selected_ids(
         [str(x) for x in form.getlist("selected_ids")],
@@ -5258,61 +5298,172 @@ async def name_person_action(
             selected_ids = _merge_selected_ids([], default_json)
 
     if not selected_ids:
-        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do przypisania osoby.</span>")
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do zmiany przypisanych osób.</span>")
 
     target_media_id = (_form_str(form, "target_media_id") or "").strip()
     face_index_val = to_int(_form_str(form, "face_index"))
+    is_clear = person_action == "clear" or (person_action == "replace" and not parsed_names)
+    primary_name = parsed_names[0] if parsed_names else None
 
-    tag_label = f"osoba:{person_name}"[:64]
-    tag_norm = normalize_pl(tag_label)
-
-    existing_tags_by_mid: Dict[str, set] = {}
     for ch_start in range(0, len(selected_ids), 900):
         ch = selected_ids[ch_start : ch_start + 900]
-        if face_index_val is not None:
-            if target_media_id:
-                if target_media_id in ch:
+
+        if is_clear:
+            if face_index_val is not None:
+                if target_media_id and target_media_id in ch:
+                    old_nm = db.scalar(
+                        select(MediaFace.person_name).where(
+                            MediaFace.media_id == target_media_id,
+                            MediaFace.face_index == face_index_val,
+                        )
+                    )
                     db.execute(
                         update(MediaFace)
                         .where(MediaFace.media_id == target_media_id, MediaFace.face_index == face_index_val)
-                        .values(person_name=person_name)
+                        .values(person_name=None)
                     )
-                other_mids = [m for m in ch if m != target_media_id]
-                if other_mids:
+                    if old_nm:
+                        db.execute(
+                            delete(MediaTag).where(
+                                MediaTag.media_id == target_media_id,
+                                MediaTag.tag == f"osoba:{old_nm}"[:64],
+                            )
+                        )
+                other_mids = [m for m in ch if m != target_media_id] if target_media_id else ch
+                if other_mids and not target_media_id:
                     db.execute(
                         update(MediaFace)
+                        .where(MediaFace.media_id.in_(other_mids), MediaFace.face_index == face_index_val)
+                        .values(person_name=None)
+                    )
+                elif other_mids:
+                    db.execute(update(MediaFace).where(MediaFace.media_id.in_(other_mids)).values(person_name=None))
+                    db.execute(delete(MediaTag).where(MediaTag.media_id.in_(other_mids), MediaTag.tag.like("osoba:%")))
+            else:
+                db.execute(update(MediaFace).where(MediaFace.media_id.in_(ch)).values(person_name=None))
+                db.execute(delete(MediaTag).where(MediaTag.media_id.in_(ch), MediaTag.tag.like("osoba:%")))
+            continue
+
+        # Replace or Add non-empty parsed_names
+        if person_action == "replace":
+            # For group-photo single-face targeting, preserve other faces on `target_media_id`!
+            if face_index_val is not None and target_media_id and target_media_id in ch:
+                old_nm = db.scalar(
+                    select(MediaFace.person_name).where(
+                        MediaFace.media_id == target_media_id,
+                        MediaFace.face_index == face_index_val,
+                    )
+                )
+                db.execute(
+                    update(MediaFace)
+                    .where(MediaFace.media_id == target_media_id, MediaFace.face_index == face_index_val)
+                    .values(person_name=primary_name)
+                )
+                if old_nm and normalize_pl(old_nm) not in seen_norm:
+                    still_other = db.scalar(
+                        select(MediaFace.id).where(
+                            MediaFace.media_id == target_media_id,
+                            MediaFace.face_index != face_index_val,
+                            MediaFace.person_name == old_nm,
+                        ).limit(1)
+                    )
+                    if still_other is None:
+                        db.execute(
+                            delete(MediaTag).where(
+                                MediaTag.media_id == target_media_id,
+                                MediaTag.tag == f"osoba:{old_nm}"[:64],
+                            )
+                        )
+                other_mids = [m for m in ch if m != target_media_id]
+            elif face_index_val is not None:
+                db.execute(
+                    update(MediaFace)
+                    .where(MediaFace.media_id.in_(ch), MediaFace.face_index == face_index_val)
+                    .values(person_name=primary_name)
+                )
+                other_mids = []
+            else:
+                other_mids = ch
+
+            if other_mids:
+                db.execute(delete(MediaTag).where(MediaTag.media_id.in_(other_mids), MediaTag.tag.like("osoba:%")))
+                # Map multiple names onto faces 0, 1, 2... if multiple faces exist, else primary name
+                face_rows = list(
+                    db.scalars(
+                        select(MediaFace)
                         .where(MediaFace.media_id.in_(other_mids))
-                        .values(person_name=person_name)
+                        .order_by(MediaFace.media_id.asc(), MediaFace.face_index.asc())
+                    ).all()
+                )
+                faces_by_mid: Dict[str, List[MediaFace]] = defaultdict(list)
+                for fr in face_rows:
+                    faces_by_mid[str(fr.media_id)].append(fr)
+                for mid_k, flist in faces_by_mid.items():
+                    for idx_pos, fr in enumerate(flist):
+                        if idx_pos < len(parsed_names):
+                            fr.person_name = parsed_names[idx_pos]
+                        elif len(parsed_names) == 1:
+                            fr.person_name = parsed_names[0]
+                        else:
+                            fr.person_name = None
+        else:
+            # person_action == "add": fill only unnamed faces (or targeted face_index), preserve existing osoba:* tags
+            if face_index_val is not None:
+                if target_media_id and target_media_id in ch:
+                    db.execute(
+                        update(MediaFace)
+                        .where(MediaFace.media_id == target_media_id, MediaFace.face_index == face_index_val)
+                        .values(person_name=primary_name)
+                    )
+                    other_mids = [m for m in ch if m != target_media_id]
+                    if other_mids:
+                        db.execute(
+                            update(MediaFace)
+                            .where(MediaFace.media_id.in_(other_mids), MediaFace.person_name.is_(None))
+                            .values(person_name=primary_name)
+                        )
+                else:
+                    db.execute(
+                        update(MediaFace)
+                        .where(MediaFace.media_id.in_(ch), MediaFace.face_index == face_index_val)
+                        .values(person_name=primary_name)
                     )
             else:
                 db.execute(
                     update(MediaFace)
-                    .where(MediaFace.media_id.in_(ch), MediaFace.face_index == face_index_val)
-                    .values(person_name=person_name)
+                    .where(MediaFace.media_id.in_(ch), MediaFace.person_name.is_(None))
+                    .values(person_name=primary_name)
                 )
-        else:
-            db.execute(
-                update(MediaFace)
-                .where(MediaFace.media_id.in_(ch))
-                .values(person_name=person_name)
-            )
+
+        # Ensure every name in parsed_names has a separate `osoba:<Name>` tag on each photo in chunk
+        existing_tags_by_mid: Dict[str, set] = {}
         for mid_r, tag_r in db.execute(
             select(MediaTag.media_id, MediaTag.tag).where(MediaTag.media_id.in_(ch))
         ).all():
             existing_tags_by_mid.setdefault(str(mid_r), set()).add(normalize_pl(str(tag_r)))
 
-    for mid in selected_ids:
-        have = existing_tags_by_mid.setdefault(str(mid), set())
-        if tag_norm not in have:
-            db.add(MediaTag(media_id=str(mid), tag=tag_label, confidence=1.0, source_model="face_cluster"))
-            have.add(tag_norm)
+        for mid in ch:
+            have = existing_tags_by_mid.setdefault(str(mid), set())
+            for pname in parsed_names:
+                t_lbl = f"osoba:{pname}"[:64]
+                t_norm = normalize_pl(t_lbl)
+                if t_norm not in have:
+                    db.add(MediaTag(media_id=str(mid), tag=t_lbl, confidence=1.0, source_model="face_cluster"))
+                    have.add(t_norm)
 
     db.commit()
-    msg = f"Przypisano osobę „{person_name}” (tag {tag_label}) do {len(selected_ids)} zdjęć."
+    if is_clear:
+        msg = f"Usunięto przypisania osób z {len(selected_ids)} zdjęć."
+    else:
+        names_disp = ", ".join(parsed_names)
+        verb = "Dodano" if person_action == "add" else "Ustawiono"
+        msg = f"{verb} osoby ({names_disp}) dla {len(selected_ids)} zdjęć."
     OperationLogger.log("PERSON_NAMED", msg, status="OK", db=db)
+    keep_view = (_form_str(form, "keep_view") or "").strip().lower() in ("1", "true", "yes")
+    trig = "refresh-sidebar" if keep_view else "refresh-all"
     return HTMLResponse(
         f"<span class='text-emerald-400 text-xs font-semibold'>👤 {html_mod.escape(msg)}</span>",
-        headers={"HX-Trigger": "refresh-all"},
+        headers={"HX-Trigger": trig},
     )
 
 

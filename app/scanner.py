@@ -368,21 +368,29 @@ class MetadataDateResolver:
         folder_info: Optional[Tuple[datetime.datetime, str, str]] = None,
     ) -> Tuple[datetime.datetime, bool, Optional[str]]:
         """
-        Resolves effective date per user specification:
-        a) If EXIF / container date exists, use it directly with NO anomaly.
-        b) Otherwise use file creation date (`ctime`) when it agrees with filename and folder
-           date (day may differ in folder names as long as month and year match) -> NO anomaly.
-        c) On conflict in (b) or copy-updated `ctime`, pick the oldest existing date and flag a date discrepancy.
+        Resolves effective date and date discrepancies:
+        a) If valid EXIF date exists -> effective_date = EXIF.
+        b) If EXIF is absent -> effective_date = mtime (file modification date; fallback to ctime only if mtime invalid),
+           even when it differs from ctime, filename date, or path/folder date.
+        Discrepancy (anomaly) rules:
+        - Missing EXIF is NEVER an anomaly.
+        - Difference between ctime and mtime is NEVER an anomaly (still shown in file details).
+        - If effective_date disagrees with date in path/folder -> flag path discrepancy.
+        - If effective_date disagrees with date in filename -> flag filename discrepancy.
         """
         now_upper = datetime.datetime.utcnow() + datetime.timedelta(days=1)
         valid_exif = exif if cls._is_valid_date(exif, now_upper) else None
+        valid_mtime = mtime if cls._is_valid_date(mtime, now_upper) else None
+        valid_ctime = ctime if cls._is_valid_date(ctime, now_upper) else now_upper
+
         if valid_exif is not None:
-            return valid_exif, False, None
+            effective = valid_exif
+        elif valid_mtime is not None:
+            effective = valid_mtime
+        else:
+            effective = valid_ctime
 
         valid_fn = fn_date if cls._is_valid_date(fn_date, now_upper) else None
-        valid_ctime = ctime if cls._is_valid_date(ctime, now_upper) else now_upper
-        valid_mtime = mtime if cls._is_valid_date(mtime, now_upper) else now_upper
-
         valid_folder: Optional[Tuple[datetime.datetime, str, str]] = None
         if folder_info and cls._is_valid_date(folder_info[0], now_upper):
             valid_folder = folder_info
@@ -390,43 +398,20 @@ class MetadataDateResolver:
         reasons: List[str] = []
         fn_date_only = valid_fn is not None and valid_fn.hour == 0 and valid_fn.minute == 0 and valid_fn.second == 0
 
-        if valid_fn and not cls.dates_agree(valid_ctime, valid_fn, date_only=fn_date_only):
-            reasons.append(
-                f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) vs nazwa pliku ({valid_fn.strftime('%Y-%m-%d')})"
-            )
-
         if valid_folder:
             f_dt, f_prec, f_seg = valid_folder
-            if not cls.matches_folder_date(valid_ctime, f_dt, f_prec):
+            if not cls.matches_folder_date(effective, f_dt, f_prec):
                 reasons.append(
-                    f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) z folderem '{f_seg}'"
-                )
-            if valid_fn and not cls.matches_folder_date(valid_fn, f_dt, f_prec):
-                reasons.append(
-                    f"Niezgodność dat: nazwa pliku ({valid_fn.strftime('%Y-%m-%d')}) z folderem '{f_seg}'"
+                    f"Niezgodność z datą w ścieżce (folder '{f_seg}'; data efektywna: {effective.strftime('%Y-%m-%d')})"
                 )
 
-        if (valid_ctime - valid_mtime).total_seconds() > 86400:
+        if valid_fn and not cls.dates_agree(effective, valid_fn, date_only=fn_date_only):
             reasons.append(
-                f"Niezgodność dat: utworzenie pliku ({valid_ctime.strftime('%Y-%m-%d')}) zmodyfikowane przy kopiowaniu vs modyfikacja ({valid_mtime.strftime('%Y-%m-%d')})"
+                f"Niezgodność z datą w nazwie pliku ({valid_fn.strftime('%Y-%m-%d')}; data efektywna: {effective.strftime('%Y-%m-%d')})"
             )
 
         if not reasons:
-            return valid_ctime, False, None
-
-        precise_candidates = [valid_ctime, valid_mtime]
-        if valid_fn is not None:
-            precise_candidates.append(valid_fn)
-        oldest_precise = min(precise_candidates)
-
-        if valid_folder:
-            f_dt, f_prec, _ = valid_folder
-            if not cls.matches_folder_date(oldest_precise, f_dt, f_prec) and f_dt < oldest_precise:
-                effective = f_dt
-            else:
-                effective = oldest_precise
-        else:
-            effective = oldest_precise
+            return effective, False, None
 
         return effective, True, "; ".join(reasons)[:255]
 

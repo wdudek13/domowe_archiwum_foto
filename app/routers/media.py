@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 import shutil
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -322,9 +322,15 @@ def _build_deleted_dup_history_map(db: Session, items: List[MediaItem], q: Optio
 def _anomaly_type_clause(anomaly_type: Optional[str]):
     at = (anomaly_type or "all").strip().lower()
     if at == "folder":
-        return MediaItem.date_anomaly_reason.ilike("%folder%")
+        return or_(
+            MediaItem.date_anomaly_reason.ilike("%folder%"),
+            MediaItem.date_anomaly_reason.ilike("%ścież%"),
+        )
     if at == "filename":
-        return MediaItem.date_anomaly_reason.ilike("%nazwa pliku%")
+        return or_(
+            MediaItem.date_anomaly_reason.ilike("%nazwa pliku%"),
+            MediaItem.date_anomaly_reason.ilike("%nazwie pliku%"),
+        )
     if at == "copy_ctime":
         return or_(
             MediaItem.date_anomaly_reason.ilike("%zmodyfikowane przy kopiowaniu%"),
@@ -337,7 +343,9 @@ def _anomaly_type_clause(anomaly_type: Optional[str]):
             MediaItem.date_anomaly_reason.is_(None),
             and_(
                 ~MediaItem.date_anomaly_reason.ilike("%folder%"),
+                ~MediaItem.date_anomaly_reason.ilike("%ścież%"),
                 ~MediaItem.date_anomaly_reason.ilike("%nazwa pliku%"),
+                ~MediaItem.date_anomaly_reason.ilike("%nazwie pliku%"),
                 ~MediaItem.date_anomaly_reason.ilike("%zmodyfikowane przy kopiowaniu%"),
                 ~MediaItem.date_anomaly_reason.ilike("%EXIF%"),
             ),
@@ -468,11 +476,29 @@ def apply_media_filters(
             defect_tag = qdef if qdef.startswith("do_usuniecia:") else f"do_usuniecia:{qdef}"
             stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == defect_tag)
     if tag and tag.strip():
-        if not quality_defect or not quality_defect.strip():
-            stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == tag.strip())
+        t_clean = tag.strip()
+        if t_clean == "twarz:all":
+            stmt = stmt.where(MediaItem.id.in_(select(MediaFace.media_id)))
+        elif t_clean == "twarz:nienazwane":
+            stmt = stmt.where(MediaItem.id.in_(select(MediaFace.media_id).where(MediaFace.person_name.is_(None))))
+        elif t_clean in ("twarz:1", "twarz:2", "twarz:3"):
+            f_idx = int(t_clean.split(":")[1]) - 1
+            stmt = stmt.where(MediaItem.id.in_(select(MediaFace.media_id).where(MediaFace.face_index == f_idx)))
+        elif t_clean == "twarz:4+":
+            stmt = stmt.where(MediaItem.id.in_(select(MediaFace.media_id).where(MediaFace.face_index >= 3)))
+        elif t_clean.startswith("osoba:"):
+            person_nm = t_clean[6:].strip()
+            stmt = stmt.where(
+                or_(
+                    MediaItem.id.in_(select(MediaTag.media_id).where(MediaTag.tag == t_clean)),
+                    MediaItem.id.in_(select(MediaFace.media_id).where(MediaFace.person_name == person_nm)),
+                )
+            )
+        elif not quality_defect or not quality_defect.strip():
+            stmt = stmt.join(MediaItem.tags).where(MediaTag.tag == t_clean)
         else:
             tag_alias = aliased(MediaTag)
-            stmt = stmt.join(tag_alias, tag_alias.media_id == MediaItem.id).where(tag_alias.tag == tag.strip())
+            stmt = stmt.join(tag_alias, tag_alias.media_id == MediaItem.id).where(tag_alias.tag == t_clean)
     if untagged_only:
         stmt = stmt.where(~MediaItem.id.in_(select(MediaTag.media_id).distinct()))
     if unvectored_only:
@@ -520,29 +546,39 @@ def apply_media_filters(
         clean_q_low = clean_q.lower()
         clean_q_norm = normalize_pl(clean_q)
         search_terms = [clean_q_low]
+        exact_tag_terms: List[str] = []
         if clean_q_norm and clean_q_norm != clean_q_low:
             search_terms.append(clean_q_norm)
         for pl_cat, en_words in PL_CATEGORY_MAPPING.items():
             norm_cat = normalize_pl(pl_cat)
             if (
-                clean_q_low in pl_cat
-                or clean_q_norm in norm_cat
+                clean_q_low == pl_cat
+                or clean_q_norm == norm_cat
+                or (len(clean_q_norm) >= 3 and clean_q_norm in norm_cat)
                 or any(
-                    clean_q_low in w
-                    or w in clean_q_low
-                    or clean_q_norm in normalize_pl(w)
-                    or (len(normalize_pl(w)) >= 3 and normalize_pl(w) in clean_q_norm)
+                    clean_q_norm == normalize_pl(w)
+                    or (len(clean_q_norm) >= 4 and clean_q_norm in normalize_pl(w))
+                    or (len(normalize_pl(w)) >= 4 and normalize_pl(w) in clean_q_norm)
                     for w in en_words
                 )
             ):
-                search_terms.append(pl_cat)
-                search_terms.extend(en_words)
+                exact_tag_terms.append(pl_cat)
+                if pl_cat == "kwiaty / rosliny":
+                    exact_tag_terms.append("kwiaty")
+        # Map specific Polish/English synonyms safely (skip ambiguous short substrings like pot/hip/ear/park/flower)
+        _unsafe_sub = {"pot", "hip", "ear", "park", "corn", "flower", "cab", "cup", "hat", "ski"}
         for en_k, pl_v in IMAGENET_PL_SYNONYMS.items():
             n_en = normalize_pl(en_k)
             n_pl = normalize_pl(pl_v)
-            if clean_q_norm in n_pl or clean_q_norm in n_en:
-                search_terms.append(en_k)
-                search_terms.append(pl_v)
+            if (
+                clean_q_norm == n_pl
+                or clean_q_norm == n_en
+                or (len(clean_q_norm) >= 4 and (clean_q_norm in n_pl or clean_q_norm in n_en))
+            ):
+                if len(n_en) >= 4 and n_en not in _unsafe_sub:
+                    search_terms.append(en_k)
+                if len(n_pl) >= 4:
+                    search_terms.append(pl_v)
 
         del_hist_hashes = select(DeletedDuplicateHistory.file_hash).where(
             or_(
@@ -583,6 +619,8 @@ def apply_media_filters(
         ]
         if expanded_gids:
             q_conds.append(MediaItem.group_id.in_(list(expanded_gids)))
+        if exact_tag_terms:
+            q_conds.append(q_tag_alias.tag.in_(sorted(set(exact_tag_terms))))
         for term in sorted(set(search_terms)):
             q_conds.append(q_tag_alias.tag.ilike(f"%{term}%"))
 
@@ -765,10 +803,85 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
         "lowres": defect_counts_raw.get("do_usuniecia:niska_rozdzielczosc", 0),
     }
 
+    # Sidebar: Named persons (`osoba:*` + `MediaFace.person_name`) & detected face slots (Twarz #1, #2, #3, #4+)
+    person_media_sets: Dict[str, set] = defaultdict(set)
+    for pname, mid in db.execute(
+        select(MediaFace.person_name, MediaFace.media_id)
+        .join(MediaItem, MediaItem.id == MediaFace.media_id)
+        .where(gallery_visible, MediaFace.person_name.is_not(None), MediaFace.person_name != "")
+    ).all():
+        person_media_sets[str(pname).strip()].add(str(mid))
+
+    for tname, mid in db.execute(
+        select(MediaTag.tag, MediaTag.media_id)
+        .join(MediaItem, MediaItem.id == MediaTag.media_id)
+        .where(gallery_visible, MediaTag.tag.like("osoba:%"))
+    ).all():
+        p_clean = str(tname)[6:].strip()
+        if p_clean:
+            person_media_sets[p_clean].add(str(mid))
+
+    named_persons = sorted(
+        [(pname, len(mids)) for pname, mids in person_media_sets.items() if mids],
+        key=lambda x: (-x[1], x[0].lower()),
+    )
+
+    face_all_cnt = (
+        db.scalar(
+            select(func.count(func.distinct(MediaFace.media_id)))
+            .join(MediaItem, MediaItem.id == MediaFace.media_id)
+            .where(gallery_visible)
+        )
+        or 0
+    )
+    face_unnamed_cnt = (
+        db.scalar(
+            select(func.count(func.distinct(MediaFace.media_id)))
+            .join(MediaItem, MediaItem.id == MediaFace.media_id)
+            .where(gallery_visible, MediaFace.person_name.is_(None))
+        )
+        or 0
+    )
+    slot_counts_raw = dict(
+        db.execute(
+            select(MediaFace.face_index, func.count(func.distinct(MediaFace.media_id)))
+            .join(MediaItem, MediaItem.id == MediaFace.media_id)
+            .where(gallery_visible, MediaFace.face_index <= 2)
+            .group_by(MediaFace.face_index)
+        ).all()
+    )
+    slot_4plus_cnt = (
+        db.scalar(
+            select(func.count(func.distinct(MediaFace.media_id)))
+            .join(MediaItem, MediaItem.id == MediaFace.media_id)
+            .where(gallery_visible, MediaFace.face_index >= 3)
+        )
+        or 0
+    )
+    face_slots = []
+    for idx_0, tag_key, label in (
+        (0, "twarz:1", "Twarz #1"),
+        (1, "twarz:2", "Twarz #2"),
+        (2, "twarz:3", "Twarz #3"),
+    ):
+        cnt = int(slot_counts_raw.get(idx_0, 0) or 0)
+        if cnt > 0:
+            face_slots.append((tag_key, label, cnt))
+    if slot_4plus_cnt > 0:
+        face_slots.append(("twarz:4+", "Twarz #4+", int(slot_4plus_cnt)))
+
+    face_slot_counts = {
+        "all": int(face_all_cnt),
+        "unnamed": int(face_unnamed_cnt),
+        "slots": face_slots,
+    }
+
     return {
         "vol_counts": vol_counts,
         "direct_counts": direct_counts,
         "top_tags": top_tags,
+        "named_persons": named_persons,
+        "face_slot_counts": face_slot_counts,
         "years": [(int(y), c) for y, c in years if y is not None],
         "total_all": total_all,
         "total_anomalies": total_anomalies,
@@ -805,6 +918,7 @@ def build_sidebar_context(db: Session) -> dict:
         db.scalar(select(func.count(MediaTag.id))) or 0,
         db.scalar(select(func.count(MediaFace.id))) or 0,
         db.scalar(select(func.count(MediaFace.person_name))) or 0,
+        db.scalar(select(func.count(func.distinct(MediaFace.person_name)))) or 0,
         db.scalar(select(func.count(MediaEmbedding.media_id))) or 0,
         db.scalar(select(func.count(MediaGroup.id))) or 0,
         db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_primary_duplicate == False)) or 0,
@@ -1263,6 +1377,20 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             .order_by(MediaFace.face_index.asc())
         ).all()
     )
+    item_person_names: List[str] = []
+    _seen_p = set()
+    for t in it.tags:
+        if t.tag and t.tag.startswith("osoba:"):
+            pn = t.tag[6:].strip()
+            if pn and normalize_pl(pn) not in _seen_p:
+                item_person_names.append(pn)
+                _seen_p.add(normalize_pl(pn))
+    for fc in item_faces:
+        if fc.person_name:
+            pn = fc.person_name.strip()
+            if pn and normalize_pl(pn) not in _seen_p:
+                item_person_names.append(pn)
+                _seen_p.add(normalize_pl(pn))
 
     return render_template(
         request,
@@ -1270,6 +1398,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
         {
             "item": it,
             "item_faces": item_faces,
+            "item_person_names": item_person_names,
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,

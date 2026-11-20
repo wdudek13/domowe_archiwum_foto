@@ -1,0 +1,134 @@
+<!-- Podsumowanie aktywnego zbioru, zmiana osób i paginacja (wewnątrz zwijalnego panelu nad siatką) -->
+<div class="flex flex-wrap items-center justify-between gap-2.5 bg-cardBg/80 border border-borderBg px-4 py-2 rounded-xl shadow-card text-xs">
+    <div class="flex flex-wrap items-center gap-2">
+        <span class="inline-flex items-center gap-1.5 bg-slate-950/70 border border-emerald-800/50 rounded-lg px-2.5 py-1 text-slate-300">Aktywny zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong> plików ({{ "%.1f"|format(total_size_mb) }} MB)</span>
+        {% if active_group %}
+            <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Album: {{ active_group.name }} (ID: {{ active_group.id }})</span>
+        {% endif %}
+        {% if active_volume %}
+            <span class="inline-flex items-center space-x-1 bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">
+                <span>💾 Urządzenie: {{ active_volume.volume_label }} (VSN: {{ active_volume.volume_serial_number }})</span>
+                <button type="button"
+                        title="Wróć do wszystkich urządzeń"
+                        onclick="applySidebarFilter({volume_id: '', folder_prefix: ''})"
+                        class="text-sky-300 hover:text-white font-bold ml-1">✕</button>
+            </span>
+        {% endif %}
+        {% if online_only %}
+            <span class="inline-flex items-center space-x-1 bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">
+                <span>🟢 Tylko dostępne online</span>
+                <button type="button"
+                        title="Wyłącz filtr urządzeń online"
+                        onclick="applySidebarFilter({online_only: false})"
+                        class="text-emerald-300 hover:text-white font-bold ml-1">✕</button>
+            </span>
+        {% endif %}
+        {% if active_tag %}
+            {% if active_tag.startswith('do_usuniecia') %}
+                <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">
+                    ⚠️ Wada jakości:
+                    {% if active_tag == 'do_usuniecia' %}Wszystkie wadliwe
+                    {% elif active_tag == 'do_usuniecia:uszkodzone' %}Uszkodzone pliki
+                    {% elif active_tag == 'do_usuniecia:rozmyte' %}Rozmyte / brak ostrości
+                    {% elif active_tag == 'do_usuniecia:niedoswietlone' %}Niedoświetlone (ciemne)
+                    {% elif active_tag == 'do_usuniecia:przeswietlone' %}Prześwietlone (jasne)
+                    {% elif active_tag == 'do_usuniecia:brak_detali' %}Brak detali (płaskie)
+                    {% elif active_tag == 'do_usuniecia:niska_rozdzielczosc' %}Niska rozdzielczość (&lt;160px)
+                    {% else %}{{ active_tag }}{% endif %}
+                </span>
+            {% elif active_tag.startswith('osoba:') %}
+                <span class="bg-emerald-950 text-emerald-200 border border-emerald-700 px-2 py-0.5 rounded-full font-semibold">👤 Osoba: {{ active_tag[6:] }}</span>
+            {% elif active_tag == 'twarz:all' %}
+                <span class="bg-purple-950 text-purple-200 border border-purple-700 px-2 py-0.5 rounded-full font-semibold">👥 Wszystkie zdjęcia z twarzami</span>
+            {% elif active_tag == 'twarz:nienazwane' %}
+                <span class="bg-purple-950 text-purple-200 border border-purple-700 px-2 py-0.5 rounded-full font-semibold">❓ Nienazwane twarze</span>
+            {% elif active_tag.startswith('twarz:') %}
+                <span class="bg-purple-950 text-purple-200 border border-purple-700 px-2 py-0.5 rounded-full font-semibold">👤 Twarz #{{ active_tag[6:] }}</span>
+            {% else %}
+                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Tag: {{ active_tag }}</span>
+            {% endif %}
+        {% endif %}
+        {% if active_quality_defect %}
+            <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">⚠️ Wada jakości: {{ active_quality_defect }}</span>
+        {% endif %}
+        {% if active_folder %}
+            <span class="inline-flex items-center space-x-1 bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">
+                <span>📂 Katalog: {{ active_folder }}</span>
+                <button type="button"
+                        title="Wyczyść filtr katalogu"
+                        onclick="applySidebarFilter({folder_prefix: ''})"
+                        class="text-amber-300 hover:text-white font-bold ml-1">✕</button>
+            </span>
+        {% endif %}
+        {% if unbacked_only %}
+            <span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">🛡️ Pliki bez backupu na innym urządzeniu</span>
+        {% endif %}
+        {% if untagged_only %}
+            <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Brak tagów AI</span>
+        {% endif %}
+        {% if unvectored_only %}
+            <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">📐 Brak wektorów 512-D</span>
+        {% endif %}
+        {% if unanalyzed_quality_only %}
+            <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🔍 Niezbadana jakość / ostrość</span>
+        {% endif %}
+        {% if active_q and active_q.strip() %}
+            <span class="inline-flex items-center space-x-1 bg-indigo-950 text-indigo-200 border border-indigo-600 px-2 py-0.5 rounded-full">
+                <span>🔍 Szukaj: &bdquo;{{ active_q }}&rdquo;</span>
+                <button type="button"
+                        title="Wyczyść frazę wyszukiwania"
+                        onclick="const qEl=document.getElementById('main-search-input'); if(qEl){qEl.value='';} htmx.trigger(document.getElementById('filter-form'), 'submit');"
+                        class="text-indigo-300 hover:text-white font-bold ml-1">✕</button>
+            </span>
+            <button type="button"
+                    hx-post="/actions/on-demand-keyword-scan"
+                    hx-vals="{{ {'q': active_q}|tojson|e }}"
+                    hx-target="#global-notification"
+                    hx-disabled-elt="this"
+                    onclick="const n=document.getElementById('global-notification'); if(n){ n.innerHTML='<span class=\'text-purple-300 text-xs font-semibold animate-pulse\'>🧠 Skanuję lokalne miniatury modelem AI (On-Demand) — proszę czekać...</span>'; }"
+                    class="bg-purple-800/90 hover:bg-purple-700 disabled:opacity-50 border border-purple-500 text-purple-100 px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition">
+                🧠 Szukaj głębiej na miniaturach AI („{{ active_q }}”)
+            </button>
+        {% endif %}
+        {% if backup_mode is defined and backup_mode != 'hide' %}
+            <span class="bg-teal-950 text-teal-300 border border-teal-700 px-2 py-0.5 rounded-full">
+                🛡️ Backupy ({{ 'Tylko backupy' if backup_mode == 'only' else 'Wraz z oryginałami' }}{% if backup_types %}: {{ backup_types|join(', ') }}{% endif %})
+            </span>
+        {% endif %}
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2">
+        {% if not similarity_target_id %}
+        <form hx-post="/actions/name-person"
+              hx-include="input[name='selected_ids']:checked"
+              hx-target="#global-notification"
+              class="flex flex-wrap items-center gap-1 bg-slate-950/60 border border-emerald-800/50 rounded-lg px-2 py-0.5">
+            <span class="text-emerald-300 font-semibold whitespace-nowrap">👤 Zmień osoby (zaznaczone):</span>
+            <input type="text" name="person_name" placeholder="np. Ania, Ala"
+                   class="bg-slate-900 border border-borderBg rounded px-2 py-0.5 text-white w-36 text-[11px]">
+            <button type="submit" name="person_action" value="replace"
+                    title="Ustaw osoby po przecinku (np. Ania, Ala) — zastępuje dotychczasowe osoby na zaznaczonych zdjęciach"
+                    class="bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-0.5 rounded font-semibold text-[11px] whitespace-nowrap">
+                ✓ Zmień osoby
+            </button>
+            <button type="submit" name="person_action" value="add"
+                    title="Dopisz dodatkowe osoby po przecinku bez usuwania już przypisanych"
+                    class="bg-indigo-700 hover:bg-indigo-600 text-white px-2 py-0.5 rounded font-semibold text-[11px] whitespace-nowrap">
+                + Dodaj
+            </button>
+            <button type="submit" name="person_action" value="clear"
+                    title="Usuń przypisane tagi osób z zaznaczonych zdjęć"
+                    class="bg-rose-900/80 hover:bg-rose-700 text-rose-100 px-1.5 py-0.5 rounded font-semibold text-[11px]">
+                ✖️
+            </button>
+        </form>
+        {% endif %}
+        {% if total_pages > 1 %}
+        <div class="flex items-center space-x-1.5">
+            <button type="button" onclick="goToPage({{ page - 1 if page > 1 else 1 }})" {% if page <= 1 %}disabled{% endif %} class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40">&laquo; Poprzednia</button>
+            <span class="font-mono text-slate-300 px-2">Strona {{ page }} / {{ total_pages }}</span>
+            <button type="button" onclick="goToPage({{ page + 1 if page < total_pages else total_pages }})" {% if page >= total_pages %}disabled{% endif %} class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40">Następna &raquo;</button>
+        </div>
+        {% endif %}
+    </div>
+</div>

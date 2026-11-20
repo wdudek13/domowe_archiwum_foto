@@ -1,104 +1,11 @@
 <div class="space-y-4">
     <input type="hidden" id="view-total-matching" name="view_total_matching" value="{{ total_matching }}">
-    <!-- Podsumowanie aktywnego zbioru i paginacja -->
-    <div class="flex flex-wrap items-center justify-between gap-2.5 bg-cardBg/80 border border-borderBg px-4 py-2.5 rounded-xl shadow-card text-xs">
-        <div class="flex flex-wrap items-center gap-2">
-            <span class="inline-flex items-center gap-1.5 bg-slate-950/70 border border-emerald-800/50 rounded-lg px-2.5 py-1 text-slate-300">Aktywny zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong> plików ({{ "%.1f"|format(total_size_mb) }} MB)</span>
-            {% if active_group %}
-                <span class="bg-indigo-950 text-indigo-300 border border-indigo-700 px-2 py-0.5 rounded-full">📁 Album: {{ active_group.name }} (ID: {{ active_group.id }})</span>
-            {% endif %}
-            {% if active_volume %}
-                <span class="inline-flex items-center space-x-1 bg-sky-950 text-sky-300 border border-sky-700 px-2 py-0.5 rounded-full">
-                    <span>💾 Urządzenie: {{ active_volume.volume_label }} (VSN: {{ active_volume.volume_serial_number }})</span>
-                    <button type="button"
-                            title="Wróć do wszystkich urządzeń"
-                            onclick="applySidebarFilter({volume_id: '', folder_prefix: ''})"
-                            class="text-sky-300 hover:text-white font-bold ml-1">✕</button>
-                </span>
-            {% endif %}
-            {% if online_only %}
-                <span class="inline-flex items-center space-x-1 bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">
-                    <span>🟢 Tylko dostępne online</span>
-                    <button type="button"
-                            title="Wyłącz filtr urządzeń online"
-                            onclick="applySidebarFilter({online_only: false})"
-                            class="text-emerald-300 hover:text-white font-bold ml-1">✕</button>
-                </span>
-            {% endif %}
-            {% if active_tag %}
-                {% if active_tag.startswith('do_usuniecia') %}
-                    <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">
-                        ⚠️ Wada jakości:
-                        {% if active_tag == 'do_usuniecia' %}Wszystkie wadliwe
-                        {% elif active_tag == 'do_usuniecia:uszkodzone' %}Uszkodzone pliki
-                        {% elif active_tag == 'do_usuniecia:rozmyte' %}Rozmyte / brak ostrości
-                        {% elif active_tag == 'do_usuniecia:niedoswietlone' %}Niedoświetlone (ciemne)
-                        {% elif active_tag == 'do_usuniecia:przeswietlone' %}Prześwietlone (jasne)
-                        {% elif active_tag == 'do_usuniecia:brak_detali' %}Brak detali (płaskie)
-                        {% elif active_tag == 'do_usuniecia:niska_rozdzielczosc' %}Niska rozdzielczość (&lt;160px)
-                        {% else %}{{ active_tag }}{% endif %}
-                    </span>
-                {% else %}
-                    <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Tag: {{ active_tag }}</span>
-                {% endif %}
-            {% endif %}
-            {% if active_quality_defect %}
-                <span class="bg-orange-950 text-orange-300 border border-orange-700 px-2 py-0.5 rounded-full font-semibold">⚠️ Wada jakości: {{ active_quality_defect }}</span>
-            {% endif %}
-            {% if active_folder %}
-                <span class="inline-flex items-center space-x-1 bg-amber-950 text-amber-300 border border-amber-700 px-2 py-0.5 rounded-full">
-                    <span>📂 Katalog: {{ active_folder }}</span>
-                    <button type="button"
-                            title="Wyczyść filtr katalogu"
-                            onclick="applySidebarFilter({folder_prefix: ''})"
-                            class="text-amber-300 hover:text-white font-bold ml-1">✕</button>
-                </span>
-            {% endif %}
-            {% if unbacked_only %}
-                <span class="bg-emerald-950 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded-full">🛡️ Pliki bez backupu na innym urządzeniu</span>
-            {% endif %}
-            {% if untagged_only %}
-                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🏷️ Brak tagów AI</span>
-            {% endif %}
-            {% if unvectored_only %}
-                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">📐 Brak wektorów 512-D</span>
-            {% endif %}
-            {% if unanalyzed_quality_only %}
-                <span class="bg-purple-950 text-purple-300 border border-purple-700 px-2 py-0.5 rounded-full">🔍 Niezbadana jakość / ostrość</span>
-            {% endif %}
-            {% if active_q and active_q.strip() %}
-                <span class="inline-flex items-center space-x-1 bg-indigo-950 text-indigo-200 border border-indigo-600 px-2 py-0.5 rounded-full">
-                    <span>🔍 Szukaj: &bdquo;{{ active_q }}&rdquo;</span>
-                    <button type="button"
-                            title="Wyczyść frazę wyszukiwania"
-                            onclick="const qEl=document.getElementById('main-search-input'); if(qEl){qEl.value='';} htmx.trigger(document.getElementById('filter-form'), 'submit');"
-                            class="text-indigo-300 hover:text-white font-bold ml-1">✕</button>
-                </span>
-                <button type="button"
-                        hx-post="/actions/on-demand-keyword-scan"
-                        hx-vals="{{ {'q': active_q}|tojson|e }}"
-                        hx-target="#global-notification"
-                        hx-disabled-elt="this"
-                        onclick="const n=document.getElementById('global-notification'); if(n){ n.innerHTML='<span class=\'text-purple-300 text-xs font-semibold animate-pulse\'>🧠 Skanuję lokalne miniatury modelem AI (On-Demand) — proszę czekać...</span>'; }"
-                        class="bg-purple-800/90 hover:bg-purple-700 disabled:opacity-50 border border-purple-500 text-purple-100 px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition">
-                    🧠 Szukaj głębiej na miniaturach AI („{{ active_q }}”)
-                </button>
-            {% endif %}
-            {% if backup_mode is defined and backup_mode != 'hide' %}
-                <span class="bg-teal-950 text-teal-300 border border-teal-700 px-2 py-0.5 rounded-full">
-                    🛡️ Backupy ({{ 'Tylko backupy' if backup_mode == 'only' else 'Wraz z oryginałami' }}{% if backup_types %}: {{ backup_types|join(', ') }}{% endif %})
-                </span>
-            {% endif %}
-        </div>
-
-        {% if total_pages > 1 %}
-        <div class="flex items-center space-x-1.5">
-            <button type="button" onclick="goToPage({{ page - 1 if page > 1 else 1 }})" {% if page <= 1 %}disabled{% endif %} class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40">&laquo; Poprzednia</button>
-            <span class="font-mono text-slate-300 px-2">Strona {{ page }} / {{ total_pages }}</span>
-            <button type="button" onclick="goToPage({{ page + 1 if page < total_pages else total_pages }})" {% if page >= total_pages %}disabled{% endif %} class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40">Następna &raquo;</button>
-        </div>
-        {% endif %}
+    {% if _render_summary_inline is not defined or _render_summary_inline %}
+    <div id="active-summary-slot" hx-swap-oob="innerHTML">
+        {% include "partials/media_grid_summary.html" %}
     </div>
+    <span id="active-summary-compact" hx-swap-oob="innerHTML" class="hidden">Zbiór: <strong class="text-emerald-400 font-mono">{{ total_matching }}</strong></span>
+    {% endif %}
 
     <!-- Kolejność dysków offline wymaganych do zobaczenia oryginałów -->
     {% if (offline_drives_info is defined and offline_drives_info.has_offline) or active_volume or online_only %}
@@ -434,17 +341,25 @@
     </div>
     {% endif %}
 
-    <!-- Pasek przełączania 6 trybów podobieństwa -->
+    <!-- Pasek przełączania trybów podobieństwa + szybkie tagowanie osób i tagów dla zaznaczonych -->
     {% if similarity_target_id and similarity_modes %}
     <div class="bg-purple-950/30 border border-purple-700/60 p-3.5 rounded-xl space-y-2.5 text-xs">
         <div class="flex flex-wrap items-center justify-between gap-2">
             <div>
                 <span class="font-bold text-purple-300 text-sm">🔍 Wyszukiwanie podobnych dla: <span class="text-white font-mono">{{ similarity_target_name }}</span></span>
-                <p class="text-[11px] text-slate-400">Wybierz kryterium podobieństwa, aby przeliczyć ranking dopasowania:</p>
+                <p class="text-[11px] text-slate-400">Wybierz kryterium podobieństwa, zaznacz pasujące zdjęcia i nadaj im tag osoby lub dowolny tag:</p>
             </div>
-            <button type="button" onclick="applySidebarFilter({_reset: true})" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1 rounded-lg">
-                &larr; Wróć do pełnej galerii
-            </button>
+            <div class="flex flex-wrap items-center gap-1.5">
+                <button type="button" onclick="selectAllVisible(true)" class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-indigo-200 px-2.5 py-1 rounded-lg font-medium">
+                    ☑️ Zaznacz wyniki
+                </button>
+                <button type="button" onclick="selectAllVisible(false)" class="bg-slate-800 hover:bg-slate-700 border border-borderBg text-slate-300 px-2.5 py-1 rounded-lg">
+                    Odznacz
+                </button>
+                <button type="button" onclick="applySidebarFilter({_reset: true})" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1 rounded-lg">
+                    &larr; Wróć do pełnej galerii
+                </button>
+            </div>
         </div>
         <div class="flex flex-wrap gap-1.5">
             {% for m_key, m_label in similarity_modes.items() %}
@@ -456,24 +371,51 @@
             </button>
             {% endfor %}
         </div>
-        {% if similarity_mode == 'same_person' %}
-        <form hx-post="/actions/name-person"
-              hx-include="input[name='selected_ids']:checked"
-              hx-target="#global-notification"
-              class="pt-2 border-t border-purple-800/50 flex flex-wrap items-center gap-2">
-            <input type="hidden" name="default_media_ids_json" value='{{ (matched_person_ids or [])|tojson }}'>
-            {% if active_face_index is defined and active_face_index is not none %}
-            <input type="hidden" name="target_media_id" value="{{ similarity_target_id }}">
-            <input type="hidden" name="face_index" value="{{ active_face_index }}">
-            {% endif %}
-            <span class="text-purple-200 font-semibold">👤 Nazwij tę osobę{% if active_face_index is defined and active_face_index is not none %} (Twarz #{{ active_face_index + 1 }}){% endif %} (dla zaznaczonych lub wszystkich dopasowanych zdjęć):</span>
-            <input type="text" name="person_name" required placeholder="np. Babcia Zosia, Marek, Ania"
-                   class="bg-slate-900 border border-purple-600/70 rounded-lg px-2.5 py-1 text-white w-56">
-            <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1 rounded-lg font-semibold shadow">
-                ✓ Zapisz imię (dodaj tag <code>osoba:...</code>)
-            </button>
-        </form>
+        {% if similarity_mode == 'same_person' and face_not_found is defined and face_not_found %}
+        <div class="bg-amber-950/60 border border-amber-600/70 text-amber-200 px-3 py-2 rounded-lg text-[11px]">
+            ⚠️ Nie wykryto wyraźnej twarzy na miniaturze tego pliku (np. ujęcie z daleka, tyłem lub klatka wideo). Spróbuj na zdjęciu z wyraźnie widoczną twarzą albo przełącz tryb na <strong>Hybrydowe</strong>.
+        </div>
         {% endif %}
+        <div class="pt-2 border-t border-purple-800/50 flex flex-wrap items-center gap-3">
+            <form hx-post="/actions/name-person"
+                  hx-include="input[name='selected_ids']:checked"
+                  hx-target="#global-notification"
+                  class="flex flex-wrap items-center gap-1.5">
+                <input type="hidden" name="keep_view" value="1">
+                {% if similarity_mode == 'same_person' %}
+                <input type="hidden" name="default_media_ids_json" value='{{ (matched_person_ids or [])|tojson }}'>
+                {% endif %}
+                {% if active_face_index is defined and active_face_index is not none %}
+                <input type="hidden" name="target_media_id" value="{{ similarity_target_id }}">
+                <input type="hidden" name="face_index" value="{{ active_face_index }}">
+                {% endif %}
+                <span class="text-purple-200 font-semibold">👤 Zmień osoby{% if active_face_index is defined and active_face_index is not none %} (Twarz #{{ active_face_index + 1 }}){% endif %} (po przecinku, dla zaznaczonych{% if similarity_mode == 'same_person' %} lub wszystkich dopasowanych{% endif %}):</span>
+                <input type="text" name="person_name" placeholder="np. Ania, Ala, Marek"
+                       class="bg-slate-900 border border-purple-600/70 rounded-lg px-2.5 py-1 text-white w-48">
+                <button type="submit" name="person_action" value="replace" class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1 rounded-lg font-semibold shadow">
+                    ✓ Zmień osoby
+                </button>
+                <button type="submit" name="person_action" value="add" class="bg-sky-700 hover:bg-sky-600 text-white px-2.5 py-1 rounded-lg font-semibold shadow" title="Dopisz osoby bez usuwania istniejących">
+                    + Dodaj
+                </button>
+                <button type="submit" name="person_action" value="clear" class="bg-rose-900/80 hover:bg-rose-700 text-rose-100 px-2 py-1 rounded-lg font-semibold" title="Usuń przypisania osób z zaznaczonych zdjęć">
+                    ✖️ Usuń
+                </button>
+            </form>
+            <form hx-post="/actions/add-tags"
+                  hx-include="input[name='selected_ids']:checked"
+                  hx-target="#global-notification"
+                  class="flex flex-wrap items-center gap-1.5">
+                <input type="hidden" name="scope" value="selected">
+                <input type="hidden" name="keep_view" value="1">
+                <span class="text-indigo-200 font-semibold">🏷️ Dodaj tag do zaznaczonych:</span>
+                <input type="text" name="tags" required placeholder="np. rodzina, wakacje"
+                       class="bg-slate-900 border border-indigo-600/70 rounded-lg px-2.5 py-1 text-white w-44">
+                <button type="submit" class="bg-indigo-700 hover:bg-indigo-600 text-white px-3 py-1 rounded-lg font-semibold shadow">
+                    + Dodaj tag
+                </button>
+            </form>
+        </div>
     </div>
     {% endif %}
 
@@ -563,13 +505,6 @@
                 <input type="hidden" name="album_id" value="{{ active_group.id }}">
                 <input type="text" name="new_date" placeholder="Nowa data RRRR-MM-DD" required class="bg-slate-900 border border-borderBg rounded px-2 py-1 w-36 font-mono">
                 <button type="submit" class="bg-amber-700 hover:bg-amber-600 text-white px-2.5 py-1 rounded">📅 Zmień datę albumu</button>
-            </form>
-
-            <!-- Obrót całego albumu o +90° -->
-            <form hx-post="/actions/rotate-media" hx-target="#global-notification" class="flex items-center space-x-1">
-                <input type="hidden" name="album_id" value="{{ active_group.id }}">
-                <input type="hidden" name="delta" value="90">
-                <button type="submit" class="bg-sky-700 hover:bg-sky-600 text-white px-2.5 py-1 rounded font-medium">⟳ Obróć album +90°</button>
             </form>
 
             <!-- Konsolidacja na wybrany dysk -->
@@ -1000,9 +935,9 @@
                         </div>
                         {% endif %}
 
-                        <div class="flex justify-between text-slate-500 text-[9px]">
-                            <span class="truncate max-w-[110px]" title="{{ item.relative_path }}">{{ item.relative_path }}</span>
-                            <span>{{ "%.1f"|format(item.file_size_bytes / (1024*1024)) }} MB</span>
+                        <div class="flex justify-between items-center gap-1 text-slate-500 text-[9px]">
+                            <span class="truncate flex-1 min-w-0" title="{{ item.relative_path }}">{{ item.relative_path }}</span>
+                            <span class="flex-shrink-0">{{ "%.1f"|format(item.file_size_bytes / (1024*1024)) }} MB</span>
                         </div>
                         {% if item.original_relative_path %}
                         <div class="text-[9px] text-amber-300/90 font-mono truncate" title="Pierwotnie: {{ item.original_relative_path }}">

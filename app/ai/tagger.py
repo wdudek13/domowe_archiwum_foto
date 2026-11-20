@@ -2,6 +2,7 @@ import gc
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 import cv2
 import numpy as np
@@ -24,17 +25,26 @@ def normalize_pl(text: str) -> str:
     return (text or "").strip().translate(_PL_TRANSLATE).lower()
 
 
+def _label_matches_token(norm_lbl: str, token: str) -> bool:
+    """Strict whole-word boundary check so 'flower' never matches 'cauliflower' and 'pot' never matches 'potter's wheel'."""
+    if not token or not norm_lbl:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", norm_lbl) is not None
+
+
 PL_CATEGORY_MAPPING: Dict[str, List[str]] = {
     "kwiaty / rosliny": [
         "daisy", "rose", "sunflower", "tulip", "orchid", "lily", "dahlia", "bouquet",
         "hibiscus", "dandelion", "poppy", "lavender", "lotus", "blossom", "petal",
-        "yellow lady's slipper", "lady's slipper", "cardoon", "hip", "rosehip",
-        "pot", "flowerpot", "vase", "rapeseed", "corn", "acorn", "mushroom",
-        "coral fungus", "agaric", "gyromitra", "stinkhorn", "earthstar", "hen-of-the-woods",
-        "bolete", "ear", "plant", "flora", "flower", "kwiat", "kwiaty", "roslina",
-        "rosliny", "bukiet", "roza", "róża", "tulipan", "storczyk", "stokrotka",
-        "slonecznik", "słonecznik", "wazon", "doniczka", "ogrod", "ogród", "park",
-        "grzyb", "grzyby", "rzepak", "szklarnia", "greenhouse",
+        "yellow lady's slipper", "lady's slipper", "cardoon", "rosehip",
+        "flowerpot", "vase", "rapeseed", "acorn", "plant", "flora", "flower",
+        "kwiat", "kwiaty", "roslina", "rosliny", "bukiet", "roza", "róża", "tulipan",
+        "tulipany", "storczyk", "stokrotka", "slonecznik", "słonecznik", "wazon",
+        "doniczka", "ogrod", "ogród", "rzepak", "szklarnia", "greenhouse",
+    ],
+    "grzyby": [
+        "grzyb", "grzyby", "borowik", "pieczarka", "mushroom", "coral fungus",
+        "agaric", "gyromitra", "stinkhorn", "earthstar", "hen-of-the-woods", "bolete",
     ],
     "pies": [
         "pies", "psy", "piesek", "szczeniak", "dog", "retriever", "terrier", "spaniel",
@@ -245,10 +255,10 @@ IMAGENET_PL_SYNONYMS: Dict[str, str] = {
 }
 
 _FLOWER_PLANT_INDICES = {
-    580, 738, 883, 946, 947, 984, 985, 986, 987, 988, 989,
-    990, 991, 992, 993, 994, 995, 996, 997, 998,
+    580, 738, 883, 946, 984, 985, 986, 989, 998,
 }
 _PURE_FLOWER_INDICES = {738, 883, 946, 984, 985, 986, 989}
+_MUSHROOM_INDICES = {947, 991, 992, 993, 994, 995, 996, 997}
 _MUSIC_INDICES = {401, 402, 420, 486, 513, 541, 546, 558, 566, 579, 594, 642, 683, 684, 776, 875, 881, 889}
 _EVENT_INDICES = {417, 470, 496, 572, 607, 907, 982}
 _WEATHER_ACC_INDICES = {414, 515, 808, 836, 837, 879}
@@ -370,12 +380,17 @@ class OnDemandObjectTagger:
         """
         mapped: List[Tuple[str, float]] = []
 
-        # 0. Flowers, Plants, Garden & Fungi
+        # 0. Flowers, Plants & Garden
         if idx in _FLOWER_PLANT_INDICES:
             if prob >= 0.15:
                 mapped.append(("kwiaty / rosliny", round(prob, 3)))
                 if idx in _PURE_FLOWER_INDICES:
                     mapped.append(("kwiaty", round(prob, 3)))
+            return mapped
+
+        if idx in _MUSHROOM_INDICES:
+            if prob >= 0.18:
+                mapped.append(("grzyby", round(prob, 3)))
             return mapped
 
         # 1. Dogs (indices 151..268 in ImageNet-1K)
@@ -535,23 +550,45 @@ class OnDemandObjectTagger:
         if green_ratio > 0.24:
             tags.append(("gory_natura", round(min(0.98, 0.65 + green_ratio), 2)))
 
-        # Task 2: Dedicated HSV Flower heuristic — green foliage (>=12%) + vivid colorful petal clusters (5%..65%)
-        foliage_mask = cv2.inRange(hsv, (35, 45, 40), (85, 255, 255))
+        # Task 2: Tightened HSV Flower heuristic — green foliage (>=12%) + compact vivid petal cluster(s)
+        # Rejects extreme panoramas (PANO_*) and scattered drone roofs / sunlit dry fields!
+        aspect_ratio = float(max(w, h)) / float(max(1, min(w, h)))
+        foliage_mask = cv2.inRange(hsv, (35, 50, 40), (85, 255, 240))
         foliage_ratio = float(np.count_nonzero(foliage_mask)) / total_px
-        if foliage_ratio >= 0.12:
-            petal_red1 = cv2.inRange(hsv, (0, 125, 100), (12, 255, 255))
-            petal_red2 = cv2.inRange(hsv, (155, 125, 100), (179, 255, 255))
-            petal_yellow = cv2.inRange(hsv, (15, 125, 100), (34, 255, 255))
-            petal_purple = cv2.inRange(hsv, (125, 125, 100), (154, 255, 255))
+        if foliage_ratio >= 0.12 and aspect_ratio <= 2.2:
+            petal_red1 = cv2.inRange(hsv, (0, 145, 105), (10, 255, 255))
+            petal_red2 = cv2.inRange(hsv, (158, 145, 105), (179, 255, 255))
+            petal_yellow = cv2.inRange(hsv, (18, 175, 130), (32, 255, 255))
+            petal_purple = cv2.inRange(hsv, (128, 140, 100), (154, 255, 255))
             petal_mask = cv2.bitwise_or(
                 cv2.bitwise_or(petal_red1, petal_red2),
                 cv2.bitwise_or(petal_yellow, petal_purple),
             )
             petal_ratio = float(np.count_nonzero(petal_mask)) / total_px
-            if 0.05 <= petal_ratio <= 0.65:
-                fl_conf = round(min(0.92, 0.62 + min(petal_ratio, 0.25) + min(foliage_ratio, 0.15) * 0.4), 2)
-                tags.append(("kwiaty / rosliny", fl_conf))
-                tags.append(("kwiaty", fl_conf))
+            if 0.05 <= petal_ratio <= 0.55:
+                k_fl = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                p_clean = cv2.morphologyEx(petal_mask, cv2.MORPH_OPEN, k_fl)
+                p_contours, _ = cv2.findContours(p_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                has_blossom_cluster = False
+                for cnt in p_contours:
+                    c_area = float(cv2.contourArea(cnt))
+                    c_ratio = c_area / total_px
+                    if not (0.018 <= c_ratio <= 0.45):
+                        continue
+                    bx, by, bw, bh = cv2.boundingRect(cnt)
+                    b_asp = float(bw) / float(max(1, bh))
+                    if not (0.35 <= b_asp <= 2.8):
+                        continue
+                    hull_a = float(cv2.contourArea(cv2.convexHull(cnt)))
+                    solidity = c_area / max(1.0, hull_a)
+                    # Reject flat sky/horizon bands stuck along top edge
+                    if solidity >= 0.48 and not (by <= 2 and bw >= int(w * 0.7)):
+                        has_blossom_cluster = True
+                        break
+                if has_blossom_cluster:
+                    fl_conf = round(min(0.92, 0.62 + min(petal_ratio, 0.25) + min(foliage_ratio, 0.15) * 0.4), 2)
+                    tags.append(("kwiaty / rosliny", fl_conf))
+                    tags.append(("kwiaty", fl_conf))
 
         warm_mask = cv2.inRange(hsv, (4, 120, 95), (22, 255, 255))
         warm_ratio = float(np.count_nonzero(warm_mask)) / total_px
@@ -597,11 +634,11 @@ class OnDemandObjectTagger:
                                 detail_tag = self._format_detailed_imagenet_tag(en_lbl)
                                 if detail_tag:
                                     results.append((detail_tag, round(p, 3), "onnx_detail"))
-                                # Also match category via PL_CATEGORY_MAPPING if not covered by index rules
+                                # Also match category via PL_CATEGORY_MAPPING using strict word boundaries
                                 norm_en = normalize_pl(en_lbl)
                                 for pl_cat, words in PL_CATEGORY_MAPPING.items():
                                     if any(
-                                        len(normalize_pl(w)) >= 4 and normalize_pl(w) in norm_en
+                                        len(normalize_pl(w)) >= 4 and _label_matches_token(norm_en, normalize_pl(w))
                                         for w in words
                                     ):
                                         if p >= 0.20:
@@ -671,7 +708,9 @@ class OnDemandObjectTagger:
 
         target_indices: Set[int] = set()
         if "kwiaty / rosliny" in matched_cats:
-            target_indices.update(_FLOWER_PLANT_INDICES)
+            target_indices.update(_PURE_FLOWER_INDICES)
+        if "grzyby" in matched_cats:
+            target_indices.update(_MUSHROOM_INDICES)
         if "pies" in matched_cats:
             target_indices.update(range(151, 269))
         if "kot" in matched_cats:
@@ -699,7 +738,8 @@ class OnDemandObjectTagger:
         if "pogoda / akcesoria" in matched_cats:
             target_indices.update(_WEATHER_ACC_INDICES)
 
-        # Match directly against all 1000 loaded ImageNet labels (handles rare words like 'umbrella', 'vase', 'guitar', etc.)
+        # Match directly against all 1000 loaded ImageNet labels using strict word boundaries
+        # (prevents e.g. 'flower' -> 'cauliflower', 'pot' -> 'potter's wheel', 'ear' -> 'bear', 'hip' -> 'ship')
         if self.labels is not None:
             items_iter = (
                 enumerate(self.labels)
@@ -708,7 +748,7 @@ class OnDemandObjectTagger:
             )
             for idx, lbl in items_iter:
                 norm_lbl = normalize_pl(str(lbl))
-                if any(len(tok) >= 3 and tok in norm_lbl for tok in tokens):
+                if any(len(tok) >= 3 and _label_matches_token(norm_lbl, tok) for tok in tokens):
                     target_indices.add(int(idx))
 
         return target_indices, matched_cats, tokens
@@ -719,7 +759,7 @@ class OnDemandObjectTagger:
         keyword: str,
         limit_scan: int = 3000,
         thumbnails_dir: Optional[Path] = None,
-        confidence_threshold: float = 0.06,
+        confidence_threshold: float = 0.15,
     ) -> Dict[str, Any]:
         """
         Task 1: On-Demand ONNX + OpenCV HSV scanner operating strictly on local WebP thumbnails

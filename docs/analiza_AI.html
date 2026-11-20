@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kompendium Analiz AI, Miniatur i Algorytmu Dat — Domowe Archiwum Foto</title>
+    <style>
+        :root {
+            --bg-main: #090d16;
+            --bg-card: #111827;
+            --bg-soft: #1a243d;
+            --bg-code: #06090f;
+            --border: #253356;
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --indigo: #6366f1;
+            --sky: #38bdf8;
+            --emerald: #34d399;
+            --amber: #fbbf24;
+            --orange: #fb923c;
+            --rose: #fb7185;
+            --purple: #c084fc;
+        }
+        * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg-main);
+            color: var(--text-main);
+            line-height: 1.65;
+            padding: 2rem 1.5rem 4rem;
+        }
+        .container {
+            max-width: 1280px;
+            margin: 0 auto;
+        }
+        header.hero {
+            background: linear-gradient(135deg, #131b2e 0%, #2e1065 50%, #0f172a 100%);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 2.2rem 2rem;
+            margin-bottom: 2rem;
+        }
+        header.hero h1 {
+            margin: 0 0 0.5rem 0;
+            font-size: 2rem;
+            color: #fff;
+        }
+        header.hero p {
+            margin: 0;
+            color: #cbd5e1;
+            font-size: 1rem;
+            max-width: 960px;
+        }
+        h2 {
+            font-size: 1.45rem;
+            color: #fff;
+            border-left: 4px solid var(--purple);
+            padding-left: 0.85rem;
+            margin-top: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        h3 {
+            font-size: 1.12rem;
+            color: var(--sky);
+            margin-top: 1.25rem;
+            margin-bottom: 0.5rem;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 0.9rem;
+            padding: 1.5rem 1.75rem;
+            margin-bottom: 1.5rem;
+        }
+        .card.purple { border-left: 5px solid var(--purple); }
+        .card.emerald { border-left: 5px solid var(--emerald); }
+        .card.sky { border-left: 5px solid var(--sky); }
+        .card.amber { border-left: 5px solid var(--amber); }
+        .card.rose { border-left: 5px solid var(--rose); }
+        .badge {
+            display: inline-block;
+            padding: 0.18rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-right: 0.4rem;
+        }
+        .b-thumb { background: rgba(52, 211, 153, 0.15); color: var(--emerald); border: 1px solid var(--emerald); }
+        .b-phys { background: rgba(251, 113, 133, 0.15); color: var(--rose); border: 1px solid var(--rose); }
+        .b-db { background: rgba(56, 189, 248, 0.15); color: var(--sky); border: 1px solid var(--sky); }
+        .b-auto { background: rgba(192, 132, 252, 0.15); color: var(--purple); border: 1px solid var(--purple); }
+        .b-manual { background: rgba(251, 191, 36, 0.15); color: var(--amber); border: 1px solid var(--amber); }
+        code, pre {
+            font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+            font-size: 0.86rem;
+        }
+        code {
+            background: var(--bg-code);
+            border: 1px solid var(--border);
+            padding: 0.12rem 0.4rem;
+            border-radius: 0.3rem;
+            color: var(--emerald);
+        }
+        pre {
+            background: var(--bg-code);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 1rem 1.25rem;
+            overflow-x: auto;
+            color: #cbd5e1;
+        }
+        pre code { background: none; border: none; padding: 0; color: inherit; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.88rem;
+        }
+        th, td {
+            border: 1px solid var(--border);
+            padding: 0.65rem 0.8rem;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background: var(--bg-soft);
+            color: #fff;
+            font-weight: 600;
+        }
+        tr:nth-child(even) td { background: rgba(15, 23, 42, 0.35); }
+        .ui-btn {
+            display: inline-block;
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            color: #fff;
+            padding: 0.1rem 0.5rem;
+            border-radius: 0.38rem;
+            font-size: 0.83rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1.15rem;
+            margin-top: 1rem;
+        }
+        .box {
+            background: var(--bg-soft);
+            border: 1px solid var(--border);
+            border-radius: 0.65rem;
+            padding: 1rem 1.15rem;
+            font-size: 0.9rem;
+        }
+        .box h4 {
+            margin: 0 0 0.4rem 0;
+            color: #fff;
+            font-size: 0.98rem;
+        }
+        .callout {
+            border-left: 4px solid var(--emerald);
+            background: rgba(52, 211, 153, 0.08);
+            padding: 0.95rem 1.2rem;
+            border-radius: 0 0.6rem 0.6rem 0;
+            margin: 1rem 0;
+        }
+        .callout.amber {
+            border-left-color: var(--amber);
+            background: rgba(251, 191, 36, 0.09);
+        }
+        ul, ol { padding-left: 1.35rem; margin: 0.5rem 0; }
+        li { margin-bottom: 0.4rem; }
+        footer {
+            margin-top: 3rem;
+            border-top: 1px solid var(--border);
+            padding-top: 1.25rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <header class="hero">
+        <h1>⚡ Kompendium Analiz AI, Miniatur i Algorytmu Dat — Domowe Archiwum Foto</h1>
+        <p>
+            Szczegółowa specyfikacja wszystkich modułów analitycznych systemu: gdzie powstają i leżą miniatury, co zbiera się automatycznie podczas skanowania dysku, a co na żądanie w oknie <strong>⚡ Analizuj AI</strong> lub w trakcie wyszukiwania, z jakich danych korzysta każdy silnik (miniatury WebP vs fizyczne pliki na dyskach USB) oraz jak krok po kroku używać każdej analizy.
+        </p>
+    </header>
+
+    <!-- ================================================================= -->
+    <!-- SEKCJA 1: MINIATURY WEBP — GDZIE SĄ I JAK POWSTAJĄ                -->
+    <!-- ================================================================= -->
+    <h2>1. Gdzie są przechowywane miniatury i jak są zbierane?</h2>
+
+    <div class="card emerald">
+        <h3>Lokalizacja na dysku i format miniatur</h3>
+        <ul>
+            <li><strong>Ścieżka fizyczna:</strong> Wszystkie miniatury są zapisywane na lokalnym dysku komputera (SSD/NVMe) w katalogu projektu:
+                <code>data/thumbnails/{media_id}.webp</code> (gdzie <code>{media_id}</code> to unikalny identyfikator UUID pliku w bazie SQLite, np. <code>a1b2c3d4-...webp</code>).</li>
+            <li><strong>Parametry techniczne:</strong> Format <strong>WebP</strong>, maksymalny wymiar dłuższego boku <strong>300 px</strong> (z zachowaniem proporcji <em>aspect ratio</em> oraz z automatycznym obrotem orientacji EXIF <code>ImageOps.exif_transpose</code>), jakość kompresji <code>78%</code>. Pojedyncza miniatura zajmuje średnio tylko <strong>10–20 KB</strong>.</li>
+            <li><strong>Atomowy zapis:</strong> Klasa <code>ThumbnailService.generate()</code> (<code>app/scanner.py</code>) zapisuje miniaturę najpierw do pliku tymczasowego <code>.{media_id}.tmp.webp</code>, weryfikuje nagłówek RIFF/WEBP (<code>is_valid_thumbnail</code>) i dopiero wtedy atomowo podmienia plik docelowy.</li>
+        </ul>
+
+        <h3>Kiedy i jak zbierane są miniatury (3 momenty):</h3>
+        <div class="grid-2">
+            <div class="box">
+                <h4>1. Automatycznie w trakcie skanowania dysku (<span class="ui-btn">Skanuj dysk</span>)</h4>
+                <p>Dla każdego nowego zdjęcia lub filmu wykrytego na dysku USB skaner od razu tworzy miniaturę <code>.webp</code>:
+                <ul>
+                    <li><strong>Dla zdjęć:</strong> wielostopniowy dekoder (<code>Pillow</code> z akceleracją <code>img.draft</code> &rarr; <code>OpenCV cv2.imread</code> &rarr; ekstrakcja osadzonej ramki JPEG z RAW/uszkodzonego pliku <code>extract_embedded_frame</code>).</li>
+                    <li><strong>Dla wideo:</strong> <code>cv2.VideoCapture</code> pobiera klatkę z 1. sekundy filmu (lub klatkę 0), skaluje do 300 px i zapisuje jako <code>.webp</code>.</li>
+                    <li>Jeśli plik jest całkowicie uszkodzony, generowana jest czytelna plakietka zastępcza <em>„PLIK USZKODZONY”</em>.</li>
+                </ul>
+                </p>
+            </div>
+            <div class="box">
+                <h4>2. Naprawa podczas ponownego skanowania lub w locie (Lazy Regeneration)</h4>
+                <p>
+                    &bull; Podczas ponownego skanowania dysku, jeśli plik jest już w bazie, ale jego miniatura w <code>data/thumbnails/</code> została skasowana lub ma 0 bajtów, skaner automatycznie ją odtwarza.<br>
+                    &bull; Podczas przeglądania galerii (<code>GET /media/thumbnails/{filename}</code>), jeśli miniatura nie istnieje, a dysk z oryginałem (lub kopią zapasową!) jest aktualnie podłączony (ONLINE), serwer regeneruje miniaturę w locie.
+                </p>
+            </div>
+        </div>
+        <div class="callout">
+            <strong>Dlaczego miniatury są tak ważne dla AI i bezpieczeństwa?</strong><br>
+            Dzięki temu, że miniatury 300&times;300 px leżą na lokalnym dysku SSD w <code>data/thumbnails/</code>, aż <strong>4 moduły AI (Tagowanie obiektów, Szukanie głębiej słów kluczowych, Wektory podobieństwa 512-D oraz Rozpoznawanie twarzy 256-D)</strong> pracują wyłącznie na tych lokalnych miniaturach! Oznacza to <strong>zero konieczności podłączania dysków USB (100% praca Offline)</strong> oraz <strong>zero dotykania oryginalnych plików na dyskach zewnętrznych</strong>.
+        </div>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- SEKCJA 2: TABELA PORÓWNAWCZA WSZYSTKICH ANALIZ W SYSTEMIE         -->
+    <!-- ================================================================= -->
+    <h2>2. Zestawienie wszystkich analiz w systemie (Co zbiera się automatycznie, a co na żądanie?)</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Nazwa analizy</th>
+                <th>Na jakich danych się opiera?</th>
+                <th>Czy działa przy dysku OFFLINE?</th>
+                <th>Czy zbiera się automatycznie przy skanowaniu?</th>
+                <th>Kiedy jeszcze się zbiera?</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>1. Wektory podobieństwa wizualnego 512-D</strong><br>(CIE LAB + HSV + Krawędzie Sobel)</td>
+                <td><span class="b b-thumb">MINIATURA WEBP</span><br>(<code>data/thumbnails/</code>)</td>
+                <td><strong>TAK (100% Offline)</strong></td>
+                <td><span class="b b-auto">TAK — AUTOMATYCZNIE</span><br>Dla każdego nowego zdjęcia podczas <span class="ui-btn">Skanuj dysk</span>.</td>
+                <td>
+                    &bull; W locie w pamięci RAM po kliknięciu <span class="ui-btn">🔍 Podobne</span> (jeśli zdjęcie nie miało wektora).<br>
+                    &bull; Na żądanie w <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>Tylko Wektory 512-D</em>.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>2. Tagowanie obiektów, scen i kwiatów</strong><br>(ONNX MobileNetV2 1000 klas + OpenCV HSV)</td>
+                <td><span class="b b-thumb">MINIATURA WEBP</span><br>(<code>data/thumbnails/</code>)</td>
+                <td><strong>TAK (100% Offline)</strong></td>
+                <td><span class="b b-manual">NIE (Na żądanie)</span><br>Aby nie spowalniać pierwszego skanowania dysku USB.</td>
+                <td>
+                    &bull; Na żądanie w <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>Tagowanie Obiektów</em> lub <em>Wszystkie analizy AI</em>.<br>
+                    &bull; <strong>W trakcie wyszukiwania</strong> po kliknięciu przycisku <span class="ui-btn">🧠 Szukaj głębiej na miniaturach AI</span>.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>3. Indeksowanie i rozpoznawanie twarzy (osób) 256-D</strong><br>(YuNet / Haar + YCrCb + HOG/LAB/SFace)</td>
+                <td><span class="b b-thumb">MINIATURA WEBP</span><br>(<code>data/thumbnails/</code>)</td>
+                <td><strong>TAK (100% Offline)</strong></td>
+                <td><span class="b b-manual">NIE (Na żądanie)</span></td>
+                <td>
+                    &bull; Na żądanie w <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>👤 Indeksowanie twarzy na miniaturach</em>.<br>
+                    &bull; <strong>Automatycznie w locie</strong> po kliknięciu <span class="ui-btn">👤 Ta sama osoba</span> (jeśli baza twarzy jest jeszcze pusta, skanuje w locie miniatury portretów).
+                </td>
+            </tr>
+            <tr>
+                <td><strong>4. Detekcja ostrości (Blur), ekspozycji i uszkodzonych plików</strong><br>(Siatka 8&times;8 Laplacian + Histogram)</td>
+                <td><span class="b b-phys">FIZYCZNY PLIK NA DYSKU</span><br>(Wymaga oryginału!)</td>
+                <td><strong>NIE (Tylko ONLINE)</strong><br>Pliki Offline są pomijane.</td>
+                <td><span class="b b-manual">NIE (Na żądanie)</span><br>(Przy skanowaniu sprawdzane jest tylko, czy plik w ogóle daje się zdekodować do miniatury).</td>
+                <td>
+                    &bull; Wyłącznie na żądanie w <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>🔍 Detekcja ostrości (Blur), ekspozycji i uszkodzeń</em> (lub <em>Wszystkie analizy AI</em>) przy podłączonym dysku.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>5. Szybka analiza duplikatów i backupów</strong><br>(Klastrowanie ról SQL)</td>
+                <td><span class="b b-db">BAZA SQLITE</span><br>(Hash <code>file_hash</code> obliczony przy skanowaniu)</td>
+                <td><strong>TAK (100% Offline)</strong></td>
+                <td><span class="b b-auto">HASH: TAK</span> (przy skanowaniu)<br><span class="b b-manual">ROLE KLASTRA: Na żądanie</span></td>
+                <td>
+                    &bull; W <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>⚡ Szybka analiza duplikatów</em>.<br>
+                    &bull; Automatycznie po otwarciu okna <span class="ui-btn">🛡️ Backup zdjęć/filmów</span> lub kliknięciu <span class="ui-btn">🔄 Aktualizuj tagi klastrów</span>.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>6. Dokładna analiza duplikatów 100%</strong><br>(Pełna weryfikacja binarna)</td>
+                <td><span class="b b-phys">FIZYCZNE PLIKI NA DYSKACH</span><br>(SHA-256 + BLAKE2b + MD5 + <code>filecmp</code>)</td>
+                <td><strong>NIE (Tylko ONLINE)</strong><br>Wymaga podłączonych dysków z kopiami.</td>
+                <td><span class="b b-manual">NIE (Na żądanie)</span></td>
+                <td>
+                    &bull; W <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>🔬 Dokładna analiza duplikatów 100%</em>.<br>
+                    &bull; Automatycznie przed usunięciem każdego duplikatu.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>7. Analiza plików bez kopii zapasowej (backupu)</strong><br>(Wykrywanie <code>unbacked</code>)</td>
+                <td><span class="b b-db">BAZA SQLITE</span><br>(Porównanie <code>file_hash</code> i <code>volume_id</code>)</td>
+                <td><strong>TAK (100% Offline)</strong></td>
+                <td><span class="b b-manual">Na żądanie / w panelu</span></td>
+                <td>
+                    &bull; W <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>🛡️ Analiza zdjęć bez kopii zapasowej</em>.<br>
+                    &bull; Automatycznie w pasku bocznym i po otwarciu <span class="ui-btn">🛡️ Backup zdjęć/filmów</span>.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>8. Analiza niezgodności dat</strong><br>(EXIF &rarr; Modyfikacja <code>mtime</code> vs Nazwa i Ścieżka)</td>
+                <td><span class="b b-db">BAZA SQLITE</span> + <span class="b b-phys">METADANE PLIKU</span> (gdy Online)</td>
+                <td><strong>TAK (Offline z bazy / Online z odświeżeniem EXIF i stat)</strong></td>
+                <td><span class="b b-auto">TAK — AUTOMATYCZNIE</span><br>Dla każdego pliku już podczas <span class="ui-btn">Skanuj dysk</span>.</td>
+                <td>
+                    &bull; W <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>📅 Analiza niezgodności dat</em>.<br>
+                    &bull; Po kliknięciu <span class="ui-btn">🔄 Przelicz źródła dat</span> w widoku <em>Niezgodność dat</em>.
+                </td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ================================================================= -->
+    <!-- SEKCJA 3: SZCZEGÓŁOWY OPIS KAŻDEJ ANALIZY I JAK Z NIEJ KORZYSTAĆ  -->
+    <!-- ================================================================= -->
+    <h2>3. Szczegółowy opis działania analiz i instrukcja krok po kroku</h2>
+
+    <!-- ANALIZA 1: TAGOWANIE OBIEKTÓW I SZUKANIE GŁĘBIEJ -->
+    <div class="card purple">
+        <h3>3.1. Tagowanie Obiektów, Scen i Kwiatów (<code>OnDemandObjectTagger</code> — 1000 klas ImageNet + HSV)</h3>
+        <p>
+            <span class="badge b-thumb">Dane: Miniatury WebP (100% Offline)</span>
+            <span class="badge b-manual">Zbieranie: W oknie „Analizuj AI” oraz przyciskiem „Szukaj głębiej” w wyszukiwarce</span>
+        </p>
+        <p><strong>Jak działa pod maską:</strong></p>
+        <ul>
+            <li>Model sieci neuronowej <code>MobileNetV2-12.onnx</code> (ładowany na żądanie do CPU i zwalniany od razu po zakończeniu zadania) analizuje miniaturę 300&times;300 px przyciętą centralnie (Center Crop 224&times;224, bez deformacji proporcji obiektu).</li>
+            <li><strong>Dwupoziomowy zapis tagów (Zero utraty informacji):</strong>
+                <ol>
+                    <li><strong>Poziom 1 (Kategoria główna, <code>source_model="opencv+onnx"</code>):</strong> przypisuje czytelną polską kategorię z <code>PL_CATEGORY_MAPPING</code> (np. <code>kwiaty / rosliny</code>, <code>pies</code>, <code>kot</code>, <code>samochod / pojazd</code>, <code>gory / szczyty</code>, <code>morze / woda / jezioro</code>). Kategorie te są widoczne w lewym panelu bocznym (<em>Top 35 tagów</em>).</li>
+                    <li><strong>Poziom 2 (Szczegółowa klasa z 1000 pojęć ImageNet, <code>source_model="onnx_detail"</code>):</strong> zachowuje dokładną polską i angielską nazwę rozpoznanego obiektu spośród wszystkich 1000 klas modelu (np. <code>stokrotka (daisy)</code>, <code>storczyk (yellow lady's slipper)</code>, <code>doniczka (flowerpot)</code>, <code>wazon (vase)</code>, <code>rower</code>, <code>zamek (castle)</code>, <code>grzyb (mushroom)</code>). Dzięki temu nie zaśmiecają one paska bocznego, ale każde z 1000 słów można wpisać w pole <em>„Szukaj...”</em>!</li>
+                </ol>
+            </li>
+            <li><strong>Dodatkowe detektory OpenCV na miniaturze:</strong>
+                <ul>
+                    <li><em>Heurystyka kwiatów HSV:</em> wykrywa nasycone skupiska płatków (czerwone, różowe, żółte, fioletowe) otoczone zielenią liści i nadaje tagi <code>kwiaty / rosliny</code> oraz <code>kwiaty</code>.</li>
+                    <li><em>Analiza sceny i pory dnia:</em> rozpoznaje <code>noc / ciemne</code>, <code>zachod slonca</code>, <code>snieg / zima</code>, <code>las / drzewa</code>, <code>dokument / tekst</code>.</li>
+                </ul>
+            </li>
+        </ul>
+        <p><strong>Jak korzystać krok po kroku:</strong></p>
+        <ol>
+            <li><strong>Masowe otagowanie archiwum (Offline):</strong> Kliknij <span class="ui-btn">⚡ Analizuj AI</span> &rarr; wybierz <em>🏷️ Tylko Tagowanie Obiektów i Scen</em> &rarr; zakres: <em>🌐 Wszystkie dyski w bazie danych</em> &rarr; <span class="ui-btn">▶️ Wystartuj Analizę</span>. (Aby znaleźć zdjęcia, które nie mają jeszcze żadnych tagów, kliknij w lewym menu <em>🏷️ Brak tagów AI</em>).</li>
+            <li><strong>Wyszukiwanie na żądanie („Szukaj głębiej”):</strong> Wpisz w pasek wyszukiwania dowolne słowo (np. <code>kwiaty</code>, <code>stokrotka</code>, <code>rower</code>, <code>wazon</code>) i naciśnij <kbd>Enter</kbd>. Jeśli chcesz, aby model AI przejrzał pod kątem tego słowa również zdjęcia, które nie były wcześniej otagowane, kliknij fioletowy przycisk nad wynikami: <span class="ui-btn">🧠 Szukaj głębiej na miniaturach AI („fraza”)</span>.</li>
+            <li><strong>Ręczne dodawanie własnych tagów:</strong> Zaznacz zdjęcia i kliknij <span class="ui-btn">🏷️ Dodaj tag</span> na górnym pasku (lub dopisz tag w oknie szczegółów zdjęcia). Tagi ręczne (<code>source_model="manual"</code>) są trwale chronione i nigdy nie zostaną skasowane przez ponowną analizę AI.</li>
+        </ol>
+    </div>
+
+    <!-- ANALIZA 2: ROZPOZNAWANIE TWARZY I TEJ SAMEJ OSOBY -->
+    <div class="card purple">
+        <h3>3.2. Indeksowanie i Rozpoznawanie Twarzy — Wyszukiwanie Tej Samej Osoby (<code>OnDemandFaceEmbedder</code>, 256-D)</h3>
+        <p>
+            <span class="badge b-thumb">Dane: Miniatury WebP (100% Offline)</span>
+            <span class="badge b-manual">Zbieranie: W oknie „Analizuj AI” lub automatycznie w locie po kliknięciu „Ta sama osoba”</span>
+        </p>
+        <p><strong>Jak działa pod maską:</strong></p>
+        <ul>
+            <li>Czyta wyłącznie lokalną miniaturę z <code>data/thumbnails/</code> i przepuszcza ją przez 3-poziomowy lokalny detektor twarzy (1. <code>YuNet ONNX</code> &rarr; 2. kaskady <code>Haar Frontal/Profile + Eye</code> z walidacją odcienia skóry w przestrzeni <code>YCrCb</code> &rarr; 3. wbudowany detektor owalu cery i wewnętrznego kontrastu rysów oczu/ust).</li>
+            <li>Dla każdej wykrytej twarzy na zdjęciu (np. 3 osób na zdjęciu grupowym: <code>face_index = 0, 1, 2</code>) wycina <strong>wyłącznie owalny obszar samej twarzy</strong> (całkowicie odrzucając tło i ubranie), wyrównuje oświetlenie algorytmem <code>CLAHE</code> i wylicza 256-wymiarowy wektor tożsamości twarzy (<code>256-D float32</code>: siatka 4&times;4 gradientów HOG rysów twarzy + lokalny kontrast strukturalny + profil barwny CIE LAB + cechy <code>SFace</code>/<code>MobileNetV2</code>).</li>
+            <li>Zapisuje wykryte twarze w tabeli SQLite <code>media_faces</code> wraz ze współrzędnymi ramki <code>bbox_json</code> i opcjonalnym imieniem <code>person_name</code>.</li>
+        </ul>
+        <p><strong>Jak korzystać krok po kroku:</strong></p>
+        <ol>
+            <li><strong>Krok 1 (Zindeksowanie twarzy w tle — 100% Offline):</strong> Kliknij <span class="ui-btn">⚡ Analizuj AI</span> &rarr; wybierz <em>👤 Indeksowanie twarzy na miniaturach</em> &rarr; zakres: <em>🌐 Wszystkie dyski w bazie danych</em> &rarr; <span class="ui-btn">▶️ Wystartuj Analizę</span>.</li>
+            <li><strong>Krok 2 (Wyszukanie konkretnej osoby z dowolnego zdjęcia):</strong>
+                <ul>
+                    <li>Otwórz szczegóły zdjęcia (<span class="ui-btn">ℹ️ Szczegóły</span>). Jeśli na zdjęciu jest kilka osób, zobaczysz osobne przyciski dla każdej wykrytej twarzy: <span class="ui-btn">👤 Twarz #1</span>, <span class="ui-btn">👤 Twarz #2</span> itd.</li>
+                    <li>Kliknij wybraną twarz (lub kliknij <span class="ui-btn">🔍 Podobne</span> i wybierz tryb <strong>👤 Ta sama osoba</strong>). System w kilkanaście milisekund porówna wektor 256-D wybranej twarzy ze wszystkimi twarzami w bazie i wyświetli zdjęcia tej samej osoby!</li>
+                </ul>
+            </li>
+            <li><strong>Krok 3 (Nazwanie osoby):</strong> Nad wynikami wyszukiwania wpisz imię (np. <code>Ania</code>, <code>Marek</code>, <code>Babcia Zosia</code>) i kliknij <span class="ui-btn">🏷️ Zapisz imię osoby</span>. System przypisze imię do tej twarzy oraz doda tag <code>osoba:Ania</code>, dzięki czemu od tej pory znajdziesz wszystkie zdjęcia tej osoby wpisując po prostu <code>Ania</code> w główną wyszukiwarkę!</li>
+        </ol>
+    </div>
+
+    <!-- ANALIZA 3: WEKTORY PODOBIEŃSTWA 512-D -->
+    <div class="card emerald">
+        <h3>3.3. Wektory Podobieństwa Wizualnego 512-D (<code>OnDemandClipEmbedder</code>)</h3>
+        <p>
+            <span class="badge b-thumb">Dane: Miniatury WebP (100% Offline)</span>
+            <span class="badge b-auto">Zbieranie: AUTOMATYCZNIE przy skanowaniu dysku + w locie przy wyszukiwaniu podobnych</span>
+        </p>
+        <p><strong>Jak działa pod maską:</strong></p>
+        <ul>
+            <li>Podczas skanowania dysku (zarówno przy pierwszym skanie, jak i przy odświeżaniu podczas re-skanu) dla każdej miniatury 300&times;300 px wyliczany jest 512-wymiarowy wektor zmiennoprzecinkowy <code>float32</code> (2048 bajtów w tabeli <code>media_embeddings</code>):
+                <ul>
+                    <li><code>Bity 0..191 (192-D):</code> Siatka przestrzenna 8&times;8 w percepcyjnej przestrzeni barw <strong>CIE LAB</strong> (układ kompozycyjny kadru — idealny do szukania zdjęć seryjnych i prawie identycznych ujęć).</li>
+                    <li><code>Bity 192..447 (256-D):</code> Dwustrefowy histogram <strong>HSV</strong> (oddzielnie dla centrum kadru i obrzeży — idealny do szukania tej samej palety barw, np. kwiatów, morza, zachodu słońca).</li>
+                    <li><code>Bity 448..511 (64-D):</code> Rozkład kierunków krawędzi i faktury <strong>Sobel</strong> (orientacja kształtów i architektury).</li>
+                </ul>
+            </li>
+        </ul>
+        <p><strong>Jak korzystać krok po kroku:</strong></p>
+        <ol>
+            <li>Kliknij przycisk <span class="ui-btn">🔍 Podobne</span> na dowolnym kafelku zdjęcia lub w podglądzie pełnoekranowym.</li>
+            <li>Na fioletowym pasku nad wynikami przełączaj pomiędzy trybami: <em>🧠 Hybrydowe</em>, <em>🎯 Prawie identyczne / Seria (Układ 8x8 LAB)</em>, <em>🏷️ Te same obiekty i scena</em>, <em>🎨 Paleta barw i klimat (HSV)</em>, <em>📅 Ta sama sesja / Wydarzenie</em>, <em>👤 Kompozycja i Kadr</em> oraz <em>👤 Ta sama osoba</em>.</li>
+            <li>Jeśli w lewym pasku bocznym w sekcji <em>📐 Brak wektorów 512-D</em> widnieją starsze pliki (np. po przywróceniu lekkiej kopii bazy SQLite bez wektorów), kliknij <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>📐 Tylko Wektory Podobieństwa 512-D</em>, aby odtworzyć je w kilka sekund z lokalnych miniatur (Offline).</li>
+        </ol>
+    </div>
+
+    <!-- ANALIZA 4: OSTROŚĆ, EKSPOZYCJA I WADY JAKOŚCI -->
+    <div class="card rose">
+        <h3>3.4. Detekcja Ostrości (Blur), Ekspozycji i Uszkodzonych Plików (<code>MediaQualityAnalyzer</code>)</h3>
+        <p>
+            <span class="badge b-phys">Dane: FIZYCZNE PLIKI ORYGINALNE NA DYSKU USB (Wymaga dysku ONLINE!)</span>
+            <span class="badge b-manual">Zbieranie: Na żądanie w oknie „Analizuj AI”</span>
+        </p>
+        <p><strong>Dlaczego ta jedyna analiza AI wymaga podłączonego dysku fizycznego i nie działa na miniaturach?</strong></p>
+        <p>
+            Miniatura 300&times;300 px jest pomniejszona i skompresowana stratnie do WebP — badanie na niej ostrości lub uszkodzeń pliku dawałoby fałszywe wyniki (np. lekko nieostre zdjęcie po pomniejszeniu do 300 px wydaje się ostre, a uszkodzony w połowie plik RAW mógł mieć poprawną małą miniaturę EXIF). Dlatego <code>MediaQualityAnalyzer</code> **zawsze otwiera oryginalny plik na dysku USB**, a pliki z odłączonych dysków bezpiecznie pomija (<code>skipped_offline</code>).
+        </p>
+        <p><strong>Jak działa pod maską:</strong></p>
+        <ul>
+            <li>Skaluje oryginalne zdjęcie do rozdzielczości roboczej 1024 px, dzieli środek kadru na siatkę 8&times;8 (64 strefy) i liczy wariancję operatora <strong>Laplaciana</strong> dla najostrzejszych stref głównych (dzięki czemu portret z ostrym pierwszym planem i rozmytym tłem <em>bokeh</em> NIE jest błędnie oznaczany jako rozmyty!).</li>
+            <li>Bada histogram luminancji (średnią jasność, 5. i 95. percentyl oraz odchylenie standardowe detali) i klasyfikuje wykryte wady do 6 precyzyjnych tagów w tabeli <code>media_tags</code> (<code>source_model="quality_check"</code>):
+                <ul>
+                    <li><code>do_usuniecia:uszkodzone</code> — nieczytelny strumień bajtów lub uszkodzony nagłówek pliku.</li>
+                    <li><code>do_usuniecia:rozmyte</code> — wskaźnik ostrości Laplaciana <code>blur_score &lt; 45.0</code>.</li>
+                    <li><code>do_usuniecia:niedoswietlone</code> — ciemny kadr (średnia jasność &lt; 15.0 lub 95. percentyl &lt; 38.0).</li>
+                    <li><code>do_usuniecia:przeswietlone</code> — przepalony kadr (średnia jasność &gt; 243.0 lub 5. percentyl &gt; 220.0).</li>
+                    <li><code>do_usuniecia:brak_detali</code> — jednolite tło z kieszeni lub dekielka (odchylenie standardowe luminancji &lt; 6.5).</li>
+                    <li><code>do_usuniecia:niska_rozdzielczosc</code> — dłuższy bok oryginału &lt; 160 px.</li>
+                </ul>
+            </li>
+        </ul>
+        <p><strong>Jak korzystać krok po kroku:</strong></p>
+        <ol>
+            <li>Podłącz dysk USB ze zdjęciami. (W lewym menu pozycja <em>🔍 Niezbadana jakość / ostrość</em> pokaże Ci wszystkie zdjęcia, które nie były jeszcze badane).</li>
+            <li>Kliknij <span class="ui-btn">⚡ Analizuj AI</span> &rarr; wybierz <em>🔍 Detekcja ostrości (Blur), ekspozycji, uszkodzeń i zdjęć do usunięcia</em> &rarr; <span class="ui-btn">▶️ Wystartuj Analizę</span>.</li>
+            <li>Po zakończeniu przejrzyj w lewym menu sekcję <strong>⚠️ Wady jakości (do usunięcia)</strong>. Zdjęcia fałszywie zaklasyfikowane odznacz przyciskiem <span class="ui-btn">✓ Oznacz jako bez wady / nieuszkodzone</span>, a prawdziwe śmieci przenieś do Kosza (<span class="ui-btn">🗑️ Przenieś do Kosza</span>).</li>
+        </ol>
+    </div>
+
+    <!-- ANALIZA 5: NOWA ANALIZA NIEZGODNOŚCI DAT -->
+    <div class="card amber">
+        <h3>3.5. Analiza Niezgodności Dat — Nowy Algorytm (EXIF &rarr; Data modyfikacji pliku <code>mtime</code>)</h3>
+        <p>
+            <span class="badge b-db">Dane: Metadane EXIF, Modyfikacja (mtime), Utworzenie (ctime), Nazwa pliku i Ścieżka folderu</span>
+            <span class="badge b-auto">Zbieranie: AUTOMATYCZNIE przy skanowaniu + na żądanie w „Analizuj AI” / „Przelicz źródła dat”</span>
+        </p>
+
+        <div class="callout amber">
+            <strong>Nowa specyfikacja wyznaczania Daty Efektywnej (<code>effective_date</code>) i Anomalii Daty (<code>has_date_anomaly</code>):</strong>
+            <ol>
+                <li>
+                    <strong>Krok A — Data EXIF ma najwyższy priorytet:</strong><br>
+                    Jeśli zdjęcie posiada prawidłową datę w metadanych <strong>EXIF</strong> (<code>DateTimeOriginal</code> / <code>DateTimeDigitized</code> / <code>DateTime</code>), to <strong>data EXIF staje się datą efektywną (<code>effective_date = exif_date</code>)</strong>, a zdjęcie <strong>NIE ma anomalii daty</strong> (<code>has_date_anomaly = False</code>, <code>date_anomaly_reason = None</code>).
+                </li>
+                <li>
+                    <strong>Krok B — Gdy brak EXIF, datą efektywną jest zawsze Data Modyfikacji pliku (<code>fs_mtime</code>):</strong><br>
+                    Jeśli plik nie posiada daty EXIF, to <strong>sam brak EXIF NIE jest anomalią</strong>. Jako datę efektywną przyjmujemy <strong>datę modyfikacji zdjęcia (<code>effective_date = fs_mtime</code>)</strong> — nawet wtedy, gdy różni się ona od daty utworzenia pliku (<code>fs_ctime</code>), daty w nazwie pliku czy daty w ścieżce folderu!
+                    <br><em>Dlaczego <code>fs_mtime</code>, a nie <code>fs_ctime</code>?</em> Ponieważ podczas kopiowania zdjęć między dyskami w systemie Windows system operacyjny nadpisuje datę utworzenia (<code>ctime</code>) datą dzisiejszego kopiowania, natomiast <strong>data modyfikacji (<code>mtime</code>) zachowuje oryginalny czas zapisania zdjęcia przez aparat/telefon</strong>!
+                </li>
+                <li>
+                    <strong>Krok C — Kiedy zgłaszana jest Niezgodność Daty (<code>has_date_anomaly = True</code>) przy braku EXIF?</strong><br>
+                    Wyznaczoną w Kroku B datę efektywną (czyli <code>fs_mtime</code>) porównujemy z dwoma źródłami kontekstowymi:
+                    <ul>
+                        <li><strong>Porównanie ze ścieżką folderu (<code>folder_date</code>):</strong> jeśli w ścieżce katalogów występuje data (np. folder <code>2021-07_Wakacje</code> lub <code>2021</code>), a data efektywna (<code>fs_mtime</code>) nie zgadza się z rokiem/miesiącem w ścieżce &rarr; flagujemy anomalię i dodajemy powód: <code>"Niezgodność dat: data efektywna (RRRR-MM-DD) niezgodna z datą w ścieżce ('...')"</code>.</li>
+                        <li><strong>Porównanie z nazwą pliku (<code>filename_date</code>):</strong> jeśli w nazwie pliku zaszyta jest data (np. <code>IMG_20200512_143000.jpg</code>), a data efektywna (<code>fs_mtime</code>) różni się od niej o więcej niż 1 dzień &rarr; flagujemy anomalię i dodajemy powód: <code>"Niezgodność dat: data efektywna (RRRR-MM-DD) nie zgadza się z datą w nazwie pliku (RRRR-MM-DD)"</code>.</li>
+                    </ul>
+                </li>
+                <li>
+                    <strong>Krok D — Co NIE jest anomalią:</strong>
+                    <ul>
+                        <li><strong>Brak metadanych EXIF</strong> — nie jest anomalią.</li>
+                        <li><strong>Różnica między datą utworzenia (<code>fs_ctime</code>) a datą modyfikacji (<code>fs_mtime</code>)</strong> — <strong>NIE jest traktowana jako anomalia!</strong> Obie te daty są nadal czytelnie wypisywane informacyjnie w oknie szczegółów pliku (<code>Data pliku (utworz. / modyf.): ...</code>), ale różnica między nimi po skopiowaniu pliku na nowy dysk nie wrzuca zdjęcia na listę błędów.</li>
+                    </ul>
+                </li>
+            </ol>
+        </div>
+
+        <p><strong>Jak korzystać z analizy niezgodności dat krok po kroku:</strong></p>
+        <ol>
+            <li>Kliknij w lewym panelu bocznym <span class="ui-btn">⚠️ Niezgodność dat</span> (lub uruchom przeliczenie w <span class="ui-btn">⚡ Analizuj AI</span> &rarr; <em>📅 Analiza niezgodności dat</em> albo przyciskiem <span class="ui-btn">🔄 Przelicz źródła dat</span>).</li>
+            <li>Użyj przycisków filtrowania nad siatką, aby przejrzeć zdjęcia:
+                <ul>
+                    <li><span class="ui-btn">📂 Z nazwą folderu</span> — zdjęcia, których data efektywna (<code>mtime</code>) nie pasuje do daty w nazwie katalogu.</li>
+                    <li><span class="ui-btn">🏷️ Data pliku vs nazwa</span> — zdjęcia, których data efektywna (<code>mtime</code>) nie pasuje do daty zaszytej w nazwie pliku.</li>
+                </ul>
+            </li>
+            <li>Dla wybranych zdjęć możesz:
+                <ul>
+                    <li>Wpisać właściwą datę w polu <code>RRRR-MM-DD GG:MM</code> i kliknąć <span class="ui-btn">📅 Ustaw nową datę i usuń z listy</span>, albo</li>
+                    <li>Jeśli obecna data efektywna (<code>mtime</code>) jest prawidłowa, kliknąć <span class="ui-btn">✓ Usuń z listy niezgodności BEZ zmiany daty</span>.</li>
+                </ul>
+            </li>
+        </ol>
+    </div>
+
+    <!-- ANALIZA 6: ANALIZY DUPLIKATÓW I BACKUPÓW -->
+    <div class="card sky">
+        <h3>3.6. Analizy Duplikatów (Szybka SQL vs Dokładna 100%) oraz Analiza Brakujących Kopii (Backupów)</h3>
+        <p>
+            <span class="badge b-db">Szybka i Brakujące Backupy: Baza SQLite (100% Offline)</span>
+            <span class="badge b-phys">Dokładna 100%: Fizyczne pliki na dyskach (ONLINE)</span>
+        </p>
+        <ul>
+            <li><strong>⚡ Szybka analiza duplikatów (<code>duplicates_fast</code>):</strong> działa w 100% w bazie SQLite (Offline) na podstawie skrótów <code>file_hash</code> policzonych podczas skanowania (pełny SHA-256 dla obrazów, próbkowany 3&times;64 KB SHA-256 dla dużych wideo). Nadaje każdemu plikowi rolę w klastrze: <code>ORYGINAŁ</code>, <code>BACKUP</code> (zielony na innym dysku / pomarańczowy na tym samym dysku) lub <code>DUPLIKAT</code> (3. i kolejna kopia).</li>
+            <li><strong>🔬 Dokładna analiza duplikatów 100% (<code>duplicates_exact</code>):</strong> wymaga podłączonych dysków (ONLINE). Dla każdego klastra duplikatów porównuje pliki na dyskach 5-warstwowo (rozmiar + pełny SHA-256 + pełny BLAKE2b + pełny MD5 + porównanie bajt-po-bajcie <code>filecmp.cmp</code>) i zapisuje potwierdzony skrót w kolumnie <code>verified_sha256</code> (rozdzielając ewentualne kolizje częściowego hasha wideo).</li>
+            <li><strong>🛡️ Analiza zdjęć bez kopii zapasowej (<code>unbacked</code>):</strong> działa w 100% w bazie SQLite (Offline). Wyszukuje wszystkie unikalne Oryginały, które nie posiadają jeszcze zielonego backupu na innym urządzeniu fizycznym. Wyniki zobaczysz w lewym panelu pod pozycją <em>🛡️ Brak backupu na innym dysku</em> oraz w oknie <span class="ui-btn">🛡️ Backup zdjęć/filmów</span>.</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================= -->
+    <!-- SEKCJA 4: INSTRUKCJA DLA AGENTA — WDROŻENIE NOWEGO ALGORYTMU DAT  -->
+    <!-- ================================================================= -->
+    <h2>4. Specyfikacja Techniczna dla Agenta — Aktualizacja Algorytmu Dat w Kodzie</h2>
+
+    <div class="card amber">
+        <h3>Co Agent ma zaktualizować w <code>app/scanner.py</code> i <code>app/database.py</code>, aby wdrożyć nowe działanie anomalii dat:</h3>
+        <ol>
+            <li>
+                <strong>W <code>MetadataDateResolver.evaluate_date_sources</code> (<code>app/scanner.py</code>, linie 283–356):</strong>
+                <ul>
+                    <li><strong>Krok A (EXIF):</strong> Jeśli <code>valid_exif is not None</code> &rarr; zwróć <code>return valid_exif, False, None</code> (bez zmian).</li>
+                    <li><strong>Krok B (Brak EXIF &rarr; Data modyfikacji <code>valid_mtime</code> jest zawsze datą efektywną!):</strong>
+                        Ustaw <code>effective = valid_mtime</code>. (Nigdy nie przełączaj <code>effective</code> na <code>ctime</code>, <code>fn_date</code> ani <code>folder_date</code>!).</li>
+                    <li><strong>Krok C (Sprawdzanie niezgodności wyłącznie wobec ścieżki folderu i nazwy pliku):</strong>
+                        <ul>
+                            <li>Usuń porównywanie <code>valid_ctime</code> z <code>valid_mtime</code>! Różnica między datą utworzenia a datą modyfikacji <strong>nie dodaje żadnego wpisu do <code>reasons</code></strong>.</li>
+                            <li>Jeśli istnieje <code>valid_folder</code> (<code>f_dt, f_prec, f_seg = valid_folder</code>) i <code>not cls.matches_folder_date(effective, f_dt, f_prec)</code> &rarr; dodaj do <code>reasons</code>:<br>
+                            <code>f"Niezgodność dat: data efektywna ({effective.strftime('%Y-%m-%d')}) niezgodna z datą w ścieżce ('{f_seg}')"</code>.</li>
+                            <li>Jeśli istnieje <code>valid_fn</code> i <code>not cls.dates_agree(effective, valid_fn, date_only=fn_date_only)</code> &rarr; dodaj do <code>reasons</code>:<br>
+                            <code>f"Niezgodność dat: data efektywna ({effective.strftime('%Y-%m-%d')}) nie zgadza się z datą w nazwie pliku ({valid_fn.strftime('%Y-%m-%d')})"</code>.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Krok D (Zwrot wyniku):</strong>
+                         Jeśli lista <code>reasons</code> jest pusta &rarr; zwróć <code>return effective, False, None</code>.
+                         W przeciwnym razie zwróć <code>return effective, True, "; ".join(reasons)[:255]</code> (zauważ, że <code>effective</code> to nadal <code>valid_mtime</code>!).</li>
+                </ul>
+            </li>
+            <li>
+                <strong>W migracji bazy <code>ensure_schema_migrations</code> (<code>app/database.py</code>) oraz w <code>recalculate_date_anomalies</code>:</strong>
+                <ul>
+                    <li>Wyczyść w istniejącej bazie dawne fałszywe anomalie wynikające wyłącznie z różnicy <code>ctime vs mtime</code> (<code>zmodyfikowane przy kopiowaniu</code>), jeśli nie towarzyszy im niezgodność z nazwą pliku lub ścieżką, oraz ustaw dla plików bez EXIF <code>effective_date = fs_mtime</code> przy uruchomieniu przeliczenia dat.</li>
+                </ul>
+            </li>
+        </ol>
+    </div>
+
+    <footer>
+        Domowe Archiwum Foto — Kompendium Analiz AI, Miniatur WebP i Algorytmu Dat (HTML5)
+    </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAPORT: Zachowanie Systemu przy Odłączonych Dyskach (OFFLINE vs ONLINE) — Domowe Archiwum Foto</title>
+    <style>
+        :root {
+            --bg: #090d16;
+            --card: #111827;
+            --code-bg: #06090f;
+            --bd: #1f2937;
+            --tx: #e5e7eb;
+            --mu: #9ca3af;
+            --ok: #10b981;
+            --ok-bg: rgba(16, 185, 129, 0.14);
+            --warn: #f59e0b;
+            --warn-bg: rgba(245, 158, 11, 0.14);
+            --crit: #ef4444;
+            --crit-bg: rgba(239, 68, 68, 0.14);
+            --acc: #60a5fa;
+            --acc-bg: rgba(96, 165, 250, 0.14);
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font: 14px/1.6 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--tx);
+            padding: 24px;
+        }
+        main { max-width: 1280px; margin: 0 auto; }
+        header {
+            border-bottom: 2px solid var(--crit);
+            padding-bottom: 16px;
+            margin-bottom: 24px;
+        }
+        h1 { font-size: 23px; margin: 0 0 6px 0; color: #fff; }
+        h2 {
+            font-size: 18px;
+            color: #fff;
+            border-left: 4px solid var(--acc);
+            padding-left: 10px;
+            margin-top: 32px;
+            margin-bottom: 14px;
+        }
+        h2.crit-h2 { border-left-color: var(--crit); }
+        h3 { margin: 0 0 8px 0; font-size: 15px; color: #fff; }
+        code {
+            font-family: 'JetBrains Mono', Consolas, monospace;
+            font-size: 12px;
+            background: var(--code-bg);
+            border: 1px solid var(--bd);
+            border-radius: 4px;
+            padding: 1px 5px;
+            color: #38bdf8;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--bd);
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin: 14px 0;
+        }
+        .card-crit { border-left: 5px solid var(--crit); }
+        .b {
+            display: inline-block;
+            font-weight: 700;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            text-transform: uppercase;
+        }
+        .b-OFF { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok); }
+        .b-QUEUE { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); }
+        .b-ON { background: var(--acc-bg); color: var(--acc); border: 1px solid var(--acc); }
+        .b-BLOCK { background: var(--crit-bg); color: var(--crit); border: 1px solid var(--crit); }
+        table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 12px 0; }
+        th, td { border: 1px solid var(--bd); padding: 8px 10px; text-align: left; vertical-align: top; }
+        th { background: var(--code-bg); color: #fff; }
+        tr:hover { background: rgba(255,255,255,0.02); }
+        .mu { color: var(--mu); }
+        ul, ol { padding-left: 20px; margin: 6px 0; }
+        li { margin-bottom: 4px; }
+    </style>
+</head>
+<body>
+<main>
+
+<header>
+    <span class="b b-OFF">RAPORT ARCHITEKTONICZNY: TRYB OFFLINE vs ONLINE (Z PEŁNĄ ANALIZĄ „USUŃ TRWALE”)</span>
+    <h1>Co się dzieje, gdy dysk źródłowy lub docelowy jest OFFLINE (odłączony przed lub w trakcie operacji)?</h1>
+    <p class="mu">
+        Kompletna mapa zachowań Domowego Archiwum Foto po wdrożeniu architektury Zero-Trust File Safety (VSN Verification + Kwarantanna + Two-Phase Commit).
+    </p>
+</header>
+
+<!-- ===================================================================== -->
+<!-- SEKCJA 1: JAK SYSTEM ROZPOZNAJE, ŻE DYSK JEST OFFLINE?                -->
+<!-- ===================================================================== -->
+<h2>1. Jak aplikacja rozpoznaje, czy dysk jest ONLINE czy OFFLINE? (Ochrona VSN przed podmianą litery dysku)</h2>
+<div class="card">
+    <p>
+        System <strong>nigdy nie ufa samej literze dysku w Windows</strong> (np. <code>E:\</code>), ponieważ po odłączeniu dysku <em>Foto-1</em> i podłączeniu innego pendrive'a system Windows może nadać mu tę samą literę <code>E:\</code>.
+    </p>
+    <ul>
+        <li>Przy każdej operacji funkcja <code>StorageAutomationService.verify_and_resolve_online_volume_root(vol, strict_vsn=True)</code> odpytuje jądro Windows (<code>kernel32.GetVolumeInformationW</code>) o <strong>sprzętowy numer seryjny wolumenu (VSN, np. <code>A4F2-881C</code>)</strong>.</li>
+        <li>Jeśli dysk o danym VSN jest podłączony pod inną literą niż ostatnio (np. wcześniej był <code>E:\</code>, a dziś jest <code>G:\</code>), aplikacja <strong>automatycznie wykrywa nowy punkt montowania <code>G:\</code></strong> i wykonuje operację poprawnie.</li>
+        <li>Jeśli pod literą <code>E:\</code> znajduje się dziś inny dysk (o innym VSN) lub dysk jest fizycznie odpięty, metoda zwraca <code>None</code> i oznacza dysk jako <strong>🔴 OFFLINE</strong> — wszelkie operacje zapisu/usuwania dla tego dysku są natychmiast wstrzymywane.</li>
+    </ul>
+</div>
+
+<!-- ===================================================================== -->
+<!-- SEKCJA 2: SZCZEGÓŁOWE ZACHOWANIE "🔥 USUŃ TRWALE"                     -->
+<!-- ===================================================================== -->
+<h2 class="crit-h2">2. Szczegółowe zachowanie operacji „🔥 Usuń trwale” (Wszystkie 6 scenariuszy OFFLINE / ONLINE)</h2>
+
+<div class="card card-crit">
+    <h3>Jak teraz działa przycisk „🔥 Usuń trwale” (na pasku głównym oraz „🔥 Usuń z dysku” w albumie)?</h3>
+    <p>
+        Każde kliknięcie <strong>„🔥 Usuń trwale”</strong> jest operacją dwufazową (Two-Phase Commit):
+        <ol>
+            <li><strong>Faza 1 (Modal Podsumowania <code>/actions/delete-preview</code>):</strong> Zanim cokolwiek zostanie dotknięte, otwiera się okno podsumowania pokazujące tabelę dysków, ich aktualny status VSN (<code>🟢 ONLINE</code> vs <code>🔴 OFFLINE</code>), liczbę Oryginałów, liczbę Jedynych Egzemplarzy oraz 15 przykładowych ścieżek. Wygenerowany zostaje jednorazowy token <code>deletion_token</code>.</li>
+            <li><strong>Faza 2 (Wykonanie <code>/actions/delete-permanently</code> po kliknięciu „Potwierdź”):</strong> Zamiast nieodwracalnego `unlink()`, pliki na dyskach ONLINE są przenoszone atomowym `os.rename` do bezpiecznego katalogu kwarantanny <code>&lt;dysk&gt;\daf_kwarantanna\&lt;RRRRMMDD&gt;\&lt;ścieżka&gt;</code> na tym samym dysku (z zapisem do `manifest.jsonl`), a ich rekord jest usuwany z bazy SQLite.</li>
+        </ol>
+    </p>
+
+    <h3>Co dokładnie dzieje się w poszczególnych scenariuszach, gdy dysk jest OFFLINE?</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Scenariusz „🔥 Usuń trwale”</th>
+                <th>Status dysków</th>
+                <th>Co pokaże Modal Podglądu (Faza 1)?</th>
+                <th>Co zrobi system po kliknięciu „Potwierdź” (Faza 2)?</th>
+                <th>Czy usunie rekord z bazy? Czy poprosi o dysk?</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Scenariusz A:</strong><br>Usuwasz zwykłe pliki / Oryginały (np. wadliwe zdjęcia), a <strong>dysk z tymi plikami jest OFFLINE</strong></td>
+                <td>Dysk usuwanego pliku: <span class="b b-BLOCK">🔴 OFFLINE</span></td>
+                <td>
+                    W tabeli dysków przy tym nośniku widnieje:<br>
+                    <code>🔴 OFFLINE (plik i rekord bazy nietknięte)</code>.<br>
+                    Jeśli są tam Oryginały, wymaga zaznaczenia zgody i wpisania słowa <code>USUŃ</code> (limit maks. 500 Oryginałów na raz).
+                </td>
+                <td>
+                    1. Na dysku fizycznym nic się nie dzieje (bo jest odłączony).<br>
+                    2. <strong>W bazie SQLite rekordy tych plików oraz ich miniatury <code>.webp</code> zostają w 100% ZACHOWANE!</strong> (Naprawiony błąd z incydentu — program nigdy nie usuwa rekordu z bazy podczas trwałego usuwania, jeśli nie może przenieść fizycznego pliku na dysku).
+                </td>
+                <td>
+                    <strong>Rekord w bazie: ZACHOWANY.</strong><br><br>
+                    <strong>Prośba o dysk: TAK</strong> — zadanie przechodzi w stan <code>WAITING_FOR_DEVICE</code> i wyświetla żółty baner:<br>
+                    <em>„🔌 Podłącz kolejny dysk: [Nazwa Dysku] (VSN: ...) — do usunięcia na tym dysku: X plików [▶️ Kontynuuj na podłączonym dysku]”</em>.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Scenariusz B:</strong><br>Usuwasz zaznaczone pliki z <strong>3 dysków naraz</strong> (np. Dysk 1 jest ONLINE, a Dysk 2 i Dysk 3 są OFFLINE)</td>
+                <td>Dysk 1: <span class="b b-OFF">🟢 ONLINE</span><br>Dysk 2 i 3: <span class="b b-BLOCK">🔴 OFFLINE</span></td>
+                <td>
+                    Tabela w modalu pokazuje osobny wiersz dla każdego dysku:<br>
+                    &bull; Dysk 1: <code>🟢 ONLINE (kwarantanna daf_kwarantanna/ + usunięcie z bazy)</code><br>
+                    &bull; Dysk 2 i 3: <code>🔴 OFFLINE (plik i rekord bazy nietknięte)</code>.
+                </td>
+                <td>
+                    1. System tworzy kopię bezpieczeństwa bazy SQLite (<code>pre_permanent_disk_delete</code>).<br>
+                    2. Przetwarza w całości <strong>Dysk 1 (ONLINE)</strong>: przenosi jego pliki do <code>daf_kwarantanna/</code> i usuwa je z bazy.<br>
+                    3. Plików z <strong>Dysku 2 i 3 (OFFLINE)</strong> nie usuwa z bazy — sortuje odłączone dyski od tego, który ma najwięcej plików do usunięcia.
+                </td>
+                <td>
+                    <strong>Prośba o dysk: TAK (kolejka dysk po dysku)</strong>.<br>
+                    Po zakończeniu Dysku 1 wyświetla prośbę o podłączenie najpierw tego dysku offline, na którym jest najwięcej plików (np. Dysku 2), z przyciskiem <em>„▶️ Kontynuuj na podłączonym dysku”</em> (nie tworząc już drugiej kopii bazy).
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Scenariusz C:</strong><br>Usuwasz <strong>Duplikat (3. lub kolejną kopię)</strong> leżący na dysku ONLINE, a dysk z Oryginałem lub Backupem jest ONLINE</td>
+                <td>Dysk duplikatu: <span class="b b-OFF">🟢 ONLINE</span><br>Dysk Oryginału/Backupu: <span class="b b-OFF">🟢 ONLINE</span></td>
+                <td>
+                    Pokazuje liczbę duplikatów (<code>Oryg. / Dup.: 0 / X</code>). Nie wymaga wpisywania słowa <code>USUŃ</code>, ponieważ usuwane są wyłącznie nadmiarowe duplikaty.
+                </td>
+                <td>
+                    1. Sprawdza, czy po usunięciu w klastrze zostaną co najmniej 2 kopie (Oryginał + Backup).<br>
+                    2. Wykonuje <strong>100% weryfikację binarną na żywo</strong> (rozmiar + SHA-256 + BLAKE2b + MD5 + porównanie bajt-po-bajcie <code>filecmp</code> + nagłówek obrazu) pomiędzy duplikatem a kopią referencyjną.<br>
+                    3. Po potwierdzeniu 100% zgodności przenosi duplikat do <code>daf_kwarantanna/</code>, zapisuje ślad w <code>deleted_duplicate_history</code> i usuwa rekord duplikatu z bazy.
+                </td>
+                <td>
+                    <strong>Działa od razu w 100%</strong> (bez pytania o kolejne dyski). Na koniec wyświetla zielony raport weryfikacji potwierdzający, że 100% usuniętych duplikatów ma zachowany aktywny Oryginał w bazie.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Scenariusz D:</strong><br>Usuwasz <strong>Duplikat</strong> leżący na dysku <strong>ONLINE</strong>, ale <strong>ZARÓWNO dysk Oryginału, JAK I dysk Backupu są w tej chwili OFFLINE</strong></td>
+                <td>Dysk duplikatu: <span class="b b-OFF">🟢 ONLINE</span><br>Dyski Oryginału i Backupu: <span class="b b-BLOCK">🔴 OFFLINE</span></td>
+                <td>
+                    Dysk z duplikatem ma status <code>🟢 ONLINE</code>.
+                </td>
+                <td>
+                    Ponieważ kopie referencyjne (Oryginał i Backup) są odłączone, nie da się wykonać porównania <code>filecmp</code> między dwoma dyskami:<br>
+                    1. <strong>Dla zdjęć (lub filmów z policzonym wcześniej pełnym <code>verified_sha256</code>):</strong> System liczy pełny SHA-256 usuwanego pliku na dysku ONLINE, porównuje z rozmiarem i pełnym hashem klastra w bazie oraz sprawdza strukturę obrazu. Jeśli wszystko pasuje w 100%, **przenosi plik wyłącznie do <code>daf_kwarantanna/</code> na tym samym dysku** (dzięki czemu nawet gdyby na dysku offline brakowało oryginału, plik wciąż fizycznie istnieje w <code>daf_kwarantanna/</code>!).<br>
+                    2. <strong>Dla filmów mających tylko częściowy hash <code>partial_3x64k</code> (bez pełnego SHA-256):</strong> Operacja zostaje **ZABLOKOWANA** (<code>blocked_verify += 1</code>)! Plik wideo i jego rekord w bazie pozostają nietknięte.
+                </td>
+                <td>
+                    <strong>Dla wideo bez pełnego SHA-256: ZABLOKOWANE</strong> (wymaga wcześniejszego podłączenia dysku z oryginałem).<br>
+                    <strong>Dla zdjęć ze zgodnym pełnym SHA-256:</strong> bezpieczna kwarantanna <code>daf_kwarantanna/</code> na tym samym dysku.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Scenariusz E:</strong><br>Usuwasz cały album (<strong>„🔥 Usuń z dysku”</strong> na pasku albumu), gdy część zdjęć albumu jest na dysku ONLINE, a część na dysku OFFLINE</td>
+                <td>Część zdjęć: <span class="b b-OFF">🟢 ONLINE</span><br>Część zdjęć: <span class="b b-BLOCK">🔴 OFFLINE</span></td>
+                <td>
+                    Otwiera modal podglądu z informacją:<br>
+                    <code>📁 Usuwanie albumu: [Nazwa Albumu] wraz z podalbumami</code> oraz tabelą dysków ONLINE i OFFLINE.
+                </td>
+                <td>
+                    1. Zdjęcia znajdujące się na dyskach <strong>ONLINE</strong> zostają przeniesione do <code>daf_kwarantanna/</code> i usunięte z bazy.<br>
+                    2. Zdjęcia znajdujące się na dyskach <strong>OFFLINE</strong> pozostają w bazie danych.<br>
+                    3. Ponieważ w albumie pozostały nieusunięte zdjęcia z dysku OFFLINE (`rem_cnt > 0`), **sam album (rekord `MediaGroup`) NIE zostaje usunięty z bazy**, aby zdjęcia na dysku offline nie straciły przypisania do swojego albumu!
+                </td>
+                <td>
+                    <strong>Album i zdjęcia offline zostają zachowane w bazie.</strong> Dopiero gdy podłączysz drugi dysk i usuniesz pozostałe zdjęcia (tak że `rem_cnt == 0`), pusty album zostanie automatycznie usunięty.
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Scenariusz F:</strong><br>Wśród zaznaczonych do trwałego usunięcia plików znajdują się pliki z katalogu <strong><code>daf_backup/</code>, <code>backup/</code> lub pliki z atrybutem Windows <code>Tylko do odczytu (Read-Only)</code></strong></td>
+                <td>Dowolny</td>
+                <td>
+                    W modalu podglądu pliki z <code>daf_backup/</code> i <code>backup/</code> są automatycznie odfiltrowane z zielonym komunikatem:<br>
+                    <code>🛡️ Ochrona daf_backup/: Automatycznie wykluczono X plików backupu.</code>
+                </td>
+                <td>
+                    Nawet gdyby plik w <code>daf_backup/</code> lub plik oznaczony w Windows jako <code>Read-Only</code> trafił do pętli wykonawczej, <code>FileSafetyGuard</code> rzuca <code>PermissionError</code> (nigdy nie zdejmuje atrybutu Read-Only!) i pozostawia plik oraz jego rekord w bazie całkowicie nienaruszone.
+                </td>
+                <td>
+                    <strong>100% ZABLOKOWANE (Ochrona bezwzględna).</strong>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- ===================================================================== -->
+<!-- SEKCJA 3: OPERACJE DZIAŁAJĄCE W 100% OFFLINE                          -->
+<!-- ===================================================================== -->
+<h2>3. Operacje działające w 100% OFFLINE (Dyski USB mogą być całkowicie odłączone)</h2>
+<p class="mu">Poniższe operacje korzystają wyłącznie z lokalnej bazy SQLite (<code>data/db/media_vault.db</code>) oraz lokalnego cache miniatur WebP (<code>data/thumbnails/*.webp</code> na dysku SSD komputera).</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Operacja / Funkcja</th>
+            <th>Tryb pracy</th>
+            <th>Co dokładnie się dzieje, gdy dysk źródłowy jest OFFLINE?</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Przeglądanie galerii, oś czasu, filtrowanie, szukanie po tagach, ścieżkach i nazwach albumów</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Wszystkie kafelki wyświetlają się natychmiast z lokalnych miniatur <code>.webp</code>. Na kafelku widnieje czerwona odznaka nazwy dysku (Offline), a nad galerią pojawia się belka informująca, które dyski offline mają najwięcej zdjęć w aktualnym widoku.</td>
+        </tr>
+        <tr>
+            <td><strong>Pełny podgląd zdjęcia/wideo w Lightboxie i Pokaz TV (Fallback z kopii ONLINE!)</strong></td>
+            <td><span class="b b-OFF">HYBRYDOWY OFFLINE</span></td>
+            <td>
+                1. Jeśli dysk z Oryginałem jest OFFLINE, ale <strong>na innym podłączonym dysku ONLINE znajduje się jego kopia zapasowa (Backup)</strong> o tym samym hashu SHA-256, funkcja <code>_resolve_online_preview_path</code> <strong>automatycznie wyświetla pełnej jakości zdjęcie lub odtwarza film z dysku Backupu</strong> (z zielonym komunikatem: <em>„🟢 Podgląd z kopii online — oryginał offline”</em>)!<br>
+                2. Jeśli zarówno Oryginał, jak i wszystkie kopie są OFFLINE, Lightbox wyświetla zapisaną miniaturę 300x300 px.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Wyszukiwanie wizualnie podobnych zdjęć (<code>🔍 Podobne 512-D</code>) oraz tej samej osoby (<code>👤 Ta sama osoba</code>)</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Działa w 100% bez dysków! Wektory obrazu 512-D oraz wektory twarzy 256-D są pobierane z SQLite lub wyliczane w locie z lokalnych miniatur <code>data/thumbnails/*.webp</code>.</td>
+        </tr>
+        <tr>
+            <td><strong>Analiza AI: Tagowanie obiektów/kwiatów (<code>tags</code>), Szukanie głębiej na miniaturach (<code>🧠 Szukaj głębiej</code>), Wektory 512-D (<code>vectors</code>) oraz Indeksowanie twarzy (<code>faces</code>)</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Modele ONNX i OpenCV czytają wyłącznie lokalne miniatury <code>data/thumbnails/*.webp</code>. Wszystkie zdjęcia z odłączonych dysków zostają normalnie przeanalizowane i otagowane w bazie.</td>
+        </tr>
+        <tr>
+            <td><strong>Ręczne dodawanie i usuwanie tagów (<code>🏷️ Dodaj tag</code>) oraz nazywanie wykrytych osób (<code>👤 Zapisz imię osoby</code>)</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Zapisuje tagi ręczne (<code>source_model="manual"</code>) oraz imiona osób (<code>MediaFace.person_name</code> i tag <code>osoba:&lt;imię&gt;</code>) bezpośrednio w SQLite.</td>
+        </tr>
+        <tr>
+            <td><strong>Szybka analiza duplikatów (<code>duplicates_fast</code>), analiza brakujących backupów (<code>unbacked</code>) oraz Planowanie Backupu</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Przelicza klastry i buduje harmonogram par dysków (A &harr; B) na podstawie zapisanych w SQLite hashy <code>file_hash</code> oraz pojemności dysków zapamiętanych w <code>windows_volumes</code>.</td>
+        </tr>
+        <tr>
+            <td><strong>Zarządzanie albumami, 1-Klik Auto-Organizacja, przycisk „⭐ Przypisz do albumu Ważne”, obracanie zdjęć, zmiana daty</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Wszystkie te operacje modyfikują wyłącznie metadane w SQLite i działają natychmiast przy całkowicie odłączonych dyskach.</td>
+        </tr>
+        <tr>
+            <td><strong>Przenoszenie do Kosza (<code>🗑️ Do Kosza</code>) oraz Przywracanie z Kosza (<code>♻️ Przywróć</code>)</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Kosz działa jako logiczny atrybut <code>is_trashed = True</code> w SQLite — przeniesienie do Kosza i przywrócenie z Kosza działa natychmiast również dla odłączonych dysków.</td>
+        </tr>
+        <tr>
+            <td><strong>Wyindeksowanie z bazy (<code>✖️ Usuń z bazy</code> / <code>/actions/unindex</code>) oraz Eksport JSON</strong></td>
+            <td><span class="b b-OFF">100% OFFLINE</span></td>
+            <td>Usuwa wpisy wyłącznie z bazy SQLite i lokalne miniatury <code>.webp</code> (nie dotyka dysków USB).</td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ===================================================================== -->
+<!-- SEKCJA 4: POZOSTAŁE OPERACJE HYBRYDOWE I WYMAGAJĄCE TRYBU ONLINE      -->
+<!-- ===================================================================== -->
+<h2>4. Pozostałe Operacje Hybrydowe i Wymagające Podłączonego Dysku (ONLINE)</h2>
+
+<table>
+    <thead>
+        <tr>
+            <th>Operacja / Funkcja</th>
+            <th>Zachowanie przy dysku OFFLINE</th>
+            <th>Szczegółowy przebieg</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Automatyczny Backup zdjęć i filmów (<code>🛡️ Zrób backup</code>)</strong></td>
+            <td><span class="b b-QUEUE">KOLEJKUJE PARY I PROSI O DYSKI</span></td>
+            <td>
+                Wykonuje backup dla wszystkich par dysków, które są aktualnie <strong>ONLINE</strong>. Dla par, w których przynajmniej jeden dysk jest <strong>OFFLINE</strong>, przechodzi w stan <code>WAITING_FOR_DEVICE</code> i wyświetla prośbę o podłączenie konkretnej pary dysków z przyciskiem <strong>„▶️ Podłączyłem wskazaną parę dysków — Kontynuuj backup”</strong>.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Opróżnianie Kosza (<code>🔥 Opróżnij Kosz</code>)</strong></td>
+            <td><span class="b b-QUEUE">POMIJA OFFLINE (ZACHOWUJE W BAZIE)</span></td>
+            <td>
+                Dla dysków <strong>ONLINE</strong> przenosi pliki do <code>daf_kwarantanna/</code> i usuwa rekordy z bazy. Dla dysków <strong>OFFLINE</strong> pozostawia rekordy w Koszu nienaruszone i raportuje: <em>„Pominięto dyski OFFLINE (rekordy zachowane): Y”</em>.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Analiza AI: Ostrość, ekspozycja i uszkodzenia (<code>analysis_type="quality"</code>) oraz Dokładna analiza duplikatów 100% (<code>duplicates_exact</code>)</strong></td>
+            <td><span class="b b-QUEUE">POMIJA OFFLINE</span></td>
+            <td>
+                Wymagają odczytu pełnego pliku oryginalnego z dysku. Badają pliki na dyskach <strong>ONLINE</strong>, a pliki na dyskach <strong>OFFLINE</strong> pomijają z informacją w podsumowaniu: <em>„Pominięto offline: X”</em>.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Weryfikacja spójności Baza &harr; Dyski (<code>🔍 Sprawdź spójność bazy z dyskami</code>)</strong></td>
+            <td><span class="b b-QUEUE">CHRONI OFFLINE</span></td>
+            <td>
+                Weryfikuje obecność plików tylko na dyskach <strong>ONLINE</strong>. Dyski <strong>OFFLINE</strong> wykazuje w osobnej sekcji i nigdy nie pozwala usunąć ich rekordów jako „brakujących”.
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Przenoszenie plików (<code>🚚 Przenieś pliki</code>), Przenoszenie backupów (<code>🚚 Przenieś backupy</code>), Uporządkuj oryginały (<code>🗂️ Uporządkuj oryginały</code>), Eksport fizyczny albumu (<code>daf_albums/</code>)</strong></td>
+            <td><span class="b b-ON">WYMAGA ONLINE</span></td>
+            <td>
+                Jeśli dysk źródłowy lub docelowy jest <strong>OFFLINE</strong>, pliki z odłączonego dysku są bezpiecznie pomijane (<code>skipped_offline</code>) lub wyświetlany jest komunikat z prośbą o podłączenie dysku — żaden rekord w bazie nie zostaje uszkodzony.
+            </td>
+        </tr>
+    </tbody>
+</table>
+
+<!-- ===================================================================== -->
+<!-- SEKCJA 5: CO SIĘ STANIE, GDY KABEL USB ZOSTANIE WYJĘTY W TRAKCIE?     -->
+<!-- ===================================================================== -->
+<h2>5. Scenariusz Awaryjny: Co się stanie, jeśli dysk zostanie nagle odłączony (wypięty kabel USB) W TRAKCIE trwającej operacji?</h2>
+
+<div class="card">
+    <ol>
+        <li>
+            <strong>W trakcie „🔥 Usuń trwale” (przenoszenia do <code>daf_kwarantanna/</code>):</strong>
+            <ul>
+                <li>Gdy wypięty zostanie dysk, z którego usuwane są pliki: <code>FileSafetyGuard.quarantine_file</code> rzuci <code>OSError</code>, pętla przejdzie do `continue` i **rekord w bazie SQLite nie zostanie usunięty**.</li>
+                <li>Po **5 kolejnych błędach I/O** natychmiast zadziała wyłącznik awaryjny (<strong>Circuit Breaker</strong>: <code>consecutive_io_errors &ge; 5</code>), który bezpiecznie zatrzyma zadanie ze statusem <code>STOPPED</code>.</li>
+            </ul>
+        </li>
+        <li>
+            <strong>W trakcie kopiowania do <code>daf_backup/</code> lub przenoszenia między dyskami (<code>_safe_move</code> / <code>_safe_copy_new_to_daf_backup</code>):</strong>
+            <ul>
+                <li>Zapis na dysku docelowym zawsze odbywa się do pliku tymczasowego <code>.daf_tmp</code> / <code>.daf_move_tmp</code>.</li>
+                <li>Wypięcie kabla przerwie kopiowanie na pliku tymczasowym — weryfikacja 100% SHA-256 zwróci <code>False</code>, więc **plik źródłowy na dysku źródłowym pozostaje w 100% nienaruszony**.</li>
+                <li>Ponieważ baza wykonuje <code>self.db.commit()</code> po każdym pojedynczym ukończonym pliku, wszystkie pliki przeniesione przed awarią mają już zaktualizowane ścieżki w bazie, a plik przerwany i kolejne pliki zachowują swoje stare ścieżki. **Zero rozjazdu między bazą a dyskiem!**</li>
+            </ul>
+        </li>
+    </ol>
+</div>
+
+</main>
+</body>
+</html>

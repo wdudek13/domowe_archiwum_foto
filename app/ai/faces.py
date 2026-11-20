@@ -75,7 +75,7 @@ class OnDemandFaceEmbedder:
                     str(self.yunet_path.resolve()),
                     "",
                     (300, 300),
-                    score_threshold=0.60,
+                    score_threshold=0.65,
                     nms_threshold=0.35,
                     top_k=20,
                 )
@@ -181,13 +181,13 @@ class OnDemandFaceEmbedder:
                         fy = max(0, min(h - 1, fy))
                         fw = min(w - fx, max(1, fw))
                         fh = min(h - fy, max(1, fh))
-                        if fw >= 10 and fh >= 10:
+                        if fw >= 12 and fh >= 12:
                             raw_boxes.append((fx, fy, fw, fh, round(min(1.0, score), 3)))
             except Exception as exc:
                 logger.debug("YuNet detect warning: %s", exc)
 
-        # Tier 2: Haar cascades with YCrCb skin validation
-        if not raw_boxes and (self._frontal_cascade is not None or self._profile_cascade is not None):
+        # Tier 2: Haar cascades with YCrCb skin validation (ONLY when YuNet is unavailable)
+        if not raw_boxes and self._yunet is None and (self._frontal_cascade is not None or self._profile_cascade is not None):
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             skin_full = self._skin_mask_ycrcb(img_bgr)
             for clf, base_conf in ((self._frontal_cascade, 0.90), (self._profile_cascade, 0.80)):
@@ -213,8 +213,9 @@ class OnDemandFaceEmbedder:
                 except Exception as exc:
                     logger.debug("Haar detect warning: %s", exc)
 
-        # Tier 3: Zero-file built-in YCrCb skin-blob + ovality + facial-feature contrast detector
-        if not raw_boxes:
+        # Tier 3: Zero-file built-in YCrCb skin-blob fallback ONLY when neither YuNet nor Haar cascades are loaded
+        # (Prevents false-positive "faces" on tan rocks/roofs/drones/landscapes when YuNet legitimately finds 0 faces!)
+        if not raw_boxes and self._yunet is None and self._frontal_cascade is None and self._profile_cascade is None:
             skin = self._skin_mask_ycrcb(img_bgr)
             k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))

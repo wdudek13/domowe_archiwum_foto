@@ -268,30 +268,33 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         exif_dt, fn_dt, ctime, mtime, effective_dt, anomaly, reason = MetadataDateResolver.resolve_dates(img_file, is_image=True)
         self.assertIsNone(exif_dt)
         self.assertEqual(fn_dt, datetime.datetime(2021, 5, 10, 12, 30, 45))
-        self.assertEqual(effective_dt, fn_dt)
+        # Rule (b): Without EXIF, effective_date is ALWAYS mtime even if filename date differs (with filename anomaly!)
+        self.assertEqual(effective_dt, mtime)
         self.assertTrue(anomaly)
-        self.assertIn("Niezgodność dat", reason)
+        self.assertIn("nazwie pliku", reason)
 
-        # Missing EXIF alone WITHOUT source discrepancy must NOT trigger an anomaly
+        # Missing EXIF alone WITHOUT path/filename discrepancy must NOT trigger an anomaly
         plain_img = create_synthetic_jpeg(self.drive_a / "random_shot.jpg")
-        _, _, _, _, _, plain_anom, plain_reason = MetadataDateResolver.resolve_dates(plain_img, is_image=True)
+        _, _, _, plain_mtime, plain_eff, plain_anom, plain_reason = MetadataDateResolver.resolve_dates(plain_img, is_image=True)
+        self.assertEqual(plain_eff, plain_mtime)
         self.assertFalse(plain_anom)
         self.assertIsNone(plain_reason)
 
-        # Folder date discrepancy after file copy: folder 2019-08 vs filesystem timestamps in 2026
+        # Folder date discrepancy: without EXIF, effective is mtime AND path discrepancy is flagged
         folder_img = create_synthetic_jpeg(self.drive_a / "2019-08_Grecja" / "beach.jpg")
-        _, _, _, _, f_eff, f_anom, f_rsn = MetadataDateResolver.resolve_dates(
+        _, _, _, f_mtime, f_eff, f_anom, f_rsn = MetadataDateResolver.resolve_dates(
             folder_img, is_image=True, rel_path="2019-08_Grecja/beach.jpg"
         )
         self.assertTrue(f_anom)
-        self.assertEqual((f_eff.year, f_eff.month), (2019, 8))
-        self.assertIn("folderem", f_rsn)
+        self.assertEqual(f_eff, f_mtime)
+        self.assertIn("ścieżce", f_rsn)
+        self.assertIn("folder", f_rsn)
 
         # Rule (b): Day-level folder may differ in DAY as long as YEAR and MONTH match -> NO anomaly
         same_ym_eff, same_ym_anom, same_ym_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=None,
-            ctime=datetime.datetime(2022, 7, 28, 14, 0),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
             mtime=datetime.datetime(2022, 7, 28, 14, 0),
             folder_info=(datetime.datetime(2022, 7, 15, 0, 0), "day", "2022-07-15"),
         )
@@ -299,18 +302,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIsNone(same_ym_rsn)
         self.assertEqual(same_ym_eff, datetime.datetime(2022, 7, 28, 14, 0))
 
-        # Rule (c): Copy-modified ctime with older mtime matching folder -> picks mtime and flags anomaly
-        day_eff, day_anom, _ = MetadataDateResolver.evaluate_date_sources(
-            exif=None,
-            fn_date=None,
-            ctime=datetime.datetime(2026, 5, 1, 10, 0),
-            mtime=datetime.datetime(2022, 7, 15, 14, 0),
-            folder_info=(datetime.datetime(2022, 7, 15, 0, 0), "day", "2022-07-15"),
-        )
-        self.assertTrue(day_anom)
-        self.assertEqual(day_eff, datetime.datetime(2022, 7, 15, 14, 0))
-
-        # Copy discrepancy without folder/EXIF/filename when ctime is >24h newer than mtime
+        # Difference between ctime and mtime is NOT an anomaly (shown in details only!), effective = mtime
         cp_eff, cp_anom, cp_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=None,
@@ -318,63 +310,71 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             mtime=datetime.datetime(2021, 3, 20, 9, 0),
             folder_info=None,
         )
-        self.assertTrue(cp_anom)
+        self.assertFalse(cp_anom)
+        self.assertIsNone(cp_rsn)
         self.assertEqual(cp_eff, datetime.datetime(2021, 3, 20, 9, 0))
-        self.assertIn("kopiowaniu", cp_rsn)
 
-        # Rule (a): Whenever EXIF exists, return EXIF with NO anomaly even if other sources differ
-        ex_only_eff, ex_only_anom, ex_only_rsn = MetadataDateResolver.evaluate_date_sources(
+        # Rule (a): EXIF is effective_date; disagreements with path and filename ARE flagged cleanly
+        ex_eff, ex_anom, ex_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=datetime.datetime(2023, 5, 10, 12, 0),
             fn_date=datetime.datetime(2021, 5, 10, 12, 0),
             ctime=datetime.datetime(2026, 1, 1, 10, 0),
             mtime=datetime.datetime(2026, 1, 1, 10, 0),
             folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
         )
-        self.assertFalse(ex_only_anom)
-        self.assertIsNone(ex_only_rsn)
-        self.assertEqual(ex_only_eff, datetime.datetime(2023, 5, 10, 12, 0))
+        self.assertEqual(ex_eff, datetime.datetime(2023, 5, 10, 12, 0))
+        self.assertTrue(ex_anom)
+        self.assertIn("ścieżce", ex_rsn)
+        self.assertIn("nazwie pliku", ex_rsn)
 
-        # Rule (c) with no EXIF: filename older than folder -> picks oldest (2019-05-10)
-        eff_fn_fold, anom_fn_fold, _ = MetadataDateResolver.evaluate_date_sources(
+        # Rule (a) when EXIF matches folder & filename (even if ctime/mtime are much newer) -> NO anomaly
+        ex_ok_eff, ex_ok_anom, ex_ok_rsn = MetadataDateResolver.evaluate_date_sources(
+            exif=datetime.datetime(2023, 5, 10, 12, 0),
+            fn_date=datetime.datetime(2023, 5, 10, 12, 0),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
+            mtime=datetime.datetime(2025, 2, 1, 10, 0),
+            folder_info=(datetime.datetime(2023, 5, 1, 0, 0), "month", "2023-05"),
+        )
+        self.assertEqual(ex_ok_eff, datetime.datetime(2023, 5, 10, 12, 0))
+        self.assertFalse(ex_ok_anom)
+        self.assertIsNone(ex_ok_rsn)
+
+        # Rule (b) without EXIF: effective is ALWAYS mtime even if filename/folder are older; both discrepancies reported
+        eff_fn_fold, anom_fn_fold, rsn_fn_fold = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=datetime.datetime(2019, 5, 10, 12, 0),
             ctime=datetime.datetime(2026, 1, 1, 10, 0),
-            mtime=datetime.datetime(2026, 1, 1, 10, 0),
+            mtime=datetime.datetime(2025, 6, 5, 10, 0),
             folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
         )
         self.assertTrue(anom_fn_fold)
-        self.assertEqual(eff_fn_fold.year, 2019)
+        self.assertEqual(eff_fn_fold, datetime.datetime(2025, 6, 5, 10, 0))
+        self.assertIn("ścieżce", rsn_fn_fold)
+        self.assertIn("nazwie pliku", rsn_fn_fold)
 
-        # Rule (b) all agree -> returns ctime with NO anomaly
+        # Rule (b) when mtime agrees with filename and folder (even with newer ctime) -> NO anomaly
         eff_agree, anom_agree, _ = MetadataDateResolver.evaluate_date_sources(
             exif=None,
             fn_date=datetime.datetime(2022, 4, 5, 11, 0),
-            ctime=datetime.datetime(2022, 4, 5, 11, 5),
+            ctime=datetime.datetime(2026, 1, 1, 10, 0),
             mtime=datetime.datetime(2022, 4, 5, 11, 5),
             folder_info=MetadataDateResolver.parse_folder_date(self.drive_a / "2022-04-05" / "a.jpg", rel_path="abcdef0123456789abcdef/2022-04-05/a.jpg"),
         )
         self.assertFalse(anom_agree)
         self.assertEqual(eff_agree, datetime.datetime(2022, 4, 5, 11, 5))
 
-        # Rule (c) folder month older than filename -> picks folder (2020-06) and flags discrepancy
-        self.assertEqual(
-            MetadataDateResolver.evaluate_date_sources(
-                exif=None,
-                fn_date=datetime.datetime(2026, 1, 2, 10, 0),
-                ctime=datetime.datetime(2025, 6, 5, 10, 0),
-                mtime=datetime.datetime(2025, 6, 5, 10, 0),
-                folder_info=(datetime.datetime(2020, 6, 1, 0, 0), "month", "2020-06"),
-            )[0].year,
-            2020,
-        )
-
-        # Test EXIF parsing on JpegImageFile (rule a: EXIF always takes priority without anomaly)
+        # Test EXIF parsing on JpegImageFile (EXIF matches plain filename -> NO anomaly; mismatched filename -> anomaly)
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "2023:05:10 12:30:45"}):
-            ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(img_file, is_image=True)
+            ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(plain_img, is_image=True)
             self.assertEqual(ex_dt, datetime.datetime(2023, 5, 10, 12, 30, 45))
             self.assertEqual(eff_dt, ex_dt)
             self.assertFalse(anom)
             self.assertIsNone(rsn)
+            # On IMG_20210510_123045.jpg, EXIF 2023 disagrees with filename 2021 -> effective=EXIF, anomaly=True
+            _, _, _, _, eff_mm, anom_mm, rsn_mm = MetadataDateResolver.resolve_dates(img_file, is_image=True)
+            self.assertEqual(eff_mm, datetime.datetime(2023, 5, 10, 12, 30, 45))
+            self.assertTrue(anom_mm)
+            self.assertIn("nazwie pliku", rsn_mm)
 
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "bad-date"}):
             self.assertIsNone(MetadataDateResolver.parse_exif(img_file))
@@ -496,7 +496,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             db.refresh(vol_c)
             vol_a_id, vol_b_id, vol_c_id = vol_a.id, vol_b.id, vol_c.id
 
-            # Create File 1: 1 copy on Drive A, 2 copies on Drive B
+            # Create File 1: 1 copy on Drive A, 2 copies on Drive B (with mtime = 2023-06-15)
             p1_a = create_synthetic_jpeg(self.drive_a / "IMG_20230615_100000.jpg", color=(10, 80, 200))
             p1_b_orig = self.drive_b / "01_Wakacje" / "IMG_20230615_100000.jpg"
             p1_b_orig.parent.mkdir(parents=True, exist_ok=True)
@@ -504,9 +504,14 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             p1_b_dup = self.drive_b / "99_Kopia" / "IMG_20230615_100000_dup.jpg"
             p1_b_dup.parent.mkdir(parents=True, exist_ok=True)
             p1_b_dup.write_bytes(p1_a.read_bytes())
+            ts_2023_06_15 = datetime.datetime(2023, 6, 15, 10, 0, 0).timestamp()
+            for p_ts in (p1_a, p1_b_orig, p1_b_dup):
+                os.utime(p_ts, (ts_2023_06_15, ts_2023_06_15))
 
-            # Create File 2: only 1 copy on Drive A (unbacked!)
+            # Create File 2: only 1 copy on Drive A (unbacked!, mtime = 2023-07-20)
             p2_a = create_synthetic_jpeg(self.drive_a / "IMG_20230720_150000.jpg", color=(200, 50, 30))
+            ts_2023_07_20 = datetime.datetime(2023, 7, 20, 15, 0, 0).timestamp()
+            os.utime(p2_a, (ts_2023_07_20, ts_2023_07_20))
 
             for p, v in [(p1_a, vol_a), (p1_b_orig, vol_b), (p1_b_dup, vol_b), (p2_a, vol_a)]:
                 it = FileScannerService.process_file(p, v)
@@ -6799,15 +6804,32 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         # ---------------------------------------------------------------------
         # 4) Task 4: Offline Same-Person Face Indexing, Similarity Search & Person Naming
         # ---------------------------------------------------------------------
-        # Run face indexing via Analyze AI (`analysis_type=faces`) on OFFLINE drive thumbnails
-        r_face_idx = self.client.post(
-            "/actions/analyze-all",
-            data={
-                "analysis_type": "faces",
-                "target_drive_scope": "all_drives",
-                "run_sync": "true",
-            },
-        )
+        # Verify Item #1 fix: when YuNet IS active and returns 0 faces on a tan/brown landscape/drone thumbnail,
+        # Tier-3 skin-blob fallback MUST NOT fire (eliminates false positives on drone/landscape photos!)
+        fe_yn_guard = OnDemandFaceEmbedder()
+        fake_yn_zero = MagicMock()
+        fake_yn_zero.detect.return_value = (1, None)
+        fe_yn_guard._yunet = fake_yn_zero
+        tan_drone_arr = cv2.imread(str(self.thumbs_dir / f"{ania1_id}.webp"))
+        self.assertEqual(fe_yn_guard.detect_faces(tan_drone_arr), [])
+        fe_yn_guard.close_session()
+
+        # Run face indexing via Analyze AI (`analysis_type=faces`) on OFFLINE drive synthetic cartoon thumbnails
+        # (using Tier-3 fallback mode with YuNet disabled for synthetic OpenCV cartoon drawings)
+        orig_open_sess = OnDemandFaceEmbedder.open_session
+        def _open_without_yunet(self_fe):
+            self_fe.yunet_path = self.root / "no_yunet_for_synthetic.onnx"
+            orig_open_sess(self_fe)
+
+        with patch.object(OnDemandFaceEmbedder, "open_session", _open_without_yunet):
+            r_face_idx = self.client.post(
+                "/actions/analyze-all",
+                data={
+                    "analysis_type": "faces",
+                    "target_drive_scope": "all_drives",
+                    "run_sync": "true",
+                },
+            )
         self.assertEqual(r_face_idx.status_code, 200)
         self.assertIn("Zaindeksowano twarze na miniaturach", r_face_idx.text)
 
@@ -6824,7 +6846,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIn("portret_ania_plaza.jpg", r_same.text)
         self.assertIn("portret_ania_las.jpg", r_same.text)
         self.assertNotIn("jezioro_01.jpg", r_same.text)
-        self.assertIn("Nazwij tę osobę", r_same.text)
+        self.assertIn("Zmień osoby", r_same.text)
 
         # Name this person ("Ania") via POST /actions/name-person -> searchable immediately via q=Ania!
         r_name = self.client.post(
@@ -6985,6 +7007,131 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         r_sb_after_rm = self.client.get("/media/sidebar")
         self.assertNotIn("stary_tag_cache", r_sb_after_rm.text)
         self.assertIn("nowszy_tag_cache", r_sb_after_rm.text)
+
+        # ---------------------------------------------------------------------
+        # 6) UX & Precision Polish Verification (Requests 1-6)
+        # ---------------------------------------------------------------------
+        # Req 1: No "Obróć album +90°" button in active album bar
+        r_alb_view = self.client.get("/media/search", params={"group_id": str(grp_parent.id)})
+        self.assertEqual(r_alb_view.status_code, 200)
+        self.assertNotIn("Obróć album +90°", r_alb_view.text)
+        # Req 5: Inline "Zmień osoby" available directly in media_grid
+        self.assertIn("Zmień osoby (zaznaczone):", r_alb_view.text)
+
+        # Req 2 & Req 4: Sidebar album tree collapsed under root + Osoby i Twarze section (Ania, Marek, Twarz #1, Twarz #2)
+        self.assertIn('data-album-children class="hidden"', r_sb_after_rm.text)
+        self.assertIn("toggleAlbumBranch", r_sb_after_rm.text)
+        self.assertIn("Osoby i Twarze", r_sb_after_rm.text)
+        self.assertIn("Ania", r_sb_after_rm.text)
+        self.assertIn("Marek", r_sb_after_rm.text)
+        self.assertIn("Twarz #1", r_sb_after_rm.text)
+        self.assertIn("Twarz #2", r_sb_after_rm.text)
+
+        # Req 4: Main page renders collapsible top panel & independent scrolling grid container
+        r_home_ui = self.client.get("/")
+        self.assertEqual(r_home_ui.status_code, 200)
+        self.assertIn("top-controls-panel", r_home_ui.text)
+        self.assertIn("toggleTopControlsPanel", r_home_ui.text)
+        self.assertIn("media-grid-scroll", r_home_ui.text)
+
+        # Filtering by sidebar face/person tags works cleanly
+        r_tw2 = self.client.get("/media/search", params={"tag": "twarz:2"})
+        self.assertIn("grupa_ania_marek.jpg", r_tw2.text)
+        self.assertNotIn("ogrod_roza.jpg", r_tw2.text)
+        r_os_ania = self.client.get("/media/search", params={"tag": "osoba:Ania"})
+        self.assertIn("portret_ania_plaza.jpg", r_os_ania.text)
+        self.assertNotIn("ogrod_roza.jpg", r_os_ania.text)
+
+        # Req 2 & Req 3: Wider + resizable detail modal, full non-200px path, native hx-get same_person
+        self.assertIn("resize: horizontal", r_det_grp.text)
+        self.assertIn("detail-modal-box", r_det_grp.text)
+        self.assertNotIn("max-w-[200px]", r_det_grp.text)
+        self.assertIn(f'hx-get="/semantic/similar/{grp_photo_id}?mode=same_person"', r_det_grp.text)
+        self.assertIn("Zmień osoby:", r_det_grp.text)
+
+        # Req 5: Comma-separated multi-person "Zmień osoby" ("Ania, Ala") assigns photo to BOTH separate people!
+        r_multi_p = self.client.post(
+            "/actions/name-person",
+            data={"person_name": "Ania, Ala", "person_action": "replace", "selected_ids": [ania1_id]},
+        )
+        self.assertEqual(r_multi_p.status_code, 200)
+        r_sb_multi = self.client.get("/media/sidebar")
+        self.assertIn("Ania", r_sb_multi.text)
+        self.assertIn("Ala", r_sb_multi.text)
+        self.assertIn("portret_ania_plaza.jpg", self.client.get("/media/search", params={"tag": "osoba:Ania"}).text)
+        self.assertIn("portret_ania_plaza.jpg", self.client.get("/media/search", params={"tag": "osoba:Ala"}).text)
+
+        # Replacing with just "Ania" removes "Ala" cleanly; clearing removes all persons
+        r_rep_one = self.client.post(
+            "/actions/name-person",
+            data={"person_name": "Ania", "person_action": "replace", "selected_ids": [ania1_id]},
+        )
+        self.assertEqual(r_rep_one.status_code, 200)
+        self.assertNotIn("portret_ania_plaza.jpg", self.client.get("/media/search", params={"tag": "osoba:Ala"}).text)
+        self.assertIn("portret_ania_plaza.jpg", self.client.get("/media/search", params={"tag": "osoba:Ania"}).text)
+
+        # Removing osoba:Ania via /actions/remove-tag also clears MediaFace.person_name
+        r_rm_p_tag = self.client.post(
+            "/actions/remove-tag",
+            data={"media_id": ania1_id, "tag": "osoba:Ania"},
+        )
+        self.assertEqual(r_rm_p_tag.status_code, 200)
+        self.assertNotIn("portret_ania_plaza.jpg", self.client.get("/media/search", params={"tag": "osoba:Ania"}).text)
+
+        # person_action=clear removes all person assignments from ania2_id
+        r_clr_p = self.client.post(
+            "/actions/name-person",
+            data={"person_action": "clear", "selected_ids": [ania2_id]},
+        )
+        self.assertEqual(r_clr_p.status_code, 200)
+        self.assertNotIn("portret_ania_las.jpg", self.client.get("/media/search", params={"tag": "osoba:Ania"}).text)
+
+        # Req 4: Similarity results (even non-same_person mode) allow changing persons / adding tags & keep_view=1 refreshes sidebar only
+        r_sim_hyb = self.client.get(f"/semantic/similar/{ania1_id}", params={"mode": "hybrid"})
+        self.assertEqual(r_sim_hyb.status_code, 200)
+        self.assertIn("Zmień osoby", r_sim_hyb.text)
+        self.assertIn("Dodaj tag do zaznaczonych", r_sim_hyb.text)
+        r_keep_tag = self.client.post(
+            "/actions/add-tags",
+            data={"scope": "selected", "selected_ids": [ania1_id], "tags": "sesja_plaza", "keep_view": "1"},
+        )
+        self.assertEqual(r_keep_tag.status_code, 200)
+        self.assertEqual(r_keep_tag.headers.get("HX-Trigger"), "refresh-sidebar")
+
+        # Req 5: Strict word-boundary & flower precision (tulipan MUST NOT match cauliflower/potter's wheel/bear/ship/earthstar!)
+        tg_prec = OnDemandObjectTagger()
+        tg_prec.labels = {
+            "294": "brown bear, bruin",
+            "724": "pirate, pirate ship",
+            "738": "pot, flowerpot",
+            "739": "potter's wheel",
+            "849": "teapot",
+            "938": "cauliflower",
+            "985": "daisy",
+            "995": "earthstar",
+        }
+        t_idxs, t_cats, _ = tg_prec.resolve_keyword_to_imagenet_indices("tulipan")
+        self.assertIn(985, t_idxs)
+        self.assertNotIn(938, t_idxs, "cauliflower must NEVER match tulipan/flower!")
+        self.assertNotIn(739, t_idxs, "potter's wheel must NEVER match tulipan/pot!")
+        self.assertNotIn(849, t_idxs, "teapot must NEVER match tulipan/pot!")
+        self.assertNotIn(294, t_idxs, "brown bear must NEVER match tulipan/ear!")
+        self.assertNotIn(724, t_idxs, "pirate ship must NEVER match tulipan/hip!")
+        self.assertNotIn(995, t_idxs, "earthstar mushroom must NEVER match tulipan!")
+
+        # Search q=tulipan MUST NOT return items tagged with bear / cauliflower / potter's wheel
+        with self.TestingSessionLocal() as db:
+            noise_id = _add_offline_item("niedzwiedz_kalafior.jpg", _write_plain_blue_thumb)
+            db.add_all([
+                MediaTag(media_id=noise_id, tag="brown bear", confidence=0.9, source_model="onnx_detail"),
+                MediaTag(media_id=noise_id, tag="cauliflower", confidence=0.9, source_model="onnx_detail"),
+                MediaTag(media_id=noise_id, tag="potter's wheel", confidence=0.9, source_model="onnx_detail"),
+            ])
+            db.commit()
+        r_tulip_q = self.client.get("/media/search", params={"q": "tulipan"})
+        self.assertEqual(r_tulip_q.status_code, 200)
+        self.assertNotIn("niedzwiedz_kalafior.jpg", r_tulip_q.text)
+        self.assertIn("ogrod_roza.jpg", r_tulip_q.text)
 
 
 if __name__ == "__main__":

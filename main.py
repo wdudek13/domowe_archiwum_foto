@@ -117,6 +117,8 @@ def index(request: Request, db: Session = Depends(get_db)):
 def user_guide_page():
     guide_path = BASE_DIR / "przewodnik_uzytkownika.html"
     if not guide_path.exists():
+        guide_path = BASE_DIR / "docs" / "przewodnik_uzytkownika.html"
+    if not guide_path.exists():
         raise HTTPException(status_code=404, detail="Brak pliku przewodnik_uzytkownika.html")
     return FileResponse(guide_path, media_type="text/html; charset=utf-8")
 
@@ -124,6 +126,8 @@ def user_guide_page():
 @app.get("/dokumentacja", response_class=HTMLResponse)
 def technical_docs_page():
     docs_path = BASE_DIR / "dokumentacja.html"
+    if not docs_path.exists():
+        docs_path = BASE_DIR / "docs" / "dokumentacja.html"
     if not docs_path.exists():
         raise HTTPException(status_code=404, detail="Brak pliku dokumentacja.html")
     return FileResponse(docs_path, media_type="text/html; charset=utf-8")

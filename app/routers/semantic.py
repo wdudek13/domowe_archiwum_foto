@@ -340,6 +340,7 @@ def find_visually_similar(
                 "similarity_mode": mode,
                 "similarity_modes": SIMILARITY_MODES,
                 "active_face_index": face_index,
+                "face_not_found": not bool(query_face_vecs),
                 "matched_person_ids": [it.id for it in sorted_items],
                 "all_groups": all_groups,
                 "flat_album_choices": build_flat_album_choices(all_groups),
