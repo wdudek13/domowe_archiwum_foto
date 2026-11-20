@@ -11,9 +11,9 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, asc, select, or_, func, extract, and_
 from sqlalchemy.orm import Session, joinedload, aliased, load_only
 
-from app.ai.tagger import PL_CATEGORY_MAPPING
+from app.ai.tagger import IMAGENET_PL_SYNONYMS, PL_CATEGORY_MAPPING, normalize_pl
 from app.database import get_db, THUMBNAILS_DIR
-from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, DeletedDuplicateHistory
+from app.models import MediaItem, WindowsVolume, MediaGroup, MediaTag, MediaEmbedding, MediaFace, DeletedDuplicateHistory
 from app.operation_log import ProcessManager
 from app.scanner import MetadataDateResolver
 from app.storage_ops import StorageAutomationService
@@ -518,11 +518,31 @@ def apply_media_filters(
     if q and q.strip():
         clean_q = q.strip()
         clean_q_low = clean_q.lower()
+        clean_q_norm = normalize_pl(clean_q)
         search_terms = [clean_q_low]
+        if clean_q_norm and clean_q_norm != clean_q_low:
+            search_terms.append(clean_q_norm)
         for pl_cat, en_words in PL_CATEGORY_MAPPING.items():
-            if clean_q_low in pl_cat or any(clean_q_low in w or w in clean_q_low for w in en_words):
+            norm_cat = normalize_pl(pl_cat)
+            if (
+                clean_q_low in pl_cat
+                or clean_q_norm in norm_cat
+                or any(
+                    clean_q_low in w
+                    or w in clean_q_low
+                    or clean_q_norm in normalize_pl(w)
+                    or (len(normalize_pl(w)) >= 3 and normalize_pl(w) in clean_q_norm)
+                    for w in en_words
+                )
+            ):
                 search_terms.append(pl_cat)
                 search_terms.extend(en_words)
+        for en_k, pl_v in IMAGENET_PL_SYNONYMS.items():
+            n_en = normalize_pl(en_k)
+            n_pl = normalize_pl(pl_v)
+            if clean_q_norm in n_pl or clean_q_norm in n_en:
+                search_terms.append(en_k)
+                search_terms.append(pl_v)
 
         del_hist_hashes = select(DeletedDuplicateHistory.file_hash).where(
             or_(
@@ -531,13 +551,38 @@ def apply_media_filters(
                 DeletedDuplicateHistory.volume_label.ilike(f"%{clean_q}%"),
             )
         )
+
+        # Task 3: Search by album names & descriptions (expanding matched albums to entire subalbum subtrees!)
+        matched_group_ids = list(
+            db.scalars(
+                select(MediaGroup.id).where(
+                    MediaGroup.is_trashed == False,
+                    or_(
+                        MediaGroup.name.ilike(f"%{clean_q}%"),
+                        MediaGroup.description.ilike(f"%{clean_q}%"),
+                    ),
+                )
+            ).all()
+        )
+        expanded_gids = set()
+        if matched_group_ids:
+            svc_grp = StorageAutomationService(db)
+            for gid in matched_group_ids:
+                expanded_gids.update(svc_grp.get_group_subtree_ids(gid))
+
+        # Task 4: Search named faces by person_name
+        matched_face_media_ids = select(MediaFace.media_id).where(MediaFace.person_name.ilike(f"%{clean_q}%"))
+
         q_tag_alias = aliased(MediaTag)
         q_conds = [
             MediaItem.file_name.ilike(f"%{clean_q}%"),
             MediaItem.relative_path.ilike(f"%{clean_q}%"),
             MediaItem.original_relative_path.ilike(f"%{clean_q}%"),
             MediaItem.file_hash.in_(del_hist_hashes),
+            MediaItem.id.in_(matched_face_media_ids),
         ]
+        if expanded_gids:
+            q_conds.append(MediaItem.group_id.in_(list(expanded_gids)))
         for term in sorted(set(search_terms)):
             q_conds.append(q_tag_alias.tag.ilike(f"%{term}%"))
 
@@ -641,7 +686,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
     )
     if len(excl_ids) <= 500:
         tag_top_stmt = select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt")).where(
-            MediaTag.source_model != "quality_check"
+            MediaTag.source_model.notin_(["quality_check", "onnx_detail"])
         )
         defect_stmt = select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id))).where(
             MediaTag.source_model == "quality_check"
@@ -668,7 +713,7 @@ def _compute_sidebar_static_aggs(db: Session) -> dict:
             for t, c in db.execute(
                 select(MediaTag.tag, func.count(func.distinct(MediaTag.media_id)).label("cnt"))
                 .join(MediaItem, MediaItem.id == MediaTag.media_id)
-                .where(gallery_visible, MediaTag.source_model != "quality_check")
+                .where(gallery_visible, MediaTag.source_model.notin_(["quality_check", "onnx_detail"]))
                 .group_by(MediaTag.tag)
                 .order_by(desc("cnt"))
                 .limit(35)

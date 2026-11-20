@@ -24,6 +24,7 @@ from app.models import (
     MediaGroup,
     MediaTag,
     MediaEmbedding,
+    MediaFace,
     BackgroundJob,
 )
 from app.operation_log import OperationLogger, ProcessManager
@@ -39,8 +40,9 @@ from app.file_safety import (
 )
 from app.storage_ops import StorageAutomationService
 from app.ai.quality import MediaQualityAnalyzer
-from app.ai.tagger import OnDemandObjectTagger
+from app.ai.tagger import OnDemandObjectTagger, normalize_pl
 from app.ai.embeddings import OnDemandClipEmbedder
+from app.ai.faces import OnDemandFaceEmbedder
 from app.routers.media import apply_media_filters, to_int, to_bool, render_template
 
 logger = logging.getLogger("ActionsRouter")
@@ -909,11 +911,41 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
     run_tags = analysis_type in ("all", "tags")
     run_vectors = analysis_type in ("all", "vectors")
     run_quality = analysis_type in ("all", "quality")
+    run_faces = analysis_type == "faces"
     is_storage_analysis = analysis_type in ("duplicates_fast", "duplicates_exact", "unbacked", "date_discrepancy")
 
     stopped_midway = False
     tagger = OnDemandObjectTagger() if run_tags else None
     try:
+        if run_faces:
+            # Task 4: 100% offline face indexing strictly on local thumbnails (0 MB RAM after exit)
+            def _on_face_progress(done_cnt: int, tot_cnt: int) -> None:
+                AI_BATCH_STATE["processed"] = done_cnt
+                AI_BATCH_STATE["total"] = tot_cnt
+                ProcessManager.update_cache_only(
+                    job_id,
+                    processed_count=done_cnt,
+                    total_count=tot_cnt,
+                    message=f"Indeksowanie twarzy na miniaturach: {done_cnt}/{tot_cnt}",
+                )
+
+            with SessionLocal() as db:
+                with OnDemandFaceEmbedder() as face_embedder:
+                    f_res = face_embedder.index_faces_for_items(
+                        db,
+                        item_ids,
+                        thumbnails_dir=THUMBNAILS_DIR,
+                        progress_cb=_on_face_progress,
+                    )
+            AI_BATCH_STATE["processed"] = f_res["processed"]
+            AI_BATCH_STATE["tagged"] = f_res["items_with_faces"]
+            AI_BATCH_STATE["result_summary"] = (
+                f"Zaindeksowano twarze na miniaturach (100% Offline): sprawdzono {f_res['processed']} zdjęć, "
+                f"wykryto {f_res['faces_found']} twarzy na {f_res['items_with_faces']} zdjęciach."
+            )
+            OperationLogger.log("FACE_INDEX_BATCH", AI_BATCH_STATE["result_summary"], status="OK")
+            return
+
         if is_storage_analysis:
             if AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id):
                 stopped_midway = True
@@ -1009,9 +1041,9 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
 
                 tags = []
                 if run_tags and tagger is not None and readable_path is not None:
-                    tags = tagger.tag_image(readable_path)
+                    tags = tagger.tag_image_with_sources(readable_path)
                     if mtype == "video":
-                        tags.append(("wideo", 1.0))
+                        tags.append(("wideo", 1.0, "opencv+onnx"))
 
                 vec_blob = None
                 if run_vectors and readable_path is not None:
@@ -1050,9 +1082,28 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                                 it_dim.is_corrupted = False
 
                         if run_tags:
-                            db.execute(delete(MediaTag).where(MediaTag.media_id == mid))
-                            for t_name, conf in tags:
-                                db.add(MediaTag(media_id=mid, tag=t_name, confidence=conf, source_model="opencv+onnx"))
+                            # Task 2: Protect user manual tags, quality defects, and face cluster tags during AI re-tagging!
+                            db.execute(
+                                delete(MediaTag).where(
+                                    MediaTag.media_id == mid,
+                                    MediaTag.source_model.notin_(["manual", "quality_check", "face_cluster"]),
+                                )
+                            )
+                            preserved_norm = {
+                                normalize_pl(str(t))
+                                for t in db.scalars(
+                                    select(MediaTag.tag).where(MediaTag.media_id == mid)
+                                ).all()
+                            }
+                            for t_entry in tags:
+                                if len(t_entry) == 3:
+                                    t_name, conf, t_src = t_entry
+                                else:
+                                    t_name, conf = t_entry[0], t_entry[1]
+                                    t_src = "opencv+onnx"
+                                if normalize_pl(t_name) not in preserved_norm:
+                                    db.add(MediaTag(media_id=mid, tag=t_name[:64], confidence=conf, source_model=t_src))
+                                    preserved_norm.add(normalize_pl(t_name))
                             if tags:
                                 AI_BATCH_STATE["tagged"] += 1
 
@@ -1196,6 +1247,7 @@ async def trigger_full_ai_analysis(
         "duplicates_exact": "Dokładna analiza duplikatów 100% (weryfikacja binarna na dyskach)",
         "unbacked": "Analiza plików bez kopii zapasowej na innym urządzeniu",
         "date_discrepancy": "Analiza niezgodności dat (EXIF / utworzenie pliku / nazwa / folder)",
+        "faces": "Indeksowanie twarzy na miniaturach (100% Offline)",
     }
     job_id = ProcessManager.create_job(
         job_type="ai_analysis",
@@ -5011,4 +5063,216 @@ async def clear_quality_defect_action(request: Request, db: Session = Depends(ge
         f"<span class='text-emerald-400 text-xs font-semibold'>✓ {msg}</span>",
         headers={"HX-Trigger": "refresh-all"},
     )
+
+
+@router.post("/on-demand-keyword-scan")
+async def on_demand_keyword_scan_action(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Task 1: Runs local On-Demand ONNX + OpenCV HSV keyword scan strictly on local thumbnails
+    (`data/thumbnails/*.webp`), saves matching tags to SQLite, releases ONNX RAM immediately,
+    and triggers gallery refresh.
+    """
+    import html as html_mod
+
+    form = await _read_large_form(request)
+    q_kw = (_form_str(form, "q") or "").strip()
+    limit_scan = to_int(_form_str(form, "limit_scan")) or 3000
+    limit_scan = max(1, min(20000, limit_scan))
+
+    if not q_kw:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Podaj słowo kluczowe do przeszukania miniatur AI.</span>")
+
+    tagger = OnDemandObjectTagger()
+    try:
+        res = tagger.scan_thumbnails_for_keyword(
+            db,
+            q_kw,
+            limit_scan=limit_scan,
+            thumbnails_dir=THUMBNAILS_DIR,
+        )
+    finally:
+        tagger.close_session()
+
+    msg = (
+        f"Przeszukano miniatury AI pod kątem „{q_kw}”: sprawdzono {res['scanned_count']} miniatur, "
+        f"dopasowano {res['matched_count']} zdjęć (zapisano {res.get('tags_added', 0)} nowych tagów w bazie)."
+    )
+    OperationLogger.log("ON_DEMAND_KEYWORD_SCAN", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-purple-200 text-xs font-semibold'>🧠 {html_mod.escape(msg)}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/add-tags")
+async def add_manual_tags_action(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Task 2: Adds user-specified manual tags (`source_model='manual'`) to a single photo (`media_id`)
+    or to the active bulk selection / filtered view. Manual tags are preserved across AI re-runs.
+    """
+    import html as html_mod
+
+    form = await _read_large_form(request)
+    raw_tags = (_form_str(form, "tags") or _form_str(form, "tag") or "").strip()
+    media_id = (_form_str(form, "media_id") or "").strip()
+
+    parsed_tags: List[str] = []
+    seen_norm = set()
+    for part in raw_tags.replace(";", ",").split(","):
+        cleaned = part.strip()[:64]
+        norm = normalize_pl(cleaned)
+        if cleaned and norm not in seen_norm:
+            parsed_tags.append(cleaned)
+            seen_norm.add(norm)
+
+    if not parsed_tags:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Wpisz przynajmniej jeden tag (np. kwiaty, róża, urodziny).</span>")
+
+    if media_id:
+        item_ids = [media_id]
+    else:
+        item_ids, fp = _resolve_bulk_ids_from_form(db, form)
+        if fp["scope"] == "filtered" and not _has_narrowing_filter(fp):
+            return HTMLResponse(
+                "<span class='text-rose-400 text-xs font-semibold'>"
+                "🛡️ Zablokowano masowe dodawanie tagów: brak aktywnego filtra zawężającego w trybie 'Cały widok'."
+                "</span>"
+            )
+
+    if not item_ids:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do otagowania.</span>")
+
+    existing_by_mid: Dict[str, set] = {}
+    for ch_start in range(0, len(item_ids), 900):
+        ch = item_ids[ch_start : ch_start + 900]
+        for mid_r, tag_r in db.execute(
+            select(MediaTag.media_id, MediaTag.tag).where(MediaTag.media_id.in_(ch))
+        ).all():
+            existing_by_mid.setdefault(str(mid_r), set()).add(normalize_pl(str(tag_r)))
+
+    added_cnt = 0
+    for mid in item_ids:
+        have = existing_by_mid.setdefault(str(mid), set())
+        for tag_txt in parsed_tags:
+            nt = normalize_pl(tag_txt)
+            if nt not in have:
+                db.add(MediaTag(media_id=str(mid), tag=tag_txt, confidence=1.0, source_model="manual"))
+                have.add(nt)
+                added_cnt += 1
+
+    db.commit()
+    tags_disp = ", ".join(parsed_tags)
+    msg = f"Dodano ręczne tagi ({tags_disp}) do {len(item_ids)} zdjęć (nowych wpisów: {added_cnt})."
+    OperationLogger.log("MANUAL_TAG_ADD", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>🏷️ {html_mod.escape(msg)}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/remove-tag")
+async def remove_tag_action(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Task 2: Removes a single tag (by tag_id or by media_id + tag name) from a photo."""
+    import html as html_mod
+
+    form = await _read_large_form(request)
+    media_id = (_form_str(form, "media_id") or "").strip()
+    tag_id = to_int(_form_str(form, "tag_id"))
+    tag_name = (_form_str(form, "tag") or "").strip()
+
+    removed = 0
+    if tag_id is not None:
+        stmt = delete(MediaTag).where(MediaTag.id == tag_id)
+        if media_id:
+            stmt = stmt.where(MediaTag.media_id == media_id)
+        res = db.execute(stmt)
+        removed = int(res.rowcount or 0)
+    elif media_id and tag_name:
+        res = db.execute(
+            delete(MediaTag).where(MediaTag.media_id == media_id, MediaTag.tag == tag_name)
+        )
+        removed = int(res.rowcount or 0)
+    else:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Wskaż tag do usunięcia.</span>")
+
+    db.commit()
+    lbl = tag_name or f"#{tag_id}"
+    msg = f"Usunięto tag „{lbl}” ({removed} szt.)."
+    OperationLogger.log("MANUAL_TAG_REMOVE", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-sky-300 text-xs font-semibold'>✓ {html_mod.escape(msg)}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
+
+@router.post("/name-person")
+async def name_person_action(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Task 4: Assigns a human name (`person_name`) to faces on selected or matched photos
+    and adds the searchable `osoba:<name>` tag (`source_model='face_cluster'`).
+    """
+    import html as html_mod
+
+    form = await _read_large_form(request)
+    person_name = (_form_str(form, "person_name") or "").strip()[:120]
+    if not person_name:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Podaj imię lub nazwę osoby (np. Babcia Zosia, Marek).</span>")
+
+    selected_ids = _merge_selected_ids(
+        [str(x) for x in form.getlist("selected_ids")],
+        _form_str(form, "selected_ids_json"),
+    )
+    if not selected_ids:
+        single_mid = (_form_str(form, "media_id") or "").strip()
+        if single_mid:
+            selected_ids = [single_mid]
+        else:
+            default_json = _form_str(form, "default_media_ids_json")
+            selected_ids = _merge_selected_ids([], default_json)
+
+    if not selected_ids:
+        return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do przypisania osoby.</span>")
+
+    tag_label = f"osoba:{person_name}"[:64]
+    tag_norm = normalize_pl(tag_label)
+
+    existing_tags_by_mid: Dict[str, set] = {}
+    for ch_start in range(0, len(selected_ids), 900):
+        ch = selected_ids[ch_start : ch_start + 900]
+        db.execute(
+            update(MediaFace)
+            .where(MediaFace.media_id.in_(ch))
+            .values(person_name=person_name)
+        )
+        for mid_r, tag_r in db.execute(
+            select(MediaTag.media_id, MediaTag.tag).where(MediaTag.media_id.in_(ch))
+        ).all():
+            existing_tags_by_mid.setdefault(str(mid_r), set()).add(normalize_pl(str(tag_r)))
+
+    for mid in selected_ids:
+        have = existing_tags_by_mid.setdefault(str(mid), set())
+        if tag_norm not in have:
+            db.add(MediaTag(media_id=str(mid), tag=tag_label, confidence=1.0, source_model="face_cluster"))
+            have.add(tag_norm)
+
+    db.commit()
+    msg = f"Przypisano osobę „{person_name}” (tag {tag_label}) do {len(selected_ids)} zdjęć."
+    OperationLogger.log("PERSON_NAMED", msg, status="OK", db=db)
+    return HTMLResponse(
+        f"<span class='text-emerald-400 text-xs font-semibold'>👤 {html_mod.escape(msg)}</span>",
+        headers={"HX-Trigger": "refresh-all"},
+    )
+
 

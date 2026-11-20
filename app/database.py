@@ -219,6 +219,25 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS ix_deleted_duplicate_history_file_name ON deleted_duplicate_history (file_name);"
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_faces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_id VARCHAR(36) NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+                face_index INTEGER DEFAULT 0 NOT NULL,
+                bbox_json VARCHAR(128) NOT NULL,
+                confidence FLOAT DEFAULT 1.0 NOT NULL,
+                person_name VARCHAR(128),
+                vector BLOB NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_media_faces_media_id ON media_faces (media_id);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_media_faces_person_name ON media_faces (person_name);"
+        )
         if m_cols and {"is_trashed", "duplicate_role", "is_backup_copy", "file_hash"}.issubset(m_cols):
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_media_role_bkp_trashed ON media_items (is_trashed, duplicate_role, is_backup_copy, file_hash);"

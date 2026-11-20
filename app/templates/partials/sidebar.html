@@ -1,6 +1,6 @@
 {% macro render_group_nodes(nodes) %}
     {% for node in nodes %}
-    <div class="pl-{{ node.depth * 3 }} py-0.5">
+    <div class="pl-{{ node.depth * 3 }} py-0.5" data-album-node data-album-name="{{ node.group.name|lower }}">
         <div class="flex items-center justify-between px-2 py-1 rounded-lg hover:bg-slate-800 text-xs text-slate-200 transition group">
             <button type="button"
                     onclick="applySidebarFilter({_reset: true, group_id: '{{ node.group.id }}'})"
@@ -192,13 +192,48 @@
             </button>
             <button onclick="document.getElementById('group-modal').classList.remove('hidden')" class="text-indigo-400 hover:text-white font-bold px-1.5 py-0.5 rounded bg-slate-800" title="Nowy album">+</button>
         </div>
-        <div class="max-h-60 overflow-y-auto pr-1 space-y-0.5">
+        <div id="album-tree-wrapper" class="space-y-1.5">
             {% if group_tree %}
-                {{ render_group_nodes(group_tree) }}
-            {% else %}
-                <div class="text-[11px] text-slate-500 italic px-2 py-1">Brak albumów.</div>
+            <input type="text"
+                   id="album-tree-search"
+                   placeholder="Szukaj albumu..."
+                   oninput="window.filterAlbumTree(this.value)"
+                   class="w-full bg-slate-900 border border-borderBg rounded-lg px-2 py-1 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
             {% endif %}
+            <div id="album-tree-list" class="max-h-60 overflow-y-auto pr-1 space-y-0.5">
+                {% if group_tree %}
+                    {{ render_group_nodes(group_tree) }}
+                {% else %}
+                    <div class="text-[11px] text-slate-500 italic px-2 py-1">Brak albumów.</div>
+                {% endif %}
+            </div>
         </div>
+        <script>
+            window.filterAlbumTree = function(rawQ) {
+                const list = document.getElementById('album-tree-list');
+                if (!list) return;
+                const q = (rawQ || '').trim().toLowerCase();
+                const nodes = Array.from(list.querySelectorAll('[data-album-node]'));
+                if (!q) {
+                    nodes.forEach(n => n.classList.remove('hidden'));
+                    return;
+                }
+                // First hide all, then reveal matching nodes plus their ancestors & descendants
+                nodes.forEach(n => n.classList.add('hidden'));
+                nodes.forEach(n => {
+                    const name = (n.getAttribute('data-album-name') || '').toLowerCase();
+                    if (name.includes(q)) {
+                        n.classList.remove('hidden');
+                        n.querySelectorAll('[data-album-node]').forEach(ch => ch.classList.remove('hidden'));
+                        let p = n.parentElement ? n.parentElement.closest('[data-album-node]') : null;
+                        while (p) {
+                            p.classList.remove('hidden');
+                            p = p.parentElement ? p.parentElement.closest('[data-album-node]') : null;
+                        }
+                    }
+                });
+            };
+        </script>
     </div>
 
     <div>

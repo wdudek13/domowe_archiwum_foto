@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session, joinedload
 import numpy as np
 
 from app.database import get_db, THUMBNAILS_DIR
-from app.models import MediaEmbedding, MediaItem, MediaTag, MediaGroup, WindowsVolume
+from app.models import MediaEmbedding, MediaFace, MediaItem, MediaTag, MediaGroup, WindowsVolume
 from app.ai.embeddings import OnDemandClipEmbedder
+from app.ai.faces import OnDemandFaceEmbedder
 from app.routers.media import (
     render_template,
     build_flat_album_choices,
@@ -28,6 +29,7 @@ SIMILARITY_MODES = {
     "color_mood": "🎨 Paleta barw i klimat (Kolory HSV)",
     "same_event": "📅 Ta sama sesja / Wydarzenie (Czas + Obraz)",
     "composition": "👤 Kompozycja, Kadr i Ludzie",
+    "same_person": "👤 Ta sama osoba (Analiza wyciętej twarzy z miniatury)",
 }
 
 
@@ -114,6 +116,155 @@ def find_visually_similar(
                 "total_pages": 1,
                 "view_mode": "grid",
                 "similarity_scores": {},
+            },
+        )
+
+    # Task 4: Dedicated 100% offline, thumbnail-only Same-Person Face Recognition mode
+    if mode == "same_person":
+        dim_bytes = OnDemandFaceEmbedder.VECTOR_DIM * 4
+        target_face_rows = list(
+            db.scalars(select(MediaFace).where(MediaFace.media_id == target_item.id)).all()
+        )
+        query_face_vecs = [
+            np.frombuffer(f.vector, dtype=np.float32)
+            for f in target_face_rows
+            if f.vector and len(f.vector) == dim_bytes
+        ]
+
+        # Collect pre-indexed candidate faces from SQLite (active, non-backup items)
+        cand_face_rows = [
+            (str(r[0]), r[1])
+            for r in db.execute(
+                select(MediaFace.media_id, MediaFace.vector)
+                .join(MediaItem, MediaItem.id == MediaFace.media_id)
+                .where(
+                    MediaItem.id != target_item.id,
+                    MediaItem.is_trashed == False,
+                    MediaItem.is_backup_copy == False,
+                    MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+                )
+            ).all()
+            if r[1] and len(r[1]) == dim_bytes
+        ]
+
+        need_on_the_fly = (not query_face_vecs) or (not cand_face_rows)
+        if need_on_the_fly:
+            with OnDemandFaceEmbedder() as fe:
+                if not query_face_vecs and target_item.thumbnail_relative_path:
+                    t_thumb = THUMBNAILS_DIR / target_item.thumbnail_relative_path
+                    if t_thumb.exists() and t_thumb.stat().st_size > 0:
+                        extracted = fe.extract_faces_from_thumbnail(
+                            t_thumb, allow_center_portrait_fallback=False
+                        )
+                        query_face_vecs = [f["vector"] for f in extracted]
+
+                if query_face_vecs and not cand_face_rows:
+                    # Fallback on-the-fly thumbnail scan: prioritize face-tagged items, then recent active items (100% offline!)
+                    face_tag_mids = list(
+                        db.scalars(
+                            select(MediaTag.media_id)
+                            .where(MediaTag.tag.in_(["osoba / twarz", "portret", "grupa osob", "ludzie"]))
+                            .distinct()
+                            .limit(250)
+                        ).all()
+                    )
+                    cand_rows_meta = []
+                    if face_tag_mids:
+                        cand_rows_meta = list(
+                            db.execute(
+                                select(MediaItem.id, MediaItem.thumbnail_relative_path).where(
+                                    MediaItem.id.in_(face_tag_mids),
+                                    MediaItem.id != target_item.id,
+                                    MediaItem.is_trashed == False,
+                                    MediaItem.is_backup_copy == False,
+                                    MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+                                )
+                            ).all()
+                        )
+                    if len(cand_rows_meta) < 20:
+                        seen_mids = {str(r[0]) for r in cand_rows_meta} | {target_item.id}
+                        extra_meta = list(
+                            db.execute(
+                                select(MediaItem.id, MediaItem.thumbnail_relative_path)
+                                .where(
+                                    MediaItem.is_trashed == False,
+                                    MediaItem.is_backup_copy == False,
+                                    MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+                                )
+                                .order_by(MediaItem.effective_date.desc())
+                                .limit(150)
+                            ).all()
+                        )
+                        for r in extra_meta:
+                            if str(r[0]) not in seen_mids:
+                                cand_rows_meta.append(r)
+                                seen_mids.add(str(r[0]))
+
+                    for cmid, cthumb_rel in cand_rows_meta:
+                        if not cthumb_rel:
+                            continue
+                        cthumb = THUMBNAILS_DIR / cthumb_rel
+                        if not cthumb.exists() or cthumb.stat().st_size == 0:
+                            continue
+                        for cf in fe.extract_faces_from_thumbnail(cthumb):
+                            cand_face_rows.append((str(cmid), cf["vector_bytes"]))
+
+        ranked_faces = OnDemandFaceEmbedder.rank_similar_faces(
+            query_face_vecs, cand_face_rows, min_score=0.45, top_n=47
+        )
+        matched_ids = [mid for mid, _ in ranked_faces]
+        cand_by_id = {}
+        if matched_ids:
+            for item_obj in db.scalars(
+                select(MediaItem)
+                .options(
+                    joinedload(MediaItem.volume),
+                    joinedload(MediaItem.group),
+                    joinedload(MediaItem.tags),
+                )
+                .where(MediaItem.id.in_(matched_ids))
+            ).unique().all():
+                cand_by_id[item_obj.id] = item_obj
+
+        sorted_items = [target_item] + [cand_by_id[mid] for mid in matched_ids if mid in cand_by_id]
+        scores_map = {target_item.id: 100.0}
+        for mid, sim_val in ranked_faces:
+            if mid in cand_by_id:
+                scores_map[mid] = round(min(99.9, max(0.0, sim_val) * 100.0), 1)
+
+        total_bytes = sum(it.file_size_bytes for it in sorted_items)
+        all_groups = list(db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all())
+        all_volumes = list(db.scalars(select(WindowsVolume)).all())
+        sim_vol_counts = defaultdict(int)
+        for it in sorted_items:
+            sim_vol_counts[it.volume_id] += 1
+
+        face_status_note = "" if query_face_vecs else " (nie wykryto wyraźnej twarzy na miniaturze wzorca)"
+        label = f"{SIMILARITY_MODES[mode]} — Wzorzec (100%): {target_item.file_name}{face_status_note}"
+        return render_template(
+            request,
+            "partials/media_grid.html",
+            {
+                "timeline": {label: sorted_items},
+                "items_flat": sorted_items,
+                "total_matching": len(sorted_items),
+                "total_size_mb": total_bytes / (1024 * 1024),
+                "page": 1,
+                "page_size": 48,
+                "total_pages": 1,
+                "view_mode": "grid",
+                "sort_by": "similarity",
+                "similarity_target_id": target_item.id,
+                "similarity_target_name": target_item.file_name,
+                "similarity_mode": mode,
+                "similarity_modes": SIMILARITY_MODES,
+                "matched_person_ids": [it.id for it in sorted_items],
+                "all_groups": all_groups,
+                "flat_album_choices": build_flat_album_choices(all_groups),
+                "all_volumes": all_volumes,
+                "offline_drives_info": build_offline_drives_queues(sorted_items, sim_vol_counts, all_volumes),
+                "cross_vault_backup_by_item_id": _build_cross_vault_backup_map(db, sorted_items),
+                "similarity_scores": scores_map,
             },
         )
 

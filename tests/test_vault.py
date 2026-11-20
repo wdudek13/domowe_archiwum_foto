@@ -6573,6 +6573,273 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         )
         self.assertEqual(r_v14_res.status_code, 200)
 
+    def test_on_demand_onnx_flowers_manual_tags_album_search_and_offline_face_recognition(self):
+        """
+        Task 5 verification covering all 4 new 100%-local, thumbnail-only, On-Demand features:
+        1) On-Demand ONNX keyword scan (`POST /actions/on-demand-keyword-scan`) finds untagged thumbnails,
+           persists tags to SQLite, and releases the ONNX session (`tagger._session is None`).
+        2) Two-level ImageNet dictionary + Flower HSV heuristic + manual tags (`POST /actions/add-tags`,
+           `POST /actions/remove-tag`) preserved across AI re-runs (`POST /actions/analyze-all`).
+        3) Search by album name/description including subalbums (`Wakacje Mazury / Lipiec` matched by `q=Mazury`).
+        4) Same-person face recognition strictly on local thumbnails for OFFLINE drives
+           (`/semantic/similar/{id}?mode=same_person`, `analysis_type=faces`, `POST /actions/name-person`).
+        """
+        import cv2
+        import numpy as np
+        from app.ai.faces import OnDemandFaceEmbedder
+        from app.ai.tagger import OnDemandObjectTagger
+        from app.models import MediaFace
+
+        def _write_synthetic_flower_thumb(dest: Path) -> Path:
+            # Green foliage background + vivid red/yellow petals in center
+            arr = np.zeros((300, 300, 3), dtype=np.uint8)
+            arr[:, :] = (35, 145, 30)  # BGR green foliage
+            cv2.circle(arr, (150, 150), 68, (40, 25, 235), -1)  # vivid red blossom (~16% area)
+            cv2.circle(arr, (150, 150), 22, (20, 220, 245), -1)  # yellow center
+            img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+            img.save(dest, "WEBP", quality=85)
+            return dest
+
+        def _write_synthetic_face_thumb(dest: Path, bg_bgr, skin_bgr=(138, 178, 226), eye_dx=22, mouth_w=24) -> Path:
+            arr = np.zeros((300, 300, 3), dtype=np.uint8)
+            arr[:, :] = bg_bgr
+            # Oval skin face
+            cv2.ellipse(arr, (150, 145), (56, 72), 0, 0, 360, skin_bgr, -1)
+            # Eyebrows
+            cv2.line(arr, (150 - eye_dx - 12, 112), (150 - eye_dx + 12, 110), (45, 45, 55), 4)
+            cv2.line(arr, (150 + eye_dx - 12, 110), (150 + eye_dx + 12, 112), (45, 45, 55), 4)
+            # Eyes (sclera + dark iris)
+            cv2.ellipse(arr, (150 - eye_dx, 128), (11, 6), 0, 0, 360, (240, 240, 240), -1)
+            cv2.ellipse(arr, (150 + eye_dx, 128), (11, 6), 0, 0, 360, (240, 240, 240), -1)
+            cv2.circle(arr, (150 - eye_dx, 128), 5, (30, 35, 45), -1)
+            cv2.circle(arr, (150 + eye_dx, 128), 5, (30, 35, 45), -1)
+            # Nose bridge & shadow
+            cv2.line(arr, (150, 130), (150, 160), (95, 130, 175), 3)
+            cv2.ellipse(arr, (150, 162), (9, 5), 0, 0, 180, (90, 120, 165), 2)
+            # Mouth
+            cv2.ellipse(arr, (150, 182), (mouth_w, 8), 0, 0, 180, (70, 75, 170), 4)
+            img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+            img.save(dest, "WEBP", quality=90)
+            return dest
+
+        def _write_plain_blue_thumb(dest: Path) -> Path:
+            arr = np.zeros((300, 300, 3), dtype=np.uint8)
+            arr[:, :] = (210, 140, 40)  # BGR sky blue
+            img = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+            img.save(dest, "WEBP", quality=85)
+            return dest
+
+        now_dt = datetime.datetime(2025, 7, 15, 12, 0, 0)
+        with self.TestingSessionLocal() as db:
+            # OFFLINE drive — physical files NEVER exist on Z:\, ONLY local thumbnails exist in self.thumbs_dir!
+            vol_off = WindowsVolume(
+                volume_serial_number="OFF9-9999",
+                volume_label="OfflineArchiwum",
+                last_known_drive_letter="Z:\\",
+                is_online=False,
+            )
+            db.add(vol_off)
+            db.commit()
+            db.refresh(vol_off)
+
+            # Task 3: Album hierarchy `Wakacje Mazury` -> subalbum `Lipiec`
+            grp_parent = MediaGroup(name="Wakacje Mazury", description="Wyjazd nad jeziora")
+            db.add(grp_parent)
+            db.commit()
+            db.refresh(grp_parent)
+            grp_child = MediaGroup(name="Lipiec", parent_id=grp_parent.id)
+            db.add(grp_child)
+            db.commit()
+            db.refresh(grp_child)
+
+            def _add_offline_item(fname: str, thumb_fn, group_id=None):
+                mid = str(uuid.uuid4())
+                t_rel = f"{mid}.webp"
+                thumb_fn(self.thumbs_dir / t_rel)
+                it = MediaItem(
+                    id=mid,
+                    volume_id=vol_off.id,
+                    relative_path=f"OfflineFolder/{fname}",
+                    file_name=fname,
+                    file_size_bytes=204800,
+                    media_type="image",
+                    mime_type="image/jpeg",
+                    file_hash=f"hash_{mid.replace('-', '')}",
+                    hash_algorithm="sha256",
+                    fs_ctime=now_dt,
+                    fs_mtime=now_dt,
+                    effective_date=now_dt,
+                    thumbnail_relative_path=t_rel,
+                    group_id=group_id,
+                    duplicate_role="original",
+                )
+                db.add(it)
+                db.commit()
+                return mid
+
+            flower_id = _add_offline_item("ogrod_roza.jpg", _write_synthetic_flower_thumb)
+            mazury_id = _add_offline_item("jezioro_01.jpg", _write_plain_blue_thumb, group_id=grp_child.id)
+            # Same person (Ania) on two completely different backgrounds!
+            ania1_id = _add_offline_item("portret_ania_plaza.jpg", lambda p: _write_synthetic_face_thumb(p, bg_bgr=(220, 160, 60)))
+            ania2_id = _add_offline_item("portret_ania_las.jpg", lambda p: _write_synthetic_face_thumb(p, bg_bgr=(35, 110, 40)))
+
+        # ---------------------------------------------------------------------
+        # 1) Task 3: Album name search finds photos in subalbum (`Wakacje Mazury / Lipiec` via `q=Mazury`)
+        # ---------------------------------------------------------------------
+        r_alb = self.client.get("/media/search", params={"q": "Mazury"})
+        self.assertEqual(r_alb.status_code, 200)
+        self.assertIn("jezioro_01.jpg", r_alb.text)
+        self.assertNotIn("ogrod_roza.jpg", r_alb.text)
+        # Also verify sidebar renders album search input
+        r_sb = self.client.get("/media/sidebar")
+        self.assertIn("Szukaj albumu...", r_sb.text)
+
+        # ---------------------------------------------------------------------
+        # 2) Task 1: On-Demand Keyword Scan on untagged local thumbnails + session release check
+        # ---------------------------------------------------------------------
+        # Before scan, searching "kwiaty" finds 0 items and offers the on-demand AI button
+        r_kw_before = self.client.get("/media/search", params={"q": "kwiaty"})
+        self.assertNotIn("ogrod_roza.jpg", r_kw_before.text)
+        self.assertIn("/actions/on-demand-keyword-scan", r_kw_before.text)
+
+        # Verify direct scan_thumbnails_for_keyword releases ONNX session (`tagger._session is None`)
+        tagger_check = OnDemandObjectTagger()
+        with self.TestingSessionLocal() as db:
+            scan_res = tagger_check.scan_thumbnails_for_keyword(db, "kwiaty", thumbnails_dir=self.thumbs_dir)
+        self.assertIsNone(tagger_check._session, "ONNX session MUST be released immediately after scan!")
+        self.assertTrue(scan_res["session_released"])
+        self.assertIn(flower_id, scan_res["matched_ids"])
+
+        # Also test HTTP endpoint POST /actions/on-demand-keyword-scan
+        r_od = self.client.post("/actions/on-demand-keyword-scan", data={"q": "kwiaty"})
+        self.assertEqual(r_od.status_code, 200)
+        self.assertIn("Przeszukano miniatury AI", r_od.text)
+
+        # Now searching "kwiaty" finds ogrod_roza.jpg instantly from SQLite!
+        r_kw_after = self.client.get("/media/search", params={"q": "kwiaty"})
+        self.assertIn("ogrod_roza.jpg", r_kw_after.text)
+
+        # ---------------------------------------------------------------------
+        # 3) Task 2: Two-level ImageNet tagging (category + detailed tag) + manual tags preserved across AI re-run + remove-tag
+        # ---------------------------------------------------------------------
+        # Verify two-level tagging produces BOTH category (`kwiaty / rosliny`) AND detailed tag (`stokrotka (daisy)`)
+        daisy_probs = np.zeros(1000, dtype=np.float32)
+        daisy_probs[985] = 0.85  # ImageNet 985 = daisy
+        tagger_2lvl = OnDemandObjectTagger()
+        tagger_2lvl.labels = {"985": "daisy"}
+        tagger_2lvl._session = MagicMock()
+        with patch.object(tagger_2lvl, "_run_onnx_probs", return_value=daisy_probs):
+            tags_with_src = tagger_2lvl.tag_image_with_sources(self.thumbs_dir / f"{flower_id}.webp")
+        tag_src_map = {t: src for t, _c, src in tags_with_src}
+        self.assertIn("kwiaty / rosliny", tag_src_map)
+        self.assertEqual(tag_src_map["kwiaty / rosliny"], "opencv+onnx")
+        self.assertIn("stokrotka (daisy)", tag_src_map)
+        self.assertEqual(tag_src_map["stokrotka (daisy)"], "onnx_detail")
+        tagger_2lvl.close_session()
+        self.assertIsNone(tagger_2lvl._session)
+
+        # Add manual tags (`róże babci, komunia`) via POST /actions/add-tags
+        r_add_m = self.client.post(
+            "/actions/add-tags",
+            data={"media_id": flower_id, "tags": "róże babci, komunia"},
+        )
+        self.assertEqual(r_add_m.status_code, 200)
+        with self.TestingSessionLocal() as db:
+            m_tags = list(
+                db.scalars(
+                    select(MediaTag).where(MediaTag.media_id == flower_id, MediaTag.source_model == "manual")
+                ).all()
+            )
+            self.assertEqual({t.tag for t in m_tags}, {"róże babci", "komunia"})
+
+        # Searchable immediately by manual tag
+        r_find_manual = self.client.get("/media/search", params={"q": "komunia"})
+        self.assertIn("ogrod_roza.jpg", r_find_manual.text)
+
+        # Re-running AI tagging (`POST /actions/analyze-all` with `analysis_type=tags`) MUST PRESERVE manual tags!
+        r_reai = self.client.post(
+            "/actions/analyze-all",
+            data={
+                "analysis_type": "tags",
+                "scope": "selected",
+                "selected_ids": [flower_id],
+                "run_sync": "true",
+            },
+        )
+        self.assertEqual(r_reai.status_code, 200)
+        with self.TestingSessionLocal() as db:
+            m_tags_after = list(
+                db.scalars(
+                    select(MediaTag).where(MediaTag.media_id == flower_id, MediaTag.source_model == "manual")
+                ).all()
+            )
+            self.assertEqual(
+                {t.tag for t in m_tags_after},
+                {"róże babci", "komunia"},
+                "Manual tags MUST NOT be deleted when AI tagging is re-run!",
+            )
+            komunia_row = next(t for t in m_tags_after if t.tag == "komunia")
+            komunia_tid = komunia_row.id
+
+        # Removing a single tag via POST /actions/remove-tag removes ONLY that tag
+        r_rm_tag = self.client.post(
+            "/actions/remove-tag",
+            data={"media_id": flower_id, "tag_id": str(komunia_tid)},
+        )
+        self.assertEqual(r_rm_tag.status_code, 200)
+        with self.TestingSessionLocal() as db:
+            rem_manual = {
+                t.tag
+                for t in db.scalars(
+                    select(MediaTag).where(MediaTag.media_id == flower_id, MediaTag.source_model == "manual")
+                ).all()
+            }
+            self.assertEqual(rem_manual, {"róże babci"})
+
+        # ---------------------------------------------------------------------
+        # 4) Task 4: Offline Same-Person Face Indexing, Similarity Search & Person Naming
+        # ---------------------------------------------------------------------
+        # Run face indexing via Analyze AI (`analysis_type=faces`) on OFFLINE drive thumbnails
+        r_face_idx = self.client.post(
+            "/actions/analyze-all",
+            data={
+                "analysis_type": "faces",
+                "target_drive_scope": "all_drives",
+                "run_sync": "true",
+            },
+        )
+        self.assertEqual(r_face_idx.status_code, 200)
+        self.assertIn("Zaindeksowano twarze na miniaturach", r_face_idx.text)
+
+        with self.TestingSessionLocal() as db:
+            faces_a1 = list(db.scalars(select(MediaFace).where(MediaFace.media_id == ania1_id)).all())
+            faces_a2 = list(db.scalars(select(MediaFace).where(MediaFace.media_id == ania2_id)).all())
+            self.assertGreaterEqual(len(faces_a1), 1, "Face must be detected on offline thumbnail ania1!")
+            self.assertGreaterEqual(len(faces_a2), 1, "Face must be detected on offline thumbnail ania2!")
+            self.assertEqual(len(faces_a1[0].vector), OnDemandFaceEmbedder.VECTOR_DIM * 4)
+
+        # Find same person across completely different backgrounds strictly from offline thumbnails!
+        r_same = self.client.get(f"/semantic/similar/{ania1_id}", params={"mode": "same_person"})
+        self.assertEqual(r_same.status_code, 200)
+        self.assertIn("portret_ania_plaza.jpg", r_same.text)
+        self.assertIn("portret_ania_las.jpg", r_same.text)
+        self.assertNotIn("jezioro_01.jpg", r_same.text)
+        self.assertIn("Nazwij tę osobę", r_same.text)
+
+        # Name this person ("Ania") via POST /actions/name-person -> searchable immediately via q=Ania!
+        r_name = self.client.post(
+            "/actions/name-person",
+            data={"person_name": "Ania", "selected_ids": [ania1_id, ania2_id]},
+        )
+        self.assertEqual(r_name.status_code, 200)
+        self.assertIn("Ania", r_name.text)
+
+        r_find_ania = self.client.get("/media/search", params={"q": "Ania"})
+        self.assertEqual(r_find_ania.status_code, 200)
+        self.assertIn("portret_ania_plaza.jpg", r_find_ania.text)
+        self.assertIn("portret_ania_las.jpg", r_find_ania.text)
+        self.assertNotIn("jezioro_01.jpg", r_find_ania.text)
+
 
 if __name__ == "__main__":
     unittest.main()

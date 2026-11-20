@@ -95,6 +95,7 @@ class MediaItem(Base):
     group: Mapped[Optional["MediaGroup"]] = relationship("MediaGroup", back_populates="media_items")
     tags: Mapped[List["MediaTag"]] = relationship("MediaTag", back_populates="media_item", cascade="all, delete-orphan")
     embedding: Mapped[Optional["MediaEmbedding"]] = relationship("MediaEmbedding", back_populates="media_item", uselist=False, cascade="all, delete-orphan")
+    faces: Mapped[List["MediaFace"]] = relationship("MediaFace", back_populates="media_item", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("idx_media_composite_filter", "media_type", "effective_date"),
@@ -121,6 +122,23 @@ class MediaEmbedding(Base):
     vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
     media_item: Mapped["MediaItem"] = relationship("MediaItem", back_populates="embedding")
+
+
+class MediaFace(Base):
+    """Stores detected face bounding boxes and 256-D L2-normalized identity vectors computed strictly from local thumbnails."""
+    __tablename__ = "media_faces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    media_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("media_items.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    face_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bbox_json: Mapped[str] = mapped_column(String(128), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    person_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    media_item: Mapped["MediaItem"] = relationship("MediaItem", back_populates="faces")
 
 
 class BackgroundJob(Base):
