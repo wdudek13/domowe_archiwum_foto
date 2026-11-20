@@ -314,7 +314,7 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIsNone(cp_rsn)
         self.assertEqual(cp_eff, datetime.datetime(2021, 3, 20, 9, 0))
 
-        # Rule (a): EXIF is effective_date; disagreements with path and filename ARE flagged cleanly
+        # Rule (a): Valid EXIF is authoritative effective_date -> NEVER an anomaly, even if folder/filename differ!
         ex_eff, ex_anom, ex_rsn = MetadataDateResolver.evaluate_date_sources(
             exif=datetime.datetime(2023, 5, 10, 12, 0),
             fn_date=datetime.datetime(2021, 5, 10, 12, 0),
@@ -323,9 +323,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             folder_info=(datetime.datetime(2021, 5, 1, 0, 0), "month", "2021-05"),
         )
         self.assertEqual(ex_eff, datetime.datetime(2023, 5, 10, 12, 0))
-        self.assertTrue(ex_anom)
-        self.assertIn("ścieżce", ex_rsn)
-        self.assertIn("nazwie pliku", ex_rsn)
+        self.assertFalse(ex_anom)
+        self.assertIsNone(ex_rsn)
 
         # Rule (a) when EXIF matches folder & filename (even if ctime/mtime are much newer) -> NO anomaly
         ex_ok_eff, ex_ok_anom, ex_ok_rsn = MetadataDateResolver.evaluate_date_sources(
@@ -363,18 +362,18 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertFalse(anom_agree)
         self.assertEqual(eff_agree, datetime.datetime(2022, 4, 5, 11, 5))
 
-        # Test EXIF parsing on JpegImageFile (EXIF matches plain filename -> NO anomaly; mismatched filename -> anomaly)
+        # Test EXIF parsing on JpegImageFile (valid EXIF -> effective=EXIF, ALWAYS NO anomaly even if filename differs)
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "2023:05:10 12:30:45"}):
             ex_dt, _, _, _, eff_dt, anom, rsn = MetadataDateResolver.resolve_dates(plain_img, is_image=True)
             self.assertEqual(ex_dt, datetime.datetime(2023, 5, 10, 12, 30, 45))
             self.assertEqual(eff_dt, ex_dt)
             self.assertFalse(anom)
             self.assertIsNone(rsn)
-            # On IMG_20210510_123045.jpg, EXIF 2023 disagrees with filename 2021 -> effective=EXIF, anomaly=True
+            # On IMG_20210510_123045.jpg, valid EXIF 2023 is authoritative -> effective=EXIF, anomaly=False
             _, _, _, _, eff_mm, anom_mm, rsn_mm = MetadataDateResolver.resolve_dates(img_file, is_image=True)
             self.assertEqual(eff_mm, datetime.datetime(2023, 5, 10, 12, 30, 45))
-            self.assertTrue(anom_mm)
-            self.assertIn("nazwie pliku", rsn_mm)
+            self.assertFalse(anom_mm)
+            self.assertIsNone(rsn_mm)
 
         with patch.object(JpegImagePlugin.JpegImageFile, "_getexif", return_value={36867: "bad-date"}):
             self.assertIsNone(MetadataDateResolver.parse_exif(img_file))

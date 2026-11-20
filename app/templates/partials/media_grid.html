@@ -145,17 +145,11 @@
                 <div class="font-bold text-amber-300 text-sm">⚠️ Niezgodność dat — wykryte rozbieżności ({{ total_matching }} szt.)</div>
                 <div class="text-slate-300 text-[11px]">
                     {% if cur_at == 'folder' %}
-                        <strong>Przyczyna:</strong> Rok/miesiąc z nazwy folderu nadrzędnego nie zgadza się z datą pliku lub datą zaszytą w nazwie pliku.
+                        <strong>Przyczyna:</strong> Plik bez daty EXIF — data modyfikacji (<code>mtime</code>) nie zgadza się z rokiem/miesiącem w ścieżce folderu.
                     {% elif cur_at == 'filename' %}
-                        <strong>Przyczyna:</strong> Data zapisana w nazwie pliku (np. <code>IMG_20210510</code>) jest starsza lub inna niż data utworzenia/EXIF na dysku.
-                    {% elif cur_at == 'copy_ctime' %}
-                        <strong>Przyczyna (kopiowanie):</strong> System Windows nadał nową datę utworzenia (<code>ctime</code>) podczas kopiowania pliku, podczas gdy data modyfikacji (<code>mtime</code>) jest starsza.
-                    {% elif cur_at == 'exif' %}
-                        <strong>Przyczyna:</strong> Data w nagłówku EXIF/kontenerze różni się od systemu plików lub struktury katalogów.
-                    {% elif cur_at == 'other' %}
-                        <strong>Przyczyna:</strong> Inna lub ręcznie oznaczona niezgodność daty.
+                        <strong>Przyczyna:</strong> Plik bez daty EXIF — data modyfikacji (<code>mtime</code>) nie zgadza się z datą zapisaną w nazwie pliku (np. <code>IMG_20210510</code>).
                     {% else %}
-                        Oznacza pliki z niezgodnością dat między folderem, nazwą pliku, EXIF lub datą zmodyfikowaną podczas kopiowania (ustawiono datę najbardziej prawdopodobną).
+                        Oznacza pliki bez daty EXIF, których data modyfikacji (<code>mtime</code>) nie zgadza się z datą w ścieżce (folderze) lub w nazwie pliku. Pliki z poprawną datą EXIF nie są oznaczane jako anomalie.
                     {% endif %}
                 </div>
             </div>
@@ -198,18 +192,6 @@
             <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'filename'})"
                     class="px-2.5 py-1 rounded-lg border {% if cur_at == 'filename' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-sky-200 border-borderBg hover:bg-slate-800{% endif %}">
                 🏷️ Data pliku vs nazwa ({{ ab.get('filename', 0) }})
-            </button>
-            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'copy_ctime'})"
-                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'copy_ctime' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-orange-200 border-borderBg hover:bg-slate-800{% endif %}">
-                📋 Ślad kopiowania (ctime &gt; mtime) ({{ ab.get('copy_ctime', 0) }})
-            </button>
-            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'exif'})"
-                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'exif' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-purple-200 border-borderBg hover:bg-slate-800{% endif %}">
-                📷 EXIF ({{ ab.get('exif', 0) }})
-            </button>
-            <button type="button" onclick="applySidebarFilter({anomaly_only: true, anomaly_type: 'other'})"
-                    class="px-2.5 py-1 rounded-lg border {% if cur_at == 'other' %}bg-amber-600 text-white border-amber-400 font-bold{% else %}bg-slate-900 text-slate-300 border-borderBg hover:bg-slate-800{% endif %}">
-                ❓ Inne ({{ ab.get('other', 0) }})
             </button>
         </div>
     </div>

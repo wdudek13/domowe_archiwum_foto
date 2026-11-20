@@ -369,14 +369,15 @@ class MetadataDateResolver:
     ) -> Tuple[datetime.datetime, bool, Optional[str]]:
         """
         Resolves effective date and date discrepancies:
-        a) If valid EXIF date exists -> effective_date = EXIF.
+        a) If valid EXIF date exists -> effective_date = EXIF and NEVER an anomaly (EXIF is authoritative,
+           there is no ambiguity about effective_date regardless of folder path or filename).
         b) If EXIF is absent -> effective_date = mtime (file modification date; fallback to ctime only if mtime invalid),
            even when it differs from ctime, filename date, or path/folder date.
-        Discrepancy (anomaly) rules:
-        - Missing EXIF is NEVER an anomaly.
+           Discrepancy (anomaly) is flagged ONLY in this no-EXIF case, when effective_date disagrees with:
+           - date in path/folder -> flag path discrepancy, and/or
+           - date in filename -> flag filename discrepancy.
+        - Missing EXIF alone is NEVER an anomaly.
         - Difference between ctime and mtime is NEVER an anomaly (still shown in file details).
-        - If effective_date disagrees with date in path/folder -> flag path discrepancy.
-        - If effective_date disagrees with date in filename -> flag filename discrepancy.
         """
         now_upper = datetime.datetime.utcnow() + datetime.timedelta(days=1)
         valid_exif = exif if cls._is_valid_date(exif, now_upper) else None
@@ -384,11 +385,9 @@ class MetadataDateResolver:
         valid_ctime = ctime if cls._is_valid_date(ctime, now_upper) else now_upper
 
         if valid_exif is not None:
-            effective = valid_exif
-        elif valid_mtime is not None:
-            effective = valid_mtime
-        else:
-            effective = valid_ctime
+            return valid_exif, False, None
+
+        effective = valid_mtime if valid_mtime is not None else valid_ctime
 
         valid_fn = fn_date if cls._is_valid_date(fn_date, now_upper) else None
         valid_folder: Optional[Tuple[datetime.datetime, str, str]] = None
