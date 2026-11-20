@@ -235,13 +235,12 @@
                     <button type="button" onclick="applySidebarFilter({_reset: true, volume_id: '{{ v.id }}'})"
                             class="flex items-center space-x-1.5 truncate text-left flex-1">
                         <span class="w-2 h-2 rounded-full flex-shrink-0 {% if v.is_online %}bg-emerald-400{% else %}bg-rose-500{% endif %}"></span>
-                        <span class="font-medium text-slate-200 truncate" title="{{ v.volume_label }}">{{ v.volume_label }}</span>
-                        <span class="text-slate-400 font-mono text-[10px]">({{ v.last_known_drive_letter }})</span>
+                        <span class="font-medium text-slate-200 truncate" title="{{ v.volume_label }} (VSN: {{ v.volume_serial_number }})">{{ v.volume_label }}</span>
                     </button>
                     <div class="flex items-center space-x-1">
                         <button type="button"
                                 title="Nadaj krótką nazwę dysku"
-                                onclick="const n = prompt('Podaj krótką nazwę dla dysku {{ v.last_known_drive_letter }}:', '{{ v.volume_label }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/rename-volume', {values: {volume_id: '{{ v.id }}', new_label: n.trim()}, target: '#global-notification'});"
+                                onclick="const n = prompt('Podaj krótką nazwę dla dysku (VSN: {{ v.volume_serial_number }}):', '{{ v.volume_label }}'); if(n && n.trim()) htmx.ajax('POST', '/actions/rename-volume', {values: {volume_id: '{{ v.id }}', new_label: n.trim()}, target: '#global-notification'});"
                                 class="text-[10px] text-slate-400 hover:text-indigo-300 px-1">✏️</button>
                         <button type="button"
                                 title="Wyindeksuj cały ten dysk z bazy (pliki na dysku pozostaną)"

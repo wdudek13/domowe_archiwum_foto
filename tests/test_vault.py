@@ -3969,7 +3969,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(r_mv_exec.status_code, 200)
             self.assertIn("Przeniesiono backupów", r_mv_exec.text)
             self.assertTrue(any((drive_c / "daf_backup").rglob("green_2.jpg")))
-            self.assertFalse(any((self.drive_b / "daf_backup").rglob("green_2.jpg")))
+            # Immutable daf_backup/ policy: existing file in source daf_backup/ is NEVER deleted
+            self.assertTrue(any((self.drive_b / "daf_backup").rglob("green_2.jpg")))
 
             # Now test remote backup consolidation (minimize_transfers=False) via /actions/execute-backup
             p_rem_orig = create_synthetic_jpeg(self.drive_a / "remote_consol.jpg", color=(150, 60, 20))
@@ -3991,7 +3992,8 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             )
             self.assertEqual(r_exec_consol.status_code, 200)
             self.assertTrue(any((drive_c / "daf_backup").rglob("remote_consol.jpg")))
-            self.assertFalse(p_rem_bkp.exists())
+            # Immutable daf_backup/ policy: existing source file inside daf_backup/ is NEVER deleted
+            self.assertTrue(p_rem_bkp.exists())
 
             # Also verify duplicate view in all 3 modes (table, compact, grid) + detail modal
             self.assertEqual(self.client.get("/media/search?duplicates_only=true&view_mode=table").status_code, 200)
@@ -5723,6 +5725,424 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
             self.assertEqual(job.status, "COMPLETED")
             self.assertIn("1 z 1 (100.0%)", job.last_message)
             self.assertFalse(p_dup.exists())
+
+    def test_important_album_action_move_path_preservation_and_offline_backup_preview_fallback(self):
+        """
+        1) POST /actions/assign-important-albums assigns Originals with >=2 non-backup copies on the same disk
+           to 'Ważne - <device>/YYYY/MM/DD' purely in DB (works when drives are offline).
+        2) organize_ungrouped_originals moves without copying, and both organize_ungrouped_originals and
+           schedule_or_execute_moves preserve original_relative_path across multiple moves (searchable via /media/search).
+        3) When an Original's disk is offline but a backup copy is online, /media/{id}/raw, /media/search
+           (lightbox/slideshow), and /media/{id}/detail serve full media read-only from the online backup
+           without touching the backup when operations target the Original.
+        """
+        from app.scanner import FileScannerService
+
+        p_imp1 = create_synthetic_jpeg(self.drive_a / "wakacje_stare" / "imp_photo.jpg", color=(33, 66, 99))
+        p_imp2 = self.drive_a / "kopia_lokalna" / "imp_photo_copy.jpg"
+        p_imp2.parent.mkdir(parents=True, exist_ok=True)
+        p_imp2.write_bytes(p_imp1.read_bytes())
+
+        p_move = create_synthetic_jpeg(self.drive_a / "archiwum_2022" / "move_me.jpg", color=(120, 45, 75))
+        p_off = create_synthetic_jpeg(self.drive_a / "offline_src" / "off_photo.jpg", color=(190, 140, 30))
+        p_off_bkp = self.drive_b / "daf_backup" / "2025" / "03" / "03" / "off_photo.jpg"
+        p_off_bkp.parent.mkdir(parents=True, exist_ok=True)
+        p_off_bkp.write_bytes(p_off.read_bytes())
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA44-1111",
+                volume_label="FotoOffA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB44-2222",
+                volume_label="BackupOnB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+                total_space_bytes=50 * 1024**3,
+                free_space_bytes=40 * 1024**3,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+
+            it_imp1 = FileScannerService.process_file(p_imp1, vol_a)
+            it_imp2 = FileScannerService.process_file(p_imp2, vol_a)
+            it_move = FileScannerService.process_file(p_move, vol_a)
+            it_off = FileScannerService.process_file(p_off, vol_a)
+            it_off_bkp = FileScannerService.process_file(p_off_bkp, vol_b)
+
+            it_imp1.duplicate_role = "original"
+            it_imp1.is_primary_duplicate = True
+            it_imp2.duplicate_role = "duplicate"
+            it_imp2.is_primary_duplicate = False
+            it_move.duplicate_role = "original"
+            it_move.is_primary_duplicate = True
+            it_off.duplicate_role = "original"
+            it_off.is_primary_duplicate = True
+            it_off_bkp.is_backup_copy = True
+            it_off_bkp.duplicate_role = "backup_green"
+            it_off_bkp.is_primary_duplicate = False
+
+            # Also add an offline video with an online backup copy
+            p_vid_bkp = self.drive_b / "daf_backup" / "2025" / "03" / "04" / "clip_off.mp4"
+            p_vid_bkp.parent.mkdir(parents=True, exist_ok=True)
+            p_vid_bkp.write_bytes(b"FAKE_MP4_STREAM_PAYLOAD_1234567890")
+            it_vid_off = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_a.id,
+                relative_path="offline_src/clip_off.mp4",
+                file_name="clip_off.mp4",
+                file_size_bytes=34,
+                media_type="video",
+                mime_type="video/mp4",
+                file_hash="vid_fallback_hash_44",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                fs_mtime=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                effective_date=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                thumbnail_relative_path="vid_fb_thumb.webp",
+                duplicate_role="original",
+                is_primary_duplicate=True,
+            )
+            it_vid_bkp = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_b.id,
+                relative_path="daf_backup/2025/03/04/clip_off.mp4",
+                file_name="clip_off.mp4",
+                file_size_bytes=34,
+                media_type="video",
+                mime_type="video/mp4",
+                file_hash="vid_fallback_hash_44",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                fs_mtime=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                effective_date=datetime.datetime(2025, 3, 4, 12, 0, 0),
+                thumbnail_relative_path="vid_fb_thumb.webp",
+                is_backup_copy=True,
+                duplicate_role="backup_green",
+                is_primary_duplicate=False,
+            )
+            db.add_all([it_imp1, it_imp2, it_move, it_off, it_off_bkp, it_vid_off, it_vid_bkp])
+            db.commit()
+
+            vol_a_id, vol_b_id = vol_a.id, vol_b.id
+            imp1_id, move_id = it_imp1.id, it_move.id
+            off_id, off_bkp_id = it_off.id, it_off_bkp.id
+            vid_off_id = it_vid_off.id
+
+            # 1) Assign 'Ważne' album purely in DB even while FotoOffA is offline
+            vol_a.is_online = False
+            db.commit()
+            r_imp = self.client.post("/actions/assign-important-albums")
+            self.assertEqual(r_imp.status_code, 200)
+            self.assertIn("1 oryginałów", r_imp.text)
+            db.expire_all()
+            imp1_db = db.get(MediaItem, imp1_id)
+            self.assertIsNotNone(imp1_db.group_id)
+            move_db = db.get(MediaItem, move_id)
+            self.assertIsNone(move_db.group_id)
+
+            # 2) Organize ungrouped originals moves without copying, then schedule_or_execute_moves preserves BOTH paths
+            vol_a_db = db.get(WindowsVolume, vol_a_id)
+            vol_a_db.is_online = True
+            db.commit()
+            vsn_both = {
+                "AA44-1111": (str(self.drive_a), "FotoOffA"),
+                "BB44-2222": (str(self.drive_b), "BackupOnB"),
+            }
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_both):
+                svc = StorageAutomationService(db)
+                org_res = svc.organize_ungrouped_originals(volume_id=vol_a_id)
+                self.assertGreaterEqual(org_res["moved_count"], 1)
+                self.assertFalse(p_move.exists())  # Moved, NOT copied!
+                db.expire_all()
+                move_db = db.get(MediaItem, move_id)
+                self.assertTrue(move_db.relative_path.startswith("daf_oryginal/"))
+                self.assertIn("FotoOffA/archiwum_2022/move_me.jpg", move_db.original_relative_path)
+                self.assertTrue((self.drive_a / move_db.relative_path).exists())
+
+                # Move again to another subfolder via schedule_or_execute_moves -> original path must remain preserved!
+                mv_res = svc.schedule_or_execute_moves([move_db], vol_a_id, target_subfolder="wybrane_final")
+                self.assertEqual(mv_res["moved_physically"], 1)
+                db.expire_all()
+                move_db = db.get(MediaItem, move_id)
+                self.assertTrue(move_db.relative_path.startswith("wybrane_final/"))
+                self.assertIn("FotoOffA/archiwum_2022/move_me.jpg", move_db.original_relative_path)
+                self.assertIn("daf_oryginal/", move_db.original_relative_path)
+
+            # Search by original path finds the twice-moved original
+            r_search_orig = self.client.get("/media/search", params={"q": "archiwum_2022"})
+            self.assertEqual(r_search_orig.status_code, 200)
+            self.assertIn("move_me.jpg", r_search_orig.text)
+
+            # 3) Disconnect FotoOffA -> BackupOnB stays online -> /raw, /search, and /detail use read-only backup fallback
+            vol_a_db = db.get(WindowsVolume, vol_a_id)
+            vol_a_db.is_online = False
+            db.commit()
+            vsn_only_b = {"BB44-2222": (str(self.drive_b), "BackupOnB")}
+            with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_only_b):
+                r_raw = self.client.get(f"/media/{off_id}/raw")
+                self.assertEqual(r_raw.status_code, 200)
+                self.assertEqual(r_raw.content, p_off_bkp.read_bytes())
+                self.assertIn("BackupOnB", r_raw.headers.get("X-DAF-Preview-Fallback", ""))
+
+                r_raw_vid = self.client.get(f"/media/{vid_off_id}/raw")
+                self.assertEqual(r_raw_vid.status_code, 200)
+                self.assertEqual(r_raw_vid.content, b"FAKE_MP4_STREAM_PAYLOAD_1234567890")
+                self.assertIn("BackupOnB", r_raw_vid.headers.get("X-DAF-Preview-Fallback", ""))
+
+                r_grid = self.client.get("/media/search", params={"q": "off_photo.jpg"})
+                self.assertEqual(r_grid.status_code, 200)
+                self.assertIn('data-fallback-label="BackupOnB', r_grid.text)
+
+                r_vid_det = self.client.get(f"/media/{vid_off_id}/detail")
+                self.assertEqual(r_vid_det.status_code, 200)
+                self.assertIn(f'<video src="/media/{vid_off_id}/raw"', r_vid_det.text)
+                self.assertIn("Podgląd z kopii online", r_vid_det.text)
+
+                # Mutating operation (rotate) on Original affects ONLY Original, never touches backup copy
+                r_rot = self.client.post("/actions/rotate-media", data={"media_id": off_id, "delta": "90"})
+                self.assertEqual(r_rot.status_code, 200)
+                db.expire_all()
+                self.assertEqual(db.get(MediaItem, off_id).rotation_angle, 90)
+                self.assertEqual(db.get(MediaItem, off_bkp_id).rotation_angle, 0)
+                self.assertTrue(p_off_bkp.exists())
+
+            # 4) Verify legacy media_groups UNIQUE(name) migration drops the constraint while preserving rows
+            from app import database as db_module
+            legacy_db = self.root / "legacy_unique_groups.db"
+            lconn = sqlite3.connect(legacy_db.as_posix())
+            lconn.execute(
+                """
+                CREATE TABLE media_groups (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    name VARCHAR(128) NOT NULL,
+                    description TEXT,
+                    target_volume_id INTEGER,
+                    created_at DATETIME NOT NULL,
+                    UNIQUE (name)
+                )
+                """
+            )
+            lconn.execute(
+                "INSERT INTO media_groups (id, name, created_at) VALUES (1, '2024', '2025-01-01 00:00:00')"
+            )
+            lconn.commit()
+            lconn.close()
+
+            db_module.ensure_schema_migrations(legacy_db)
+
+            lconn2 = sqlite3.connect(legacy_db.as_posix())
+            ddl_after = lconn2.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='media_groups'"
+            ).fetchone()[0]
+            self.assertNotIn("UNIQUE", ddl_after.upper())
+            # Inserting a second sub-album named '2024' under a different parent must now succeed
+            lconn2.execute(
+                "INSERT INTO media_groups (name, parent_id, is_trashed, created_at) VALUES ('2024', 1, 0, '2025-01-02 00:00:00')"
+            )
+            cnt_2024 = lconn2.execute("SELECT COUNT(*) FROM media_groups WHERE name='2024'").fetchone()[0]
+            lconn2.close()
+            self.assertEqual(cnt_2024, 2)
+
+    def test_delete_permanently_respects_unbacked_filter_vsn_check_and_blocks_unfiltered_wipe(self):
+        """
+        Regression test for critical safety fixes:
+        1) scope=filtered with unbacked_only=true deletes ONLY unbacked items, NEVER backed-up originals.
+        2) _execute_delete_permanently_items verifies VSN and NEVER deletes files on a swapped drive letter.
+        3) scope=filtered with no active filters is refused to prevent accidental full-archive wipe.
+        """
+        from app.scanner import FileScannerService
+
+        p_backed_orig = create_synthetic_jpeg(self.drive_a / "family_safe.jpg", color=(10, 90, 200))
+        p_backed_bkp = self.drive_b / "daf_backup" / "2025" / "05" / "05" / "family_safe.jpg"
+        p_backed_bkp.parent.mkdir(parents=True, exist_ok=True)
+        p_backed_bkp.write_bytes(p_backed_orig.read_bytes())
+
+        p_unbacked = create_synthetic_jpeg(self.drive_a / "unbacked_only.jpg", color=(200, 40, 20))
+        # File on drive_a with same relative path as an offline volume claiming drive_a's letter
+        p_swapped = create_synthetic_jpeg(self.drive_a / "shared_rel.jpg", color=(70, 180, 90))
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA99-1111",
+                volume_label="SafeDriveA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB99-2222",
+                volume_label="SafeBackupB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            vol_off_same_letter = WindowsVolume(
+                volume_serial_number="CC99-3333",
+                volume_label="OfflineSameLetter",
+                last_known_drive_letter=str(self.drive_a),  # Same letter as SafeDriveA, different VSN!
+                is_online=False,
+            )
+            db.add_all([vol_a, vol_b, vol_off_same_letter])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            db.refresh(vol_off_same_letter)
+
+            it_orig = FileScannerService.process_file(p_backed_orig, vol_a)
+            it_bkp = FileScannerService.process_file(p_backed_bkp, vol_b)
+            it_unb = FileScannerService.process_file(p_unbacked, vol_a)
+            it_orig.duplicate_role = "original"
+            it_bkp.is_backup_copy = True
+            it_bkp.duplicate_role = "backup_green"
+            it_bkp.is_primary_duplicate = False
+            it_unb.duplicate_role = "original"
+
+            it_off_fake = MediaItem(
+                id=str(uuid.uuid4()),
+                volume_id=vol_off_same_letter.id,
+                relative_path="shared_rel.jpg",
+                file_name="shared_rel.jpg",
+                file_size_bytes=p_swapped.stat().st_size,
+                media_type="image",
+                mime_type="image/jpeg",
+                file_hash="swapped_vsn_unique_hash",
+                hash_algorithm="sha256",
+                fs_ctime=datetime.datetime(2025, 5, 5),
+                fs_mtime=datetime.datetime(2025, 5, 5),
+                effective_date=datetime.datetime(2025, 5, 5),
+                thumbnail_relative_path="swap_thumb.webp",
+                duplicate_role="original",
+            )
+            db.add_all([it_orig, it_bkp, it_unb, it_off_fake])
+            db.commit()
+            orig_id, unb_id, off_fake_id = it_orig.id, it_unb.id, it_off_fake.id
+
+        vsn_map = {
+            "AA99-1111": (str(self.drive_a), "SafeDriveA"),
+            "BB99-2222": (str(self.drive_b), "SafeBackupB"),
+        }
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_map):
+            # 1) Unfiltered scope=filtered must be BLOCKED
+            r_blk = self.client.post(
+                "/actions/delete-permanently",
+                data={"scope": "filtered", "skip_db_backup": "true"},
+            )
+            self.assertEqual(r_blk.status_code, 200)
+            self.assertIn("Zablokowano trwałe usuwanie", r_blk.text)
+            self.assertTrue(p_backed_orig.exists())
+            self.assertTrue(p_unbacked.exists())
+
+            # 2) scope=filtered with unbacked_only=true deletes ONLY unbacked items, NEVER backed-up family_safe.jpg
+            r_unb = self.client.post(
+                "/actions/delete-permanently",
+                data={"scope": "filtered", "unbacked_only": "true", "skip_db_backup": "true"},
+            )
+            self.assertEqual(r_unb.status_code, 200)
+            self.assertTrue(p_backed_orig.exists())
+            self.assertFalse(p_unbacked.exists())
+            # 3) VSN mismatch protection: OfflineSameLetter pointed at drive_a/shared_rel.jpg, MUST NOT delete drive_a/shared_rel.jpg!
+            self.assertTrue(p_swapped.exists())
+
+        with self.TestingSessionLocal() as db:
+            self.assertIsNotNone(db.get(MediaItem, orig_id))
+            self.assertIsNone(db.get(MediaItem, unb_id))
+            self.assertIsNone(db.get(MediaItem, off_fake_id))
+
+    def test_daf_backup_immutability_shared_thumb_protection_and_delete_preview(self):
+        """
+        1) _safe_unlink and _safe_move hard-block deleting or overwriting existing files in daf_backup/.
+        2) POST /actions/delete-permanently refuses to delete daf_backup/ items and preserves thumbnails shared with backups.
+        3) POST /actions/delete-preview returns exact file count and breakdown by drive label (without drive letters).
+        """
+        from app.scanner import FileScannerService
+        from app.storage_ops import _safe_unlink, _safe_move, _safe_copy_new_to_daf_backup
+
+        p_orig = create_synthetic_jpeg(self.drive_a / "orig_shared_thumb.jpg", color=(80, 120, 160))
+        p_bkp = self.drive_b / "daf_backup" / "2025" / "06" / "06" / "orig_shared_thumb.jpg"
+        p_bkp.parent.mkdir(parents=True, exist_ok=True)
+        p_bkp.write_bytes(p_orig.read_bytes())
+
+        # 1) Hard guard on daf_backup/
+        with self.assertRaises(PermissionError):
+            _safe_unlink(p_bkp)
+        with self.assertRaises(PermissionError):
+            _safe_move(p_bkp, self.drive_a / "stolen.jpg")
+        with self.assertRaises(PermissionError):
+            _safe_copy_new_to_daf_backup(p_orig, p_bkp)  # existing file in daf_backup/ cannot be overwritten
+        self.assertTrue(p_bkp.exists())
+
+        # Writing a brand-new file into daf_backup/ is allowed and 100% verified
+        p_new_bkp = self.drive_b / "daf_backup" / "2025" / "06" / "06" / "brand_new_backup.jpg"
+        ok_new, _, sha_new = _safe_copy_new_to_daf_backup(p_orig, p_new_bkp)
+        self.assertTrue(ok_new)
+        self.assertTrue(p_new_bkp.exists())
+        self.assertIsNotNone(sha_new)
+
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="AA77-1111",
+                volume_label="LabelOrigA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="BB77-2222",
+                volume_label="LabelBackupB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+
+            it_orig = FileScannerService.process_file(p_orig, vol_a)
+            it_bkp = FileScannerService.process_file(p_bkp, vol_b)
+            it_orig.duplicate_role = "original"
+            it_bkp.is_backup_copy = True
+            it_bkp.duplicate_role = "backup_green"
+            it_bkp.is_primary_duplicate = False
+            # Share thumbnail filename between original and backup copy
+            it_bkp.thumbnail_relative_path = it_orig.thumbnail_relative_path
+            db.add_all([it_orig, it_bkp])
+            db.commit()
+            orig_id, bkp_id = it_orig.id, it_bkp.id
+            shared_thumb_path = self.thumbs_dir / it_orig.thumbnail_relative_path
+            self.assertTrue(shared_thumb_path.exists())
+
+        vsn_map = {
+            "AA77-1111": (str(self.drive_a), "LabelOrigA"),
+            "BB77-2222": (str(self.drive_b), "LabelBackupB"),
+        }
+        with patch.object(WindowsVolumeInspector, "get_connected_vsn_map", return_value=vsn_map):
+            # 2) Pre-delete preview shows drive label breakdown & blocks daf_backup/ item automatically
+            r_prev = self.client.post(
+                "/actions/delete-preview",
+                data={"scope": "selected", "selected_ids": [orig_id, bkp_id]},
+            )
+            self.assertEqual(r_prev.status_code, 200)
+            self.assertIn("Podsumowanie przed trwałym usunięciem (1 plików)", r_prev.text)
+            self.assertIn("LabelOrigA", r_prev.text)
+            self.assertIn("Ochrona daf_backup/", r_prev.text)
+
+            # 3) Direct delete-permanently on [orig_id, bkp_id] MUST NOT delete daf_backup/ item OR shared thumbnail!
+            r_del = self.client.post(
+                "/actions/delete-permanently",
+                data={"scope": "selected", "selected_ids": [orig_id, bkp_id], "skip_db_backup": "true"},
+            )
+            self.assertEqual(r_del.status_code, 200)
+            self.assertTrue(p_bkp.exists())
+            self.assertTrue(shared_thumb_path.exists())
+
+        with self.TestingSessionLocal() as db:
+            self.assertIsNone(db.get(MediaItem, orig_id))
+            self.assertIsNotNone(db.get(MediaItem, bkp_id))
 
 
 if __name__ == "__main__":

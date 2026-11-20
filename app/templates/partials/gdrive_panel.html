@@ -215,7 +215,7 @@
                             class="w-full bg-cardBg border border-borderBg rounded-lg p-2 text-slate-200">
                         {% for vol in online_volumes %}
                         <option value="{{ vol.id }}" {% if active_medium_vol and vol.id == active_medium_vol.id %}selected{% endif %}>
-                            💾 {{ vol.volume_label }} ({{ vol.last_known_drive_letter }})
+                            💾 {{ vol.volume_label }} (VSN: {{ vol.volume_serial_number }})
                         </option>
                         {% endfor %}
                     </select>

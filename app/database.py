@@ -74,6 +74,43 @@ def ensure_schema_migrations(target_db_path: Path = DB_PATH) -> None:
             if "is_trashed" not in g_cols:
                 cur.execute("ALTER TABLE media_groups ADD COLUMN is_trashed BOOLEAN DEFAULT 0 NOT NULL;")
 
+            # Drop legacy table-level UNIQUE(name) constraint so hierarchical sub-albums
+            # (e.g. YYYY / MM / DD under different parents) can share names safely.
+            mg_ddl_row = cur.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='media_groups';"
+            ).fetchone()
+            mg_ddl = (mg_ddl_row[0] if mg_ddl_row and mg_ddl_row[0] else "")
+            if "UNIQUE" in mg_ddl.upper():
+                cur.execute("PRAGMA foreign_keys = OFF;")
+                cur.execute(
+                    """
+                    CREATE TABLE media_groups_migrated (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        name VARCHAR(128) NOT NULL,
+                        description TEXT,
+                        parent_id INTEGER REFERENCES media_groups(id) ON DELETE CASCADE,
+                        target_volume_id INTEGER REFERENCES windows_volumes(id) ON DELETE SET NULL,
+                        is_trashed BOOLEAN DEFAULT 0 NOT NULL,
+                        created_at DATETIME NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO media_groups_migrated
+                        (id, name, description, parent_id, target_volume_id, is_trashed, created_at)
+                    SELECT
+                        id, name, description, parent_id, target_volume_id,
+                        COALESCE(is_trashed, 0), created_at
+                    FROM media_groups;
+                    """
+                )
+                cur.execute("DROP TABLE media_groups;")
+                cur.execute("ALTER TABLE media_groups_migrated RENAME TO media_groups;")
+                cur.execute("CREATE INDEX IF NOT EXISTS ix_media_groups_parent_id ON media_groups (parent_id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS ix_media_groups_is_trashed ON media_groups (is_trashed);")
+                cur.execute("PRAGMA foreign_keys = ON;")
+
         cur.execute("PRAGMA table_info(media_items);")
         m_cols = {row[1] for row in cur.fetchall()}
         if m_cols:

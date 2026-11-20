@@ -184,10 +184,9 @@
                 🗑️ Do Kosza
             </button>
             <button type="button"
-                    hx-post="/actions/delete-permanently"
+                    hx-post="/actions/delete-preview"
                     hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-confirm="UWAGA! Czy na pewno TRWALE usunąć wybrane pliki fizycznie z dysku/pendrive'a? Tej operacji NIE można cofnąć!"
-                    hx-target="#global-notification"
+                    hx-target="#modal-container"
                     class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-3 py-1.5 rounded-lg font-semibold transition">
                 🔥 Usuń trwale
             </button>
@@ -230,7 +229,7 @@
                     <option value="current">🎯 Zgodnie z paskiem akcji (Aktualny filtr / Zaznaczone zdjęcia)</option>
                     <option value="all_drives">🌐 Wszystkie dyski w bazie danych</option>
                     {% for v in all_volumes %}
-                    <option value="volume:{{ v.id }}">💾 Tylko dysk: {{ v.volume_label }} ({{ v.last_known_drive_letter }})</option>
+                    <option value="volume:{{ v.id }}">💾 Tylko dysk: {{ v.volume_label }}</option>
                     {% endfor %}
                 </select>
             </div>
@@ -356,7 +355,7 @@
                     <option value="">-- Lub wpisz pełną ścieżkę poniżej --</option>
                     {% for v in all_volumes %}
                     <option value="{{ v.id }}">
-                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} ({{ v.last_known_drive_letter }})
+                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} (VSN: {{ v.volume_serial_number }})
                     </option>
                     {% endfor %}
                 </select>
@@ -408,7 +407,7 @@
                 <select name="target_volume_id" required class="w-full bg-slate-900 border border-borderBg rounded-lg p-2.5 text-white">
                     {% for v in all_volumes %}
                     <option value="{{ v.id }}">
-                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} ({{ v.last_known_drive_letter }})
+                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} (VSN: {{ v.volume_serial_number }})
                     </option>
                     {% endfor %}
                 </select>

@@ -6,9 +6,9 @@
 
     <div class="absolute top-2 right-2 z-20 flex space-x-1 items-center">
         {% if item.volume.is_online %}
-            <span title="Dysk Online: {{ item.volume.volume_label }} ({{ item.volume.last_known_drive_letter }})" 
+            <span title="Dysk Online: {{ item.volume.volume_label }} (VSN: {{ item.volume.volume_serial_number }})" 
                   class="bg-emerald-950/80 text-emerald-400 border border-emerald-700/60 text-[10px] px-1.5 py-0.5 rounded backdrop-blur">
-                {{ item.volume.last_known_drive_letter }}
+                {{ item.volume.volume_label }}
             </span>
         {% else %}
             <span title="Dysk Offline: {{ item.volume.volume_label }}" 

@@ -53,9 +53,18 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
     thumb_p = THUMBNAILS_DIR / item.thumbnail_relative_path
     if not ThumbnailService.is_valid_thumbnail(thumb_p):
         if item.volume:
-            src_p = Path(item.volume.last_known_drive_letter) / item.relative_path
-            if src_p.exists():
-                thumb_p = src_p
+            from app.scanner import WindowsVolumeInspector
+            cmap = WindowsVolumeInspector.get_connected_vsn_map()
+            vsn = (item.volume.volume_serial_number or "").strip()
+            v_root = Path(cmap[vsn][0]) if vsn in cmap else (
+                Path(item.volume.last_known_drive_letter)
+                if (item.volume.is_online and item.volume.last_known_drive_letter and not cmap)
+                else None
+            )
+            if v_root is not None:
+                src_p = v_root / item.relative_path
+                if src_p.exists():
+                    thumb_p = src_p
 
     if thumb_p.exists() and thumb_p.stat().st_size > 0:
         try:

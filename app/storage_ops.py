@@ -20,8 +20,36 @@ from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 logger = logging.getLogger("StorageOps")
 
 
+def is_path_in_daf_backup(path: Path) -> bool:
+    """
+    Returns True if `path` resides inside a `daf_backup/` media backup folder (excluding SQLite
+    `db_backups` rotation files and uncommitted `.daf_tmp` staging files).
+    Application policy: existing files inside `daf_backup/` are strictly READ-ONLY / APPEND-ONLY
+    (new files may be added, existing files may NEVER be modified, overwritten, moved, or deleted).
+    """
+    parts = [p.lower() for p in Path(path).parts]
+    if "daf_backup" not in parts:
+        return False
+    if "db_backups" in parts:
+        return False
+    if Path(path).name.lower().endswith(".daf_tmp"):
+        return False
+    return True
+
+
+def is_item_in_daf_backup(item: MediaItem) -> bool:
+    """Returns True if a MediaItem represents a protected backup file inside `daf_backup/`."""
+    if getattr(item, "is_backup_copy", False):
+        return True
+    rel = (getattr(item, "relative_path", "") or "").replace("\\", "/").lower()
+    parts = [p for p in rel.split("/") if p]
+    return "daf_backup" in parts
+
+
 def _safe_unlink(path: Path) -> None:
-    """Deletes a file on disk, clearing Windows Read-Only attribute if needed."""
+    """Deletes a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks daf_backup/."""
+    if is_path_in_daf_backup(path):
+        raise PermissionError(f"Ochrona daf_backup: zabronione usuwanie istniejącego pliku w daf_backup/: {path}")
     try:
         path.unlink()
     except PermissionError:
@@ -30,12 +58,49 @@ def _safe_unlink(path: Path) -> None:
 
 
 def _safe_move(src: Path, dst: Path) -> None:
-    """Moves a file on disk, clearing Windows Read-Only attribute if needed."""
+    """Moves a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks mutating daf_backup/."""
+    if is_path_in_daf_backup(src):
+        raise PermissionError(f"Ochrona daf_backup: zabronione przenoszenie/usuwanie pliku z daf_backup/: {src}")
+    if is_path_in_daf_backup(dst) and dst.exists():
+        raise PermissionError(f"Ochrona daf_backup: zabronione nadpisywanie istniejącego pliku w daf_backup/: {dst}")
     try:
         shutil.move(str(src), str(dst))
     except PermissionError:
         os.chmod(src, stat.S_IWRITE)
         shutil.move(str(src), str(dst))
+
+
+def _safe_copy_new_to_daf_backup(src_path: Path, dest_path: Path) -> Tuple[bool, str, Optional[str]]:
+    """
+    Append-only verified write into `daf_backup/`:
+    1) Refuses if `dest_path` already exists (never overwrites an existing backup file).
+    2) Copies to a `.daf_tmp` staging filename, runs 100% SHA-256 + media verification.
+    3) Only atomically renames `.daf_tmp` -> `dest_path` on 100% pass; on fail, cleans only `.daf_tmp`.
+    """
+    if dest_path.exists():
+        raise PermissionError(f"Ochrona daf_backup: plik docelowy już istnieje i nie może zostać nadpisany: {dest_path}")
+    tmp_path = dest_path.with_name(f"{dest_path.name}.daf_tmp")
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    shutil.copy2(str(src_path), str(tmp_path))
+    verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, tmp_path)
+    if not verified:
+        try:
+            tmp_path.unlink()
+        except OSError as exc:
+            logger.debug("Cleanup failed staging backup copy %s: %s", tmp_path, exc)
+        return False, reason, None
+    if dest_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise PermissionError(f"Ochrona daf_backup: wykryto istniejący plik podczas finalizacji: {dest_path}")
+    tmp_path.replace(dest_path)
+    return True, reason, full_sha
 
 
 class StorageAutomationService:
@@ -353,6 +418,12 @@ class StorageAutomationService:
         mismatches_separated = 0
         offline_skipped = 0
 
+        connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+        verified_roots: Dict[int, Optional[Path]] = {
+            vid: self.verify_and_resolve_online_volume_root(v, connected_map=connected_map)
+            for vid, v in volumes.items()
+        }
+
         for fhash, cluster in by_hash.items():
             if len(cluster) < 2:
                 continue
@@ -361,8 +432,8 @@ class StorageAutomationService:
 
             clusters_checked += 1
             primary = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
-            p_vol = volumes.get(primary.volume_id)
-            p_path = (Path(p_vol.last_known_drive_letter) / primary.relative_path) if (p_vol and p_vol.is_online) else None
+            p_root = verified_roots.get(primary.volume_id)
+            p_path = (p_root / primary.relative_path) if p_root is not None else None
 
             if not p_path or not p_path.exists():
                 offline_skipped += len(cluster) - 1
@@ -371,8 +442,8 @@ class StorageAutomationService:
             for candidate in cluster:
                 if candidate.id == primary.id:
                     continue
-                c_vol = volumes.get(candidate.volume_id)
-                c_path = (Path(c_vol.last_known_drive_letter) / candidate.relative_path) if (c_vol and c_vol.is_online) else None
+                c_root = verified_roots.get(candidate.volume_id)
+                c_path = (c_root / candidate.relative_path) if c_root is not None else None
                 if not c_path or not c_path.exists():
                     offline_skipped += 1
                     continue
@@ -536,6 +607,117 @@ class StorageAutomationService:
 
         item.group_id = day_grp.id
         return day_grp
+
+    def assign_important_albums_for_same_disk_duplicates(self, volume_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Pure-DB operation (no drives need to be online, zero disk writes):
+        Finds all non-trashed Originals that have >= 2 non-backup copies on the same physical device
+        and assigns each Original to 'Ważne - <device>' -> YYYY -> MM -> DD.
+        """
+        volumes = {v.id: v for v in self.db.scalars(select(WindowsVolume)).all()}
+        groups_by_id = {g.id: g for g in self.db.scalars(select(MediaGroup).where(MediaGroup.is_trashed == False)).all()}
+
+        def is_in_important_album(item: MediaItem, vol_label: str) -> bool:
+            if not item.group_id or item.group_id not in groups_by_id:
+                return False
+            parts: List[str] = []
+            curr = groups_by_id.get(item.group_id)
+            depth = 0
+            while curr and depth < 6:
+                parts.append(curr.name)
+                curr = groups_by_id.get(curr.parent_id) if curr.parent_id else None
+                depth += 1
+            parts.reverse()
+            expected = [
+                f"Ważne - {vol_label}",
+                str(item.effective_date.year),
+                item.effective_date.strftime("%m"),
+                item.effective_date.strftime("%d"),
+            ]
+            return parts == expected
+
+        all_items = list(
+            self.db.scalars(
+                select(MediaItem)
+                .where(MediaItem.is_trashed == False)
+                .order_by(MediaItem.effective_date.asc(), MediaItem.relative_path.asc(), MediaItem.id.asc())
+            ).all()
+        )
+        by_hash: Dict[str, List[MediaItem]] = defaultdict(list)
+        for it in all_items:
+            by_hash[it.file_hash].append(it)
+
+        assigned_count = 0
+        already_in_important = 0
+        per_volume_counts: Dict[str, int] = defaultdict(int)
+
+        for _, cluster in by_hash.items():
+            best_orig = next((x for x in cluster if x.duplicate_role == "original"), None)
+            if best_orig is None:
+                best_orig = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
+            if self._is_recycle_bin_metadata_item(best_orig):
+                continue
+            if volume_id is not None and best_orig.volume_id != volume_id:
+                continue
+            orig_vol = volumes.get(best_orig.volume_id)
+            if not orig_vol:
+                continue
+            same_vol_non_bkp_cnt = sum(
+                1 for x in cluster if x.volume_id == best_orig.volume_id and not x.is_backup_copy
+            )
+            if same_vol_non_bkp_cnt < 2:
+                continue
+            if is_in_important_album(best_orig, orig_vol.volume_label or ""):
+                already_in_important += 1
+                continue
+            self.ensure_important_album_hierarchy(best_orig, orig_vol.volume_label or "Nieznany")
+            assigned_count += 1
+            per_volume_counts[orig_vol.volume_label or f"Vol-{orig_vol.id}"] += 1
+            if assigned_count % 500 == 0:
+                self.db.commit()
+
+        self.db.commit()
+        breakdown = ", ".join(f"{lbl}: {cnt}" for lbl, cnt in sorted(per_volume_counts.items()))
+        msg = (
+            f"Przypisano do albumów 'Ważne - <dysk>/RRRR/MM/DD': {assigned_count} oryginałów "
+            f"(już w 'Ważne': {already_in_important})."
+            + (f" Podział: {breakdown}." if breakdown else "")
+        )
+        OperationLogger.log(
+            "ASSIGN_IMPORTANT_ALBUMS",
+            msg,
+            status="OK",
+            details={
+                "assigned_count": assigned_count,
+                "already_in_important": already_in_important,
+                "per_volume_counts": dict(per_volume_counts),
+            },
+            db=self.db,
+        )
+        return {
+            "assigned_count": assigned_count,
+            "already_in_important": already_in_important,
+            "per_volume_counts": dict(per_volume_counts),
+            "message": msg,
+        }
+
+    @staticmethod
+    def _preserve_original_path_before_move(item: MediaItem, src_vol: Optional[WindowsVolume]) -> None:
+        """
+        Preserves the previous drive+relative path in `original_relative_path` before moving an item
+        so search and folder filters never lose the original location (even across multiple moves).
+        """
+        rel_norm = (item.relative_path or "").replace("\\", "/").lstrip("/")
+        if not rel_norm:
+            return
+        vol_prefix = f"{src_vol.volume_label}/" if (src_vol and src_vol.volume_label) else ""
+        entry = f"{vol_prefix}{rel_norm}"
+        if not item.original_relative_path:
+            item.original_relative_path = entry[:1024]
+        else:
+            existing_parts = [p.strip() for p in item.original_relative_path.split(" | ") if p.strip()]
+            if entry not in existing_parts:
+                item.original_relative_path = " | ".join(existing_parts + [entry])[:1024]
 
     @staticmethod
     def _is_recycle_bin_metadata_item(item: MediaItem) -> bool:
@@ -1350,6 +1532,7 @@ class StorageAutomationService:
                         target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
                         c += 1
                     _safe_move(curr_path, target_bkp_path)
+                    self._preserve_original_path_before_move(bkp_item, bkp_vol)
                     bkp_item.file_name = target_bkp_path.name
                     bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
                 bkp_item.is_backup_copy = True
@@ -1408,20 +1591,16 @@ class StorageAutomationService:
                 while dest_path.exists():
                     dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
-                shutil.copy2(str(src_path), str(dest_path))
-                verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+                verified, reason, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
                 if not verified:
-                    try:
-                        _safe_unlink(dest_path)
-                    except OSError as exc:
-                        logger.debug("Cleanup failed remote backup move %s: %s", dest_path, exc)
                     verification_blocks += 1
                     continue
-                if (not strict_target_writes_only) or (src_vol.id in allowed_write_vols):
+                if ((not strict_target_writes_only) or (src_vol.id in allowed_write_vols)) and not is_path_in_daf_backup(src_path):
                     try:
                         _safe_unlink(src_path)
                     except OSError as exc:
                         logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
+                self._preserve_original_path_before_move(bkp_item, src_vol)
                 bkp_item.volume_id = dst_vol.id
                 bkp_item.file_name = dest_path.name
                 bkp_item.relative_path = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
@@ -1473,14 +1652,8 @@ class StorageAutomationService:
                     dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
 
-                shutil.copy2(str(src_path), str(dest_path))
-
-                verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+                verified, reason, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
                 if not verified:
-                    try:
-                        dest_path.unlink()
-                    except OSError as exc:
-                        logger.debug("Cleanup failed backup copy %s: %s", dest_path, exc)
                     verification_blocks += 1
                     OperationLogger.log(
                         "BACKUP_VERIFY_FAIL",
@@ -2027,6 +2200,9 @@ class StorageAutomationService:
                     if full_sha:
                         orig.verified_sha256 = full_sha
 
+                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(cand_path):
+                        blocked_safety += 1
+                        continue
                     if delete_mode == "trash":
                         # Logical-only KOSZ attribute: physical file stays completely untouched on disk
                         cand.is_trashed = True
@@ -2064,6 +2240,9 @@ class StorageAutomationService:
                 else:
                     # Standard non-duplicate removal
                     src_p = vol_root / cand.relative_path
+                    if is_item_in_daf_backup(cand) or is_path_in_daf_backup(src_p):
+                        blocked_safety += 1
+                        continue
                     if delete_mode == "trash":
                         # Logical-only KOSZ attribute: physical file stays untouched on disk
                         cand.is_trashed = True
@@ -2081,7 +2260,11 @@ class StorageAutomationService:
                                 physical_count += 1
                             except OSError as exc:
                                 logger.debug("Permanent delete trash unlink warning: %s", exc)
-                        if cand.thumbnail_relative_path:
+                        thumb_shared = any(
+                            x.thumbnail_relative_path == cand.thumbnail_relative_path
+                            for x in cluster if x.id != cand.id and x.id not in removed_ids
+                        )
+                        if not thumb_shared and cand.thumbnail_relative_path:
                             thumb_p = eff_thumbs_dir / cand.thumbnail_relative_path
                             if thumb_p.exists():
                                 try:
@@ -2386,21 +2569,18 @@ class StorageAutomationService:
                 dest_path = target_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                 c += 1
 
-            shutil.copy2(str(src_path), str(dest_path))
-            verified, _, full_sha = FastHasher.verify_files_identical_100_percent(src_path, dest_path)
+            verified, _, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
             if not verified:
-                try:
-                    _safe_unlink(dest_path)
-                except OSError as exc:
-                    logger.debug("Cleanup failed backup transfer %s: %s", dest_path, exc)
                 verification_blocks += 1
                 continue
 
-            try:
-                _safe_unlink(src_path)
-            except OSError as exc:
-                logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
+            if not is_path_in_daf_backup(src_path):
+                try:
+                    _safe_unlink(src_path)
+                except OSError as exc:
+                    logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
 
+            self._preserve_original_path_before_move(item, src_vol)
             item.volume_id = dst_vol.id
             item.file_name = dest_path.name
             item.relative_path = dest_path.resolve().relative_to(dst_root.resolve()).as_posix()
@@ -2479,6 +2659,7 @@ class StorageAutomationService:
                     c += 1
                 _safe_move(src_file, dst_file)
 
+            self._preserve_original_path_before_move(it, src_vol)
             it.volume_id = target_vol.id
             it.file_name = dst_file.name
             it.relative_path = dst_file.resolve().relative_to(dst_root.resolve()).as_posix()
@@ -2918,8 +3099,7 @@ class StorageAutomationService:
                     errors += 1
                     continue
 
-            if not it.original_relative_path:
-                it.original_relative_path = f"{vol.volume_label}/{rel_norm}"
+            self._preserve_original_path_before_move(it, vol)
             it.file_name = dst_path.name
             it.relative_path = dst_path.resolve().relative_to(root.resolve()).as_posix()
             already_organized_hashes.add(it.file_hash)

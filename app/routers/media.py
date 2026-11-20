@@ -190,6 +190,93 @@ def _build_cross_vault_backup_map(db: Session, items: List[MediaItem]) -> dict:
     return result
 
 
+def _build_online_fallback_map(db: Session, items: List[MediaItem]) -> dict:
+    """
+    For items whose own volume is currently offline, finds whether an identical non-trashed copy
+    (preferring daf_backup/ copies) exists on any currently ONLINE volume for read-only preview/slideshow.
+    Returns {item.id: 'Label (Letter)'}.
+    """
+    offline_items = [it for it in items if it.file_hash and not (it.volume and it.volume.is_online)]
+    if not offline_items:
+        return {}
+    hashes = list({it.file_hash for it in offline_items})
+    rows = db.execute(
+        select(
+            MediaItem.file_hash,
+            MediaItem.volume_id,
+            MediaItem.is_backup_copy,
+            WindowsVolume.volume_label,
+            WindowsVolume.last_known_drive_letter,
+        )
+        .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
+        .where(
+            MediaItem.file_hash.in_(hashes),
+            MediaItem.is_trashed == False,
+            WindowsVolume.is_online == True,
+        )
+        .order_by(desc(MediaItem.is_backup_copy), asc(WindowsVolume.volume_label))
+    ).all()
+    by_hash = defaultdict(list)
+    for fh, vid, is_bkp, vlabel, vletter in rows:
+        by_hash[fh].append((vid, bool(is_bkp), f"{vlabel} ({vletter})"))
+
+    result = {}
+    for it in offline_items:
+        cands = [lbl for vid, _, lbl in by_hash.get(it.file_hash, []) if vid != it.volume_id]
+        if cands:
+            result[it.id] = cands[0]
+    return result
+
+
+def _resolve_online_preview_path(db: Session, it: MediaItem) -> tuple[Optional[Path], Optional[str]]:
+    """
+    Resolves a read-only filesystem path for presenting `it` (photo/video preview or slideshow).
+    1) Uses `it`'s own volume when online & file exists.
+    2) If `it` is offline/missing, falls back READ-ONLY to any non-trashed copy (preferring backup copies)
+       sharing `it.file_hash` on a VSN-verified online volume. Never mutates the fallback copy.
+    """
+    from app.scanner import WindowsVolumeInspector
+    from app.storage_ops import StorageAutomationService
+
+    svc = StorageAutomationService(db)
+    connected_map = WindowsVolumeInspector.get_connected_vsn_map()
+
+    if it.volume:
+        own_root = svc.verify_and_resolve_online_volume_root(it.volume, connected_map=connected_map)
+        if own_root is not None:
+            own_path = own_root / it.relative_path
+            if own_path.exists() and own_path.is_file():
+                return own_path, None
+
+    if not it.file_hash:
+        return None, None
+
+    fallback_copies = list(
+        db.scalars(
+            select(MediaItem)
+            .join(WindowsVolume, WindowsVolume.id == MediaItem.volume_id)
+            .options(joinedload(MediaItem.volume))
+            .where(
+                MediaItem.file_hash == it.file_hash,
+                MediaItem.id != it.id,
+                MediaItem.is_trashed == False,
+            )
+            .order_by(desc(MediaItem.is_backup_copy), desc(WindowsVolume.is_online), asc(MediaItem.id))
+        ).unique().all()
+    )
+    for cp in fallback_copies:
+        if not cp.volume:
+            continue
+        cp_root = svc.verify_and_resolve_online_volume_root(cp.volume, connected_map=connected_map)
+        if cp_root is None:
+            continue
+        cp_path = cp_root / cp.relative_path
+        if cp_path.exists() and cp_path.is_file():
+            return cp_path, f"{cp.volume.volume_label} ({cp.volume.last_known_drive_letter})"
+
+    return None, None
+
+
 def _build_deleted_dup_history_map(db: Session, items: List[MediaItem], q: Optional[str] = None) -> tuple[dict, dict]:
     """Returns (counts_by_hash, query_matches_by_hash) for DeletedDuplicateHistory entries matching displayed items."""
     if not items:
@@ -871,6 +958,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         }
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, items)
+    online_fallback_by_item_id = _build_online_fallback_map(db, items)
     deleted_dup_counts_by_hash, deleted_dup_matches_by_hash = _build_deleted_dup_history_map(db, items, q)
     offline_drives_info = build_offline_drives_queues(items, view_vol_counts_map, all_volumes)
 
@@ -880,6 +968,7 @@ def build_search_context(request: Request, db: Session) -> dict:
         "total_matching": total_matching,
         "total_redundant_dups": redundant_dup_count_filtered,
         "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
+        "online_fallback_by_item_id": online_fallback_by_item_id,
         "deleted_dup_counts_by_hash": deleted_dup_counts_by_hash,
         "deleted_dup_matches_by_hash": deleted_dup_matches_by_hash,
         "offline_drives_info": offline_drives_info,
@@ -945,10 +1034,8 @@ def serve_thumbnail(filename: str, db: Session = Depends(get_db)):
         media_id = filename.rsplit(".", 1)[0]
         it = db.scalars(select(MediaItem).options(joinedload(MediaItem.volume)).where(MediaItem.id == media_id)).unique().first()
         if it and it.volume:
-            StorageAutomationService(db).refresh_volumes_online_status()
-            db.refresh(it.volume)
-            src_p = Path(it.volume.last_known_drive_letter) / it.relative_path
-            if it.volume.is_online and src_p.exists():
+            src_p, _ = _resolve_online_preview_path(db, it)
+            if src_p is not None and src_p.exists():
                 try:
                     _, w, h, _ = ThumbnailService.generate(src_p, it.id, src_p.suffix.lower() in IMAGE_EXTS)
                     if w and h:
@@ -983,56 +1070,59 @@ def serve_raw_media(media_id: str, db: Session = Depends(get_db)):
     if not it:
         raise HTTPException(status_code=404)
 
-    if it.volume:
-        full_path = Path(it.volume.last_known_drive_letter) / it.relative_path
-        if full_path.exists() and full_path.is_file():
-            ext = full_path.suffix.lower()
+    from urllib.parse import quote
 
-            # 1. On-the-fly conversion of HEIC/HEIF/TIFF or previously flagged truncated/damaged images to clean JPEG
-            if ext in (".heic", ".heif", ".tiff", ".tif") or (it.is_corrupted and it.media_type == "image"):
+    full_path, fallback_label = _resolve_online_preview_path(db, it)
+    extra_headers = {"X-DAF-Preview-Fallback": quote(fallback_label, safe=" ()-:/\\")} if fallback_label else None
+
+    if full_path is not None:
+        ext = full_path.suffix.lower()
+
+        # 1. On-the-fly conversion of HEIC/HEIF/TIFF or previously flagged truncated/damaged images to clean JPEG
+        if ext in (".heic", ".heif", ".tiff", ".tif") or (it.is_corrupted and it.media_type == "image"):
+            try:
+                with Image.open(full_path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=90)
+                    buf.seek(0)
+                    return StreamingResponse(buf, media_type="image/jpeg", headers=extra_headers)
+            except Exception as exc:
+                logger.debug("On-the-fly JPEG conversion failed: %s", exc)
+                if it.is_corrupted and it.media_type == "image":
+                    from app.ai.quality import decode_image_array
+                    import cv2
+                    arr = decode_image_array(full_path, grayscale=False)
+                    if arr is not None:
+                        ok, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        if ok:
+                            return StreamingResponse(io.BytesIO(enc.tobytes()), media_type="image/jpeg", headers=extra_headers)
+
+        # 2. On-the-fly transcoding of .MOV / .MKV / .AVI / .WMV to browser-playable H.264 MP4
+        if ext in (".mov", ".mkv", ".avi", ".wmv", ".mts", ".m2ts", ".flv", ".3gp"):
+            cached_mp4 = THUMBNAILS_DIR / f"{it.id}_stream.mp4"
+            if not cached_mp4.exists() or cached_mp4.stat().st_size < 1000:
                 try:
-                    with Image.open(full_path) as img:
-                        img = ImageOps.exif_transpose(img)
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        buf = io.BytesIO()
-                        img.save(buf, format="JPEG", quality=90)
-                        buf.seek(0)
-                        return StreamingResponse(buf, media_type="image/jpeg")
+                    import imageio_ffmpeg
+                    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                    cmd = [
+                        ffmpeg_exe, "-y", "-i", str(full_path.resolve()),
+                        "-vf", "scale='min(1280,iw)':-2",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-movflags", "+faststart",
+                        str(cached_mp4.resolve()),
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
                 except Exception as exc:
-                    logger.debug("On-the-fly JPEG conversion failed: %s", exc)
-                    if it.is_corrupted and it.media_type == "image":
-                        from app.ai.quality import decode_image_array
-                        import cv2
-                        arr = decode_image_array(full_path, grayscale=False)
-                        if arr is not None:
-                            ok, enc = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                            if ok:
-                                return StreamingResponse(io.BytesIO(enc.tobytes()), media_type="image/jpeg")
+                    logger.debug("Video transcoding skipped: %s", exc)
+            if cached_mp4.exists() and cached_mp4.stat().st_size > 1000:
+                return FileResponse(cached_mp4, media_type="video/mp4", filename=f"{full_path.stem}.mp4", headers=extra_headers)
 
-            # 2. On-the-fly transcoding of .MOV / .MKV / .AVI / .WMV to browser-playable H.264 MP4
-            if ext in (".mov", ".mkv", ".avi", ".wmv", ".mts", ".m2ts", ".flv", ".3gp"):
-                cached_mp4 = THUMBNAILS_DIR / f"{it.id}_stream.mp4"
-                if not cached_mp4.exists() or cached_mp4.stat().st_size < 1000:
-                    try:
-                        import imageio_ffmpeg
-                        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                        cmd = [
-                            ffmpeg_exe, "-y", "-i", str(full_path.resolve()),
-                            "-vf", "scale='min(1280,iw)':-2",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-                            "-pix_fmt", "yuv420p",
-                            "-c:a", "aac", "-b:a", "128k",
-                            "-movflags", "+faststart",
-                            str(cached_mp4.resolve()),
-                        ]
-                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
-                    except Exception as exc:
-                        logger.debug("Video transcoding skipped: %s", exc)
-                if cached_mp4.exists() and cached_mp4.stat().st_size > 1000:
-                    return FileResponse(cached_mp4, media_type="video/mp4", filename=f"{full_path.stem}.mp4")
-
-            return FileResponse(full_path, media_type=it.mime_type, filename=it.file_name)
+        return FileResponse(full_path, media_type=it.mime_type, filename=it.file_name, headers=extra_headers)
 
     from app.scanner import ThumbnailService
     thumb_path = THUMBNAILS_DIR / it.thumbnail_relative_path
@@ -1103,6 +1193,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
         defect_labels.append({"tag": "do_usuniecia:rozmyte", "name": f"Rozmyte / brak ostrości (wynik: {blur_val})", "desc": "Niski wskaźnik ostrości Laplaciana", "badge_class": "bg-amber-950 text-amber-300 border-amber-700"})
 
     cross_vault_backup_by_item_id = _build_cross_vault_backup_map(db, [it] + duplicate_copies)
+    online_fallback_label = _build_online_fallback_map(db, [it]).get(it.id)
     deleted_duplicate_paths = list(
         db.scalars(
             select(DeletedDuplicateHistory)
@@ -1121,6 +1212,7 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             "duplicate_copies": duplicate_copies,
             "deleted_duplicate_paths": deleted_duplicate_paths,
             "cross_vault_backup_by_item_id": cross_vault_backup_by_item_id,
+            "online_fallback_label": online_fallback_label,
             "folder_date_str": folder_date_str,
             "quality_tags": quality_tags,
             "semantic_tags": semantic_tags,
