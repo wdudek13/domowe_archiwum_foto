@@ -217,15 +217,15 @@
 
 <header class="hero">
     <h1>🚀 Szybki Przewodnik (Quick Guide): Od Chaosu na Dyskach do Idealnego Archiwum</h1>
-    <p>Praktyczna ścieżka w 7 krokach: jak z wielu nieuporządkowanych dysków i pendrive'ów stworzyć czyste albumy ze 100% backupem, bez duplikatów i bez uszkodzonych zdjęć — oraz jak błyskawicznie wyszukiwać i przeglądać kolekcję.</p>
+    <p>Praktyczna ścieżka w 7 krokach: jak z wielu nieuporządkowanych dysków i pendrive'ów stworzyć czyste albumy ze 100% backupem, bez duplikatów i bez uszkodzonych zdjęć — oraz jak błyskawicznie wyszukiwać kwiaty, przedmioty, albumy i konkretne osoby (twarze) nawet przy odłączonych dyskach.</p>
     <div class="nav-pills">
         <a href="#krok1" class="nav-pill">1. Skanowanie dysków</a>
-        <a href="#krok2" class="nav-pill">2. Analiza AI i odsianie wad</a>
+        <a href="#krok2" class="nav-pill">2. Analiza AI, Twarze i odsianie wad</a>
         <a href="#krok3" class="nav-pill">3. Korekta dat</a>
         <a href="#krok4" class="nav-pill">4. Automatyczny Backup</a>
         <a href="#krok5" class="nav-pill">5. Usunięcie duplikatów</a>
-        <a href="#krok6" class="nav-pill">6. Organizacja w Albumy</a>
-        <a href="#krok7" class="nav-pill">7. Wyszukiwanie i Przeglądarka</a>
+        <a href="#krok6" class="nav-pill">6. Organizacja w Albumy i Tagi</a>
+        <a href="#krok7" class="nav-pill">7. Wyszukiwanie, Osoby i Przeglądarka</a>
         <a href="/przewodnik" class="nav-pill active">📖 Pełny Podręcznik</a>
     </div>
 </header>
@@ -243,10 +243,10 @@
         </div>
         <p>Zacznij od zbudowania pełnego indeksu wszystkich nośników, na których masz porozrzucane zdjęcia i filmy — nawet jeśli na wielu z nich powtarzają się te same kopie.</p>
         <ul class="checklist">
-            <li>Podłącz pierwszy dysk/pendrive, wpisz jego literę w polu na górze (np. <code>E:\</code>) i kliknij <span class="ui-btn">Skanuj dysk</span>. Katalogi <code>daf_backup/</code> (poza trybem importu) oraz <code>daf_albums/</code> są pomijane automatycznie.</li>
+            <li>Podłącz pierwszy dysk/pendrive, wpisz jego literę w polu na górze (np. <code>E:\</code>) i kliknij <span class="ui-btn">Skanuj dysk</span>. Katalogi <code>daf_backup/</code> (poza trybem importu), <code>daf_albums/</code>, <code>daf_kwarantanna/</code> oraz <code>$RECYCLE.BIN</code> są pomijane automatycznie.</li>
             <li>W lewym panelu bocznym w sekcji <strong>Nośniki / Dyski USB</strong> kliknij ikonę ołówka <span class="ui-btn">✏️</span> przy nowo dodanym dysku i nadaj mu czytelną nazwę, np. <code>Dysk_Czarny_1TB</code> lub <code>Pendrive_Wakacje</code>.</li>
             <li>Powtórz tę czynność dla wszystkich posiadanych dysków i pendrive'ów (możesz odłączać poprzednie i podłączać kolejne — system śledzi nośniki po sprzętowym numerze seryjnym <strong>Win32 VSN</strong>, więc rozpoznaje dysk nawet po zmianie litery napędu w Windows).</li>
-            <li><strong>Bezpieczne ponowne skanowanie i spójność:</strong> ponowne skanowanie tego samego dysku nigdy nie kasuje zebranych tagów AI, wektorów 512-D, oceny ostrości, albumów ani dat dla istniejących plików. W oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> możesz kliknąć <span class="ui-btn">🔍 Sprawdź spójność bazy z dyskami</span>, aby wykryć pliki brakujące fizycznie na podłączonym nośniku.</li>
+            <li><strong>Bezpieczne ponowne skanowanie i spójność:</strong> ponowne skanowanie tego samego dysku nigdy nie kasuje zebranych tagów AI i ręcznych, wektorów 512-D, wykrytych twarzy i imion osób, oceny ostrości, albumów ani dat dla istniejących plików. W oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> możesz kliknąć <span class="ui-btn">🔍 Sprawdź spójność bazy z dyskami</span>, aby wykryć pliki brakujące fizycznie na podłączonym nośniku.</li>
             <li>Jeśli posiadasz jeden duży, pusty (lub prawie pusty) dysk przeznaczony docelowo na kopię zapasową, również podłącz go na chwilę i zeskanuj — system automatycznie wykorzysta go w Kroku 4 jako główny dysk backupowy.</li>
         </ul>
     </section>
@@ -256,14 +256,19 @@
         <div class="step-header">
             <div class="step-num purple">2</div>
             <div>
-                <div class="step-goal">ETAP 2: ODSIANIE USZKODZONYCH I NIEUDANYCH ZDJĘĆ</div>
-                <h2>Uruchom analizę jakości AI i usuń uszkodzone oraz całkowicie nieudane pliki</h2>
+                <div class="step-goal">ETAP 2: TAGI AI (1000 KLAS), INDEKS TWARZY I ODSIANIE WAD</div>
+                <h2>Uruchom analizę AI (tagi, wektory, twarze i jakość) oraz odsiej nieudane pliki</h2>
             </div>
         </div>
-        <p>Zanim zaczniesz kopiować pliki na dysk backupowy, pozbądź się plików uszkodzonych, czarnych kadrów z kieszeni oraz skrajnie rozmytych ujęć:</p>
+        <p>Zanim zaczniesz kopiować pliki na dysk backupowy, wygeneruj indeksy AI i pozbądź się plików uszkodzonych, czarnych kadrów z kieszeni oraz skrajnie rozmytych ujęć:</p>
         <ul class="checklist">
-            <li>Podłącz analizowany dysk, kliknij fioletowy przycisk <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> na górnym pasku.</li>
-            <li>Wybierz opcję <strong>🧠 Wszystkie analizy AI (Tagi + Wektory 512-D + Ostrość i wady)</strong> (lub <em>🔍 Detekcja ostrości, ekspozycji i uszkodzeń</em>) i kliknij <span class="ui-btn">▶️ Wystartuj Analizę</span>.</li>
+            <li>Kliknij fioletowy przycisk <span class="ui-btn">⚡ Analizuj AI (Wybór analizy i dysków)</span> na górnym pasku.</li>
+            <li>Wybierz opcję:
+                <ul>
+                    <li><strong>🧠 Wszystkie analizy AI (Tagi + Wektory 512-D + Ostrość i wady)</strong> — gdy dysk ze zdjęciami jest podłączony Online (badanie ostrości i uszkodzeń wymaga odczytu pełnych plików).</li>
+                    <li><strong>🏷️ Tylko Tagowanie Obiektów i Scen</strong> (nadaje zarówno ogólne kategorie, jak i wszystkie 1000 szczegółowych klas ImageNet, np. <code>stokrotka (daisy)</code>, <code>storczyk</code>, <code>wazon</code>, <code>rower</code>, oraz wykrywa kwiaty analizą HSV) oraz <strong>👤 Indeksowanie twarzy na miniaturach</strong> — te analizy działają w <strong>100% Offline na lokalnych miniaturach</strong> bez konieczności podłączania dysków USB!</li>
+                </ul>
+            </li>
             <li>Po zakończeniu spójrz na lewy panel boczny na sekcję <strong>⚠️ Wady jakości (do usunięcia)</strong> i przejrzyj kolejno podkategorie:
                 <ul>
                     <li><code>💥 Uszkodzone pliki</code> — pliki nieczytelne z uszkodzoną strukturą.</li>
@@ -271,7 +276,7 @@
                     <li><code>🌫️ Rozmyte / brak ostrości</code> — posortuj je na górze według <em>Ostrość: Najbardziej rozmyte</em>, aby na samym początku zobaczyć najbardziej nieostre zdjęcia.</li>
                 </ul>
             </li>
-            <li><strong>Fałszywy alarm? Oznacz jako bez wady:</strong> jeśli zdjęcie zaklasyfikowane jako uszkodzone lub rozmyte jest w rzeczywistości dobre, kliknij <span class="ui-btn">✓ Oznacz jako bez wady / nieuszkodzone</span> (na górnym pasku widoku wad, w oknie szczegółów) albo <span class="ui-btn">✓ Bez wady</span> bezpośrednio na karcie zdjęcia / w tabeli. Zdjęcie opuści listę wad i zachowa ocenę ostrości (nie trafi do <em>Niezbadanej jakości</em>).</li>
+            <li><strong>Fałszywy alarm? Oznacz jako bez wady lub wyindeksuj:</strong> jeśli zdjęcie zaklasyfikowane jako uszkodzone lub rozmyte jest w rzeczywistości dobre, kliknij <span class="ui-btn">✓ Oznacz jako bez wady / nieuszkodzone</span> (na górnym pasku widoku wad, w oknie szczegółów) albo <span class="ui-btn">✓ Bez wady</span> bezpośrednio na karcie zdjęcia / w tabeli. Jeśli chcesz usunąć śmieciowe wpisy wyłącznie z bazy danych bez ruszania dysku, kliknij <span class="ui-btn">✖️ Wyindeksuj zaznaczone z bazy (bez ruszania plików na dysku)</span>.</li>
             <li>Zaznacz naprawdę niechciane zdjęcia i kliknij <span class="ui-btn">🗑️ Do Kosza</span> — ustawia w bazie SQLite bezpieczny atrybut <code>KOSZ</code> (bez ruszania czy przenoszenia fizycznych plików na dysku), skąd zawsze można je przywrócić.</li>
         </ul>
     </section>
@@ -313,6 +318,7 @@
                     <li><strong>Odznacz</strong> ją, jeśli chcesz zebrać wszystkie rozproszone backupy na wybrane dyski docelowe.</li>
                 </ul>
             </li>
+            <li>Możesz kliknąć <span class="ui-btn">⭐ Przypisz do albumu „Ważne” (tylko baza)</span>, aby od razu w bazie danych wyróżnić oryginały mające lokalne duplikaty na tym samym dysku (działa także Offline).</li>
             <li>Podłącz dyski wskazane jako gotowa para w <strong>Harmonogramie par urządzeń (A ↔ B)</strong> i kliknij <span class="ui-btn">🛡️ Zrób backup</span>.</li>
             <li><strong>Przenoszenie istniejących kopii między dyskami:</strong> w oknie <span class="ui-btn">🚚 Przenieś backupy</span> widzisz liczbę backupów każdego rodzaju na poszczególnych dyskach (<code>w daf_backup/</code>, <code>zielone</code>, <code>pomarańczowe</code>) oraz możesz wybrać, które typy mają zostać przeniesione do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym.</li>
         </ul>
@@ -326,7 +332,7 @@
         <div class="step-header">
             <div class="step-num rose">5</div>
             <div>
-                <div class="step-goal">ETAP 5: ODZYSKANIE MIEJSCA NA DYSKACH</div>
+                <div class="step-goal">ETAP 5: ODZYSKANIE MIEJSCA NA DYSKACH (DWUFAZOWO + KWARANTANNA)</div>
                 <h2>Usuń nadmiarowe duplikaty w widoku „Duplikaty binarne”</h2>
             </div>
         </div>
@@ -334,14 +340,19 @@
         <ul class="checklist">
             <li>Kliknij w lewym menu <span class="ui-btn">👥 Duplikaty binarne</span>.</li>
             <li>Zobaczysz zgrupowane klastry identycznych plików:
-                <span class="tag-pill tag-green">ORYGINAŁ ✓</span> (1. kopia mająca backup w <code>daf_backup/</code>),
-                <span class="tag-pill tag-green">BACKUP</span> (2. kopia chroniona) oraz
+                <span class="tag-pill tag-green">ORYGINAŁ ✓</span> (1. kopia mająca backup w <code>daf_backup/</code> — chroniona),
+                <span class="tag-pill tag-green">BACKUP</span> (2. kopia — chroniona) oraz
                 <span class="tag-pill tag-red">DUPLIKAT</span> (3. i kolejne nadmiarowe kopie).</li>
             <li>Kliknij przycisk <span class="ui-btn">☑️ Zaznacz tylko nadmiarowe kopie</span> — system zaznaczy wyłącznie czerwone <span class="tag-pill tag-red">DUPLIKAT</span> na wszystkich stronach wyników (nigdy nie zaznaczy Oryginału ani Backupu!).</li>
-            <li>Kliknij na górnym pasku <span class="ui-btn">🔥 Usuń trwale</span> (lub <span class="ui-btn">🗑️ Do Kosza</span>). System automatycznie zdejmuje atrybut tylko-do-odczytu (<code>Read-Only</code>) w Windows podczas kasowania i zachowuje dawne ścieżki usuniętych duplikatów w historii (możesz później wyszukać oryginał po nazwie/ścieżce usuniętego duplikatu).</li>
-            <li>System najpierw jednorazowo utworzy kopię bezpieczeństwa bazy SQLite (Etap 1/2), a następnie usunie zweryfikowane w 100% duplikaty z podłączonych dysków (Etap 2/2).</li>
-            <li>Jeśli część duplikatów leży na odłączonym dysku, na ekranie pojawi się prośba z dokładną liczbą duplikatów do skasowania na tym dysku — podłącz go i kliknij <span class="ui-btn">▶️ Kontynuuj na podłączonym dysku</span> (role klastrów są przeliczane dopiero po zakończeniu wszystkich dysków, bez powrotu na wcześniejsze dyski).</li>
-            <li><strong>Weryfikacja po deduplikacji:</strong> w oknie <span class="ui-btn">⚙️ Status i Log Operacji</span> kliknij <span class="ui-btn">✅ Weryfikuj usunięte duplikaty (100% Oryginałów)</span>, aby porównać bieżącą bazę z kopią sprzed usuwania i potwierdzić, że 100% usuniętych duplikatów ma aktywny Oryginał o tym samym <code>file_hash</code>.</li>
+            <li>Kliknij na górnym pasku <span class="ui-btn">🔥 Usuń trwale</span> (lub <span class="ui-btn">🗑️ Do Kosza</span>).</li>
+            <li><strong>Okno podsumowania i Kwarantanna <code>daf_kwarantanna/</code>:</strong> otworzy się okno podsumowania pokazujące rozbicie plików na poszczególne dyski (ze statusem 🟢 ONLINE / 🔴 OFFLINE i przykładowymi ścieżkami). Po kliknięciu <em>Potwierdź</em>:
+                <ul>
+                    <li><strong>Etap 1/2:</strong> Tworzona jest bezpieczna kopia bazy SQLite (chroniona w dedykowanej puli 5 ostatnich kopii <code>pre_permanent_disk_delete</code>).</li>
+                    <li><strong>Etap 2/2:</strong> Zweryfikowane w 100% duplikaty na podłączonych dyskach są przenoszone atomowo do bezpiecznego katalogu kwarantanny <code>&lt;dysk&gt;\daf_kwarantanna\&lt;RRRRMMDD&gt;\</code> na tym samym dysku (pliki z atrybutem <code>Read-Only</code> oraz katalog <code>daf_backup/</code> są bezwzględnie chronione), a ich dawne ścieżki trafiają do historii usuniętych duplikatów.</li>
+                    <li><strong>Ochrona dysków OFFLINE:</strong> Dla odłączonych dysków rekordy w bazie pozostają nietknięte, a na ekranie pojawia się prośba o podłączenie kolejnego dysku z przyciskiem <span class="ui-btn">▶️ Kontynuuj na podłączonym dysku</span>.</li>
+                </ul>
+            </li>
+            <li><strong>Weryfikacja po deduplikacji:</strong> kliknij <span class="ui-btn">✅ Weryfikuj usunięte duplikaty (100% Oryginałów)</span>, aby potwierdzić zapytaniem SQL, że 100% usuniętych duplikatów ma aktywny Oryginał o tym samym <code>file_hash</code>.</li>
         </ul>
     </section>
 
@@ -350,23 +361,23 @@
         <div class="step-header">
             <div class="step-num sky">6</div>
             <div>
-                <div class="step-goal">ETAP 6: TWORZENIE PRZEJRZYSTYCH ALBUMÓW</div>
-                <h2>Zorganizuj oczyszczone zdjęcia w drzewo Albumów i Podalbumów</h2>
+                <div class="step-goal">ETAP 6: TWORZENIE PRZEJRZYSTYCH ALBUMÓW I WŁASNYCH TAGÓW</div>
+                <h2>Zorganizuj oczyszczone zdjęcia w drzewo Albumów, Podalbumów i Tagów ręcznych</h2>
             </div>
         </div>
-        <p>Teraz w Twojej galerii znajdują się wyłącznie unikalne, ostre zdjęcia z prawidłowymi datami. Możesz ułożyć je w albumy na trzy wygodne sposoby:</p>
+        <p>Teraz w Twojej galerii znajdują się wyłącznie unikalne, ostre zdjęcia z prawidłowymi datami. Możesz ułożyć je w albumy i otagować:</p>
         <div class="grid-2">
             <div class="sub-box">
                 <h3>Sposób A: 1-Klik Auto-Organizacja z folderów dysku</h3>
                 <p>Kliknij dysk w lewym menu, a następnie kliknij wybrany katalog fizyczny na pasku nad galerią. Kliknij <span class="ui-btn">🌳 Utwórz drzewo wg Katalogów</span> (odwzoruje Twoje foldery jako Albumy i Podalbumy) lub <span class="ui-btn">📅 Utwórz drzewo wg Daty (Rok &rarr; Miesiąc)</span>.</p>
             </div>
             <div class="sub-box">
-                <h3>Sposób B: Tworzenie albumów tematycznych z wyszukiwarki</h3>
-                <p>Wyszukaj zdjęcia (np. po tagu AI <code>morze_woda</code>, po roku lub przez <span class="ui-btn">🔍 Podobne</span>), zaznacz wybrane ujęcia (z klawiszem <kbd>Shift</kbd> zaznaczysz cały przedział) i kliknij <span class="ui-btn">📁 Przypisz do albumu</span>.</p>
+                <h3>Sposób B: Albumy tematyczne i własne tagi ręczne (<span class="ui-btn">🏷️ Dodaj tag</span>)</h3>
+                <p>Zaznacz wybrane zdjęcia (z klawiszem <kbd>Shift</kbd> zaznaczysz cały przedział) i kliknij <span class="ui-btn">📁 Przypisz do albumu</span> lub <span class="ui-btn">🏷️ Dodaj tag</span> (np. <code>kwiaty, róże babci, komunia</code>). Tagi ręczne można dodawać także w oknie szczegółów zdjęcia i nigdy nie są one kasowane przez analizę AI.</p>
             </div>
             <div class="sub-box">
                 <h3>Sposób C: Porządkowanie oryginałów i eksport albumu do wywołania</h3>
-                <p>Kliknij <span class="ui-btn">🗂️ Uporządkuj oryginały</span>, aby automatycznie pogrupować nieprzypisane oryginały w <code>daf_oryginal/RRRR/MM/DD/</code> na ich macierzystym dysku (z zachowaniem pierwotnej ścieżki z nazwą dysku do wyszukiwania). Użyj <span class="ui-btn">📤 Eksportuj album fizycznie</span>, aby skopiować wybrane zdjęcia albumu do <code>daf_albums/&lt;NazwaAlbumu&gt;/</code> np. na pendrive'a do wywołania (katalog pomijany przy skanowaniu).</p>
+                <p>Wybierz dysk w panelu bocznym i kliknij <span class="ui-btn">🗂️ Uporządkuj oryginały</span>, aby pogrupować nieprzypisane oryginały z tego dysku w <code>daf_oryginal/RRRR/MM/DD/</code> (z zachowaniem pierwotnej ścieżki z nazwą dysku do wyszukiwania). Użyj <span class="ui-btn">📤 Eksportuj album fizycznie</span>, aby skopiować wybrane zdjęcia albumu do <code>daf_albums/&lt;NazwaAlbumu&gt;/</code> np. na pendrive'a do wywołania.</p>
             </div>
             <div class="sub-box">
                 <h3>Kopia bazy i kompaktowanie na koniec pracy</h3>
@@ -381,32 +392,26 @@
             <div class="step-num">7</div>
             <div>
                 <div class="step-goal">ETAP 7: CODZIENNE KORZYSTANIE Z ARCHIWUM</div>
-                <h2>Jak błyskawicznie wyszukiwać zdjęcia i korzystać z przeglądarki</h2>
+                <h2>Jak błyskawicznie wyszukiwać kwiaty, albumy, tę samą osobę i korzystać z przeglądarki</h2>
             </div>
         </div>
 
         <div class="grid-2">
             <div class="sub-box">
-                <h3>🔍 1. Wyszukiwanie słowne, historia duplikatów i widoczność backupów</h3>
-                <p>Wpisz w polu <code>Szukaj...</code> (skrót <kbd>/</kbd>) frazę: nazwę pliku, folderu, pierwotną ścieżkę po uporządkowaniu, dawną ścieżkę <em>usuniętego duplikatu</em> albo kategorię po polsku (np. <code>pies</code>, <code>morze</code>, <code>gory</code>) i naciśnij <kbd>Enter</kbd> lub przycisk <span class="ui-btn">🔄 Odśwież</span>. Domyślnie wszystkie rodzaje backupów są ukryte; obok wyszukiwarki możesz je włączyć filtrem <span class="ui-btn">🛡️ Backupy</span> (<code>daf_backup/</code>, <code>Zielone</code>, <code>Pomarańczowe</code>).</p>
+                <h3>🔍 1. Wyszukiwanie po słowach, albumach, kwiatach i „Szukaj głębiej AI”</h3>
+                <p>Wpisz w polu <code>Szukaj...</code> (skrót <kbd>/</kbd>) dowolną frazę: nazwę pliku, folderu, <strong>słowo z nazwy lub opisu Albumu</strong>, pierwotną ścieżkę, dawną ścieżkę <em>usuniętego duplikatu</em>, imię osoby albo jedno z 1000 pojęć AI (np. <code>kwiaty</code>, <code>stokrotka</code>, <code>storczyk</code>, <code>wazon</code>, <code>rower</code>, <code>pies</code>, <code>morze</code>) i naciśnij <kbd>Enter</kbd>. Jeśli chcesz przeskanować modelem ONNX pod kątem wpisanej frazy również nieotagowane wcześniej zdjęcia, kliknij pojawiający się nad wynikami przycisk <span class="ui-btn">🧠 Szukaj głębiej na miniaturach AI</span> (działa w 100% Offline!).</p>
             </div>
             <div class="sub-box">
-                <h3>🔌 2. Kolejność dysków offline i tryb „Tylko dostępne online”</h3>
-                <p>Nad listą zdjęć automatycznie wyświetlają się <strong>dwie uporządkowane listy dysków offline</strong> potrzebnych do podglądu oryginałów (osobno dla bieżącej strony/zakładki i dla całego aktywnego widoku). Kliknięcie dysku filtruje do niego listę, przycisk <span class="ui-btn">💾 Wszystkie urządzenia</span> przywraca pełny widok, a <span class="ui-btn">🟢 Tylko dostępne online</span> pokazuje wyłącznie pliki z aktualnie podłączonych dysków. Lewy panel boczny można zwijać przyciskiem <span class="ui-btn">☰</span>.</p>
+                <h3>👤 2. Wyszukiwanie tej samej osoby (twarzy) z jednego zdjęcia (100% Offline)</h3>
+                <p>Otwórz szczegóły dowolnego zdjęcia z ludźmi (<span class="ui-btn">ℹ️ Szczegóły</span>): zobaczysz wykryte na nim twarze (<span class="ui-btn">👤 Twarz #1</span>, <span class="ui-btn">👤 Twarz #2</span>...). Kliknij wybraną twarz (lub kliknij <span class="ui-btn">🔍 Podobne</span> i przełącz na 7. tryb <strong>👤 Ta sama osoba</strong>) — system na podstawie samej wyciętej twarzy z lokalnych miniatur znajdzie tę osobę na innych zdjęciach w całym archiwum bez podłączania dysków USB! Nad wynikami wpisz imię (np. <code>Ania</code>, <code>Marek</code>) i kliknij <span class="ui-btn">🏷️ Zapisz imię osoby</span>, aby od tej pory wyszukiwać ją po imieniu.</p>
             </div>
             <div class="sub-box">
-                <h3>🖥️ 3. Trzy tryby widoku, sortowanie i podobieństwo 512-D</h3>
-                <p>Przycisk <span class="ui-btn">🔍 Podobne</span> na zdjęciu przeszukuje kolekcję w 6 trybach (układ 8x8 LAB, obiekty AI, barwy HSV, ta sama sesja, kompozycja). Na górnym pasku przełączysz tryb wyświetlania:
-                <ul>
-                    <li><strong>Widok: Oś czasu</strong> — zdjęcia ułożone chronologicznie dzień po dniu.</li>
-                    <li><strong>Widok: Gęsty (Kompakt)</strong> — nawet 12 kolumn miniatur na jednym ekranie do szybkiego przeglądu tysięcy zdjęć.</li>
-                    <li><strong>Widok: Tabela (Lista)</strong> — pełne ścieżki na dyskach, rozmiary MB, dokładne godziny i szybkie przyciski akcji.</li>
-                </ul>
-                </p>
+                <h3>🔌 3. Kolejność dysków offline, „Tylko dostępne online” i filtr drzewa albumów</h3>
+                <p>Nad listą zdjęć wyświetlają się <strong>dwie uporządkowane listy dysków offline</strong> potrzebnych do podglądu oryginałów (dla bieżącej strony i dla całego widoku). Kliknięcie dysku filtruje do niego listę, przycisk <span class="ui-btn">💾 Wszystkie urządzenia</span> przywraca pełny widok, a <span class="ui-btn">🟢 Tylko dostępne online</span> pokazuje wyłącznie pliki z podłączonych dysków. W lewym pasku nad drzewem albumów pole <code>Filtruj drzewo albumów...</code> pozwala błyskawicznie znaleźć album po nazwie.</p>
             </div>
             <div class="sub-box">
-                <h3>⛶ 4. Skróty klawiszowe i podgląd wideo w trybie Offline</h3>
-                <p>Po kliknięciu zdjęcia lub filmu w Lightboxie (w trybie Offline przy odłączonym dysku wideo wyświetla dostępną miniaturę zamiast błędu odtwarzania):
+                <h3>⛶ 4. Lightbox z Fallbackiem z kopii ONLINE, skróty klawiszowe i Pokaz TV</h3>
+                <p>Po kliknięciu zdjęcia lub filmu w Lightboxie (jeśli dysk z Oryginałem jest Offline, ale podłączony jest dysk z jego kopią zapasową, program automatycznie wyświetli pełne zdjęcie lub wideo z kopii Online!):
                 <ul>
                     <li><kbd>&larr;</kbd> / <kbd>&rarr;</kbd> — poprzednie / następne zdjęcie lub wideo.</li>
                     <li><strong>Kółko myszy (lub kliknięcie zdjęcia)</strong> — płynny Zoom do 600%, przeciąganie myszą przesuwa kadr (Pan).</li>

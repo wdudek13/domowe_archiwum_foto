@@ -1,7 +1,9 @@
 import datetime
 from collections import defaultdict
+import json
 import logging
 from pathlib import Path
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select, or_, and_
 from sqlalchemy.orm import Session, joinedload
@@ -82,11 +84,89 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
     return np.zeros(512, dtype=np.float32)
 
 
+def _get_query_face_vectors(
+    db: Session,
+    target_item: MediaItem,
+    face_index: Optional[int] = None,
+    fe: Optional[OnDemandFaceEmbedder] = None,
+) -> List[np.ndarray]:
+    """
+    Returns L2-normalized 256-D face vector(s) for `target_item`.
+    When `face_index` is specified (e.g. clicking Face #2 on a group photo),
+    strictly filters to that single face instead of matching all faces in the photo.
+    """
+    dim_bytes = OnDemandFaceEmbedder.VECTOR_DIM * 4
+    face_stmt = select(MediaFace).where(MediaFace.media_id == target_item.id)
+    if face_index is not None:
+        face_stmt = face_stmt.where(MediaFace.face_index == face_index)
+    face_stmt = face_stmt.order_by(MediaFace.face_index.asc())
+    target_face_rows = list(db.scalars(face_stmt).all())
+    q_vecs = [
+        np.frombuffer(f.vector, dtype=np.float32)
+        for f in target_face_rows
+        if f.vector and len(f.vector) == dim_bytes
+    ]
+    if q_vecs:
+        return q_vecs
+
+    # If the photo already has indexed faces in SQLite, do not silently fall back for an invalid face_index
+    if face_index is not None:
+        any_stored = db.scalar(
+            select(MediaFace.id).where(MediaFace.media_id == target_item.id).limit(1)
+        )
+        if any_stored is not None:
+            return []
+
+    if not target_item.thumbnail_relative_path:
+        return []
+    t_thumb = THUMBNAILS_DIR / target_item.thumbnail_relative_path
+    if not t_thumb.exists() or t_thumb.stat().st_size == 0:
+        return []
+
+    if fe is not None:
+        extracted = fe.extract_faces_from_thumbnail(t_thumb, allow_center_portrait_fallback=False)
+    else:
+        with OnDemandFaceEmbedder() as local_fe:
+            extracted = local_fe.extract_faces_from_thumbnail(t_thumb, allow_center_portrait_fallback=False)
+
+    # Persist newly detected faces for target_item so modal_detail immediately shows Face #1, #2 pills
+    if extracted:
+        try:
+            any_existing = db.scalar(
+                select(MediaFace.id).where(MediaFace.media_id == target_item.id).limit(1)
+            )
+            if any_existing is None:
+                for ef in extracted:
+                    db.add(
+                        MediaFace(
+                            media_id=target_item.id,
+                            face_index=int(ef["face_index"]),
+                            bbox_json=json.dumps(ef["bbox_norm"]),
+                            confidence=float(ef["confidence"]),
+                            vector=ef["vector_bytes"],
+                        )
+                    )
+                db.commit()
+        except Exception as exc:
+            logger.debug("On-the-fly face cache save skipped: %s", exc)
+            db.rollback()
+
+    if face_index is not None:
+        matched = [f["vector"] for f in extracted if int(f.get("face_index", -1)) == face_index]
+        if matched:
+            return matched
+        if 0 <= face_index < len(extracted):
+            return [extracted[face_index]["vector"]]
+        return []
+    return [f["vector"] for f in extracted]
+
+
 @router.get("/similar/{media_id}")
 def find_visually_similar(
     request: Request,
     media_id: str,
     mode: str = Query("hybrid"),
+    face_index: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ):
     if mode not in SIMILARITY_MODES:
@@ -122,14 +202,6 @@ def find_visually_similar(
     # Task 4: Dedicated 100% offline, thumbnail-only Same-Person Face Recognition mode
     if mode == "same_person":
         dim_bytes = OnDemandFaceEmbedder.VECTOR_DIM * 4
-        target_face_rows = list(
-            db.scalars(select(MediaFace).where(MediaFace.media_id == target_item.id)).all()
-        )
-        query_face_vecs = [
-            np.frombuffer(f.vector, dtype=np.float32)
-            for f in target_face_rows
-            if f.vector and len(f.vector) == dim_bytes
-        ]
 
         # Collect pre-indexed candidate faces from SQLite (active, non-backup items)
         cand_face_rows = [
@@ -147,16 +219,24 @@ def find_visually_similar(
             if r[1] and len(r[1]) == dim_bytes
         ]
 
+        # Check if query face vector(s) are already in SQLite; open ONNX/OpenCV session strictly on demand
+        stored_q_stmt = select(MediaFace).where(MediaFace.media_id == target_item.id)
+        if face_index is not None:
+            stored_q_stmt = stored_q_stmt.where(MediaFace.face_index == face_index)
+        stored_q_rows = list(db.scalars(stored_q_stmt.order_by(MediaFace.face_index.asc())).all())
+        query_face_vecs = [
+            np.frombuffer(f.vector, dtype=np.float32)
+            for f in stored_q_rows
+            if f.vector and len(f.vector) == dim_bytes
+        ]
+
         need_on_the_fly = (not query_face_vecs) or (not cand_face_rows)
         if need_on_the_fly:
             with OnDemandFaceEmbedder() as fe:
-                if not query_face_vecs and target_item.thumbnail_relative_path:
-                    t_thumb = THUMBNAILS_DIR / target_item.thumbnail_relative_path
-                    if t_thumb.exists() and t_thumb.stat().st_size > 0:
-                        extracted = fe.extract_faces_from_thumbnail(
-                            t_thumb, allow_center_portrait_fallback=False
-                        )
-                        query_face_vecs = [f["vector"] for f in extracted]
+                if not query_face_vecs:
+                    query_face_vecs = _get_query_face_vectors(
+                        db, target_item, face_index=face_index, fe=fe
+                    )
 
                 if query_face_vecs and not cand_face_rows:
                     # Fallback on-the-fly thumbnail scan: prioritize face-tagged items, then recent active items (100% offline!)
@@ -239,8 +319,9 @@ def find_visually_similar(
         for it in sorted_items:
             sim_vol_counts[it.volume_id] += 1
 
+        face_idx_note = f" (Twarz #{face_index + 1})" if face_index is not None else ""
         face_status_note = "" if query_face_vecs else " (nie wykryto wyraźnej twarzy na miniaturze wzorca)"
-        label = f"{SIMILARITY_MODES[mode]} — Wzorzec (100%): {target_item.file_name}{face_status_note}"
+        label = f"{SIMILARITY_MODES[mode]} — Wzorzec (100%): {target_item.file_name}{face_idx_note}{face_status_note}"
         return render_template(
             request,
             "partials/media_grid.html",
@@ -258,6 +339,7 @@ def find_visually_similar(
                 "similarity_target_name": target_item.file_name,
                 "similarity_mode": mode,
                 "similarity_modes": SIMILARITY_MODES,
+                "active_face_index": face_index,
                 "matched_person_ids": [it.id for it in sorted_items],
                 "all_groups": all_groups,
                 "flat_album_choices": build_flat_album_choices(all_groups),

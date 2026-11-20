@@ -936,14 +936,29 @@ def _run_background_ai_batch(job_id: int, item_ids: List[str], analysis_type: st
                         item_ids,
                         thumbnails_dir=THUMBNAILS_DIR,
                         progress_cb=_on_face_progress,
+                        stop_cb=lambda: AI_BATCH_STATE["stop_requested"] or ProcessManager.is_stop_requested(job_id),
                     )
             AI_BATCH_STATE["processed"] = f_res["processed"]
             AI_BATCH_STATE["tagged"] = f_res["items_with_faces"]
-            AI_BATCH_STATE["result_summary"] = (
-                f"Zaindeksowano twarze na miniaturach (100% Offline): sprawdzono {f_res['processed']} zdjęć, "
-                f"wykryto {f_res['faces_found']} twarzy na {f_res['items_with_faces']} zdjęciach."
-            )
-            OperationLogger.log("FACE_INDEX_BATCH", AI_BATCH_STATE["result_summary"], status="OK")
+            if f_res.get("stopped"):
+                stopped_midway = True
+                AI_BATCH_STATE["result_summary"] = (
+                    f"Zatrzymano indeksowanie twarzy na {f_res['processed']}/{len(item_ids)} "
+                    f"(wykryto {f_res['faces_found']} twarzy na {f_res['items_with_faces']} zdjęciach)."
+                )
+                ProcessManager.update_progress(
+                    job_id,
+                    processed_count=f_res["processed"],
+                    remaining_ids=f_res.get("remaining_ids", []),
+                    status="STOPPED",
+                    message=AI_BATCH_STATE["result_summary"],
+                )
+            else:
+                AI_BATCH_STATE["result_summary"] = (
+                    f"Zaindeksowano twarze na miniaturach (100% Offline): sprawdzono {f_res['processed']} zdjęć, "
+                    f"wykryto {f_res['faces_found']} twarzy na {f_res['items_with_faces']} zdjęciach."
+                )
+                OperationLogger.log("FACE_INDEX_BATCH", AI_BATCH_STATE["result_summary"], status="OK")
             return
 
         if is_storage_analysis:
@@ -5245,17 +5260,42 @@ async def name_person_action(
     if not selected_ids:
         return HTMLResponse("<span class='text-amber-400 text-xs'>Brak wybranych zdjęć do przypisania osoby.</span>")
 
+    target_media_id = (_form_str(form, "target_media_id") or "").strip()
+    face_index_val = to_int(_form_str(form, "face_index"))
+
     tag_label = f"osoba:{person_name}"[:64]
     tag_norm = normalize_pl(tag_label)
 
     existing_tags_by_mid: Dict[str, set] = {}
     for ch_start in range(0, len(selected_ids), 900):
         ch = selected_ids[ch_start : ch_start + 900]
-        db.execute(
-            update(MediaFace)
-            .where(MediaFace.media_id.in_(ch))
-            .values(person_name=person_name)
-        )
+        if face_index_val is not None:
+            if target_media_id:
+                if target_media_id in ch:
+                    db.execute(
+                        update(MediaFace)
+                        .where(MediaFace.media_id == target_media_id, MediaFace.face_index == face_index_val)
+                        .values(person_name=person_name)
+                    )
+                other_mids = [m for m in ch if m != target_media_id]
+                if other_mids:
+                    db.execute(
+                        update(MediaFace)
+                        .where(MediaFace.media_id.in_(other_mids))
+                        .values(person_name=person_name)
+                    )
+            else:
+                db.execute(
+                    update(MediaFace)
+                    .where(MediaFace.media_id.in_(ch), MediaFace.face_index == face_index_val)
+                    .values(person_name=person_name)
+                )
+        else:
+            db.execute(
+                update(MediaFace)
+                .where(MediaFace.media_id.in_(ch))
+                .values(person_name=person_name)
+            )
         for mid_r, tag_r in db.execute(
             select(MediaTag.media_id, MediaTag.tag).where(MediaTag.media_id.in_(ch))
         ).all():

@@ -6840,6 +6840,152 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertIn("portret_ania_las.jpg", r_find_ania.text)
         self.assertNotIn("jezioro_01.jpg", r_find_ania.text)
 
+        # ---------------------------------------------------------------------
+        # 5) Code Review Fixes Verification ([FACES-01], [FACES-02], [FACES-03], [CACHE-01])
+        # ---------------------------------------------------------------------
+        # [FACES-01]: self._sface.feature() MUST be used in extract_face_vector() when loaded
+        fe_sf = OnDemandFaceEmbedder()
+        fake_sface = MagicMock()
+        fake_sface.feature.return_value = np.linspace(0.1, 1.0, 128, dtype=np.float32).reshape(1, 128)
+        fe_sf._sface = fake_sface
+        fe_sf._session = None
+        dummy_bgr = cv2.imread(str(self.thumbs_dir / f"{ania1_id}.webp"))
+        sf_vec = fe_sf.extract_face_vector(dummy_bgr, (80, 60, 140, 160))
+        fake_sface.feature.assert_called_once()
+        self.assertEqual(sf_vec.shape, (OnDemandFaceEmbedder.VECTOR_DIM,))
+        self.assertAlmostEqual(float(np.linalg.norm(sf_vec)), 1.0, places=4)
+        fe_sf.close_session()
+        self.assertIsNone(fe_sf._sface)
+
+        # [FACES-02] & [FACES-03]: Per-face `face_index` filtering on group photos + preserving names for face_index > 0
+        with self.TestingSessionLocal() as db:
+            grp_photo_id = _add_offline_item("grupa_ania_marek.jpg", _write_plain_blue_thumb)
+            person_a_id = _add_offline_item("solo_osoba_a.jpg", _write_plain_blue_thumb)
+            person_b_id = _add_offline_item("solo_osoba_b.jpg", _write_plain_blue_thumb)
+
+            vec_a = np.zeros(OnDemandFaceEmbedder.VECTOR_DIM, dtype=np.float32)
+            vec_a[:64] = 1.0 / np.sqrt(64.0)
+            vec_b = np.zeros(OnDemandFaceEmbedder.VECTOR_DIM, dtype=np.float32)
+            vec_b[128:192] = 1.0 / np.sqrt(64.0)
+
+            db.add_all(
+                [
+                    MediaFace(
+                        media_id=grp_photo_id,
+                        face_index=0,
+                        bbox_json="[0.1, 0.2, 0.3, 0.4]",
+                        confidence=0.95,
+                        person_name="OsobaA",
+                        vector=vec_a.tobytes(),
+                    ),
+                    MediaFace(
+                        media_id=grp_photo_id,
+                        face_index=1,
+                        bbox_json="[0.5, 0.2, 0.3, 0.4]",
+                        confidence=0.92,
+                        person_name="OsobaB",
+                        vector=vec_b.tobytes(),
+                    ),
+                    MediaFace(
+                        media_id=person_a_id,
+                        face_index=0,
+                        bbox_json="[0.2, 0.2, 0.4, 0.4]",
+                        confidence=0.96,
+                        vector=vec_a.tobytes(),
+                    ),
+                    MediaFace(
+                        media_id=person_b_id,
+                        face_index=0,
+                        bbox_json="[0.2, 0.2, 0.4, 0.4]",
+                        confidence=0.96,
+                        vector=vec_b.tobytes(),
+                    ),
+                ]
+            )
+            db.commit()
+
+        # Detail modal renders clickable per-face links with distinct face_index=0 and face_index=1
+        r_det_grp = self.client.get(f"/media/{grp_photo_id}/detail")
+        self.assertEqual(r_det_grp.status_code, 200)
+        self.assertIn(f"/semantic/similar/{grp_photo_id}?mode=same_person&amp;face_index=0", r_det_grp.text)
+        self.assertIn(f"/semantic/similar/{grp_photo_id}?mode=same_person&amp;face_index=1", r_det_grp.text)
+
+        # Clicking face_index=0 matches ONLY Person A; clicking face_index=1 matches ONLY Person B
+        r_f0 = self.client.get(f"/semantic/similar/{grp_photo_id}", params={"mode": "same_person", "face_index": 0})
+        self.assertEqual(r_f0.status_code, 200)
+        self.assertIn("solo_osoba_a.jpg", r_f0.text)
+        self.assertNotIn("solo_osoba_b.jpg", r_f0.text)
+
+        r_f1 = self.client.get(f"/semantic/similar/{grp_photo_id}", params={"mode": "same_person", "face_index": 1})
+        self.assertEqual(r_f1.status_code, 200)
+        self.assertIn("solo_osoba_b.jpg", r_f1.text)
+        self.assertNotIn("solo_osoba_a.jpg", r_f1.text)
+
+        # Naming face_index=1 on group photo updates ONLY face_index=1 (preserves face_index=0 name!)
+        r_name_f1 = self.client.post(
+            "/actions/name-person",
+            data={
+                "person_name": "Marek",
+                "target_media_id": grp_photo_id,
+                "face_index": "1",
+                "selected_ids": [grp_photo_id, person_b_id],
+            },
+        )
+        self.assertEqual(r_name_f1.status_code, 200)
+        with self.TestingSessionLocal() as db:
+            grp_faces_named = {
+                f.face_index: f.person_name
+                for f in db.scalars(select(MediaFace).where(MediaFace.media_id == grp_photo_id)).all()
+            }
+            self.assertEqual(grp_faces_named, {0: "OsobaA", 1: "Marek"})
+
+        # [FACES-03]: Re-indexing via index_faces_for_items preserves person_name for BOTH face_index=0 AND face_index=1!
+        fe_reindex = OnDemandFaceEmbedder()
+        fake_extracted_2 = [
+            {"face_index": 0, "bbox_norm": [0.1, 0.2, 0.3, 0.4], "confidence": 0.94, "vector": vec_a, "vector_bytes": vec_a.tobytes()},
+            {"face_index": 1, "bbox_norm": [0.5, 0.2, 0.3, 0.4], "confidence": 0.91, "vector": vec_b, "vector_bytes": vec_b.tobytes()},
+        ]
+        with self.TestingSessionLocal() as db:
+            with patch.object(fe_reindex, "extract_faces_from_thumbnail", return_value=fake_extracted_2):
+                fe_reindex.index_faces_for_items(db, [grp_photo_id], thumbnails_dir=self.thumbs_dir)
+            grp_faces_after = {
+                f.face_index: f.person_name
+                for f in db.scalars(select(MediaFace).where(MediaFace.media_id == grp_photo_id)).all()
+            }
+            self.assertEqual(grp_faces_after, {0: "OsobaA", 1: "Marek"})
+
+        # [CACHE-01]: Deleting an older (non-max ID) tag MUST immediately invalidate _SIDEBAR_CACHE
+        r_add_cache = self.client.post(
+            "/actions/add-tags",
+            data={"media_id": flower_id, "tags": "stary_tag_cache, nowszy_tag_cache"},
+        )
+        self.assertEqual(r_add_cache.status_code, 200)
+        r_sb_before_rm = self.client.get("/media/sidebar")
+        self.assertIn("stary_tag_cache", r_sb_before_rm.text)
+        self.assertIn("nowszy_tag_cache", r_sb_before_rm.text)
+
+        with self.TestingSessionLocal() as db:
+            stary_row = db.scalar(
+                select(MediaTag).where(MediaTag.media_id == flower_id, MediaTag.tag == "stary_tag_cache")
+            )
+            nowszy_row = db.scalar(
+                select(MediaTag).where(MediaTag.media_id == flower_id, MediaTag.tag == "nowszy_tag_cache")
+            )
+            self.assertIsNotNone(stary_row)
+            self.assertIsNotNone(nowszy_row)
+            self.assertLess(stary_row.id, nowszy_row.id)
+            stary_tid = stary_row.id
+
+        r_rm_older = self.client.post(
+            "/actions/remove-tag",
+            data={"media_id": flower_id, "tag_id": str(stary_tid)},
+        )
+        self.assertEqual(r_rm_older.status_code, 200)
+        # max(MediaTag.id) did NOT change, yet sidebar MUST refresh immediately via count(MediaTag.id)!
+        r_sb_after_rm = self.client.get("/media/sidebar")
+        self.assertNotIn("stary_tag_cache", r_sb_after_rm.text)
+        self.assertIn("nowszy_tag_cache", r_sb_after_rm.text)
+
 
 if __name__ == "__main__":
     unittest.main()

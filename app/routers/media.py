@@ -802,6 +802,9 @@ def build_sidebar_context(db: Session) -> dict:
         db.scalar(select(func.count(MediaItem.id))) or 0,
         str(db.scalar(select(func.max(MediaItem.updated_at))) or ""),
         db.scalar(select(func.max(MediaTag.id))) or 0,
+        db.scalar(select(func.count(MediaTag.id))) or 0,
+        db.scalar(select(func.count(MediaFace.id))) or 0,
+        db.scalar(select(func.count(MediaFace.person_name))) or 0,
         db.scalar(select(func.count(MediaEmbedding.media_id))) or 0,
         db.scalar(select(func.count(MediaGroup.id))) or 0,
         db.scalar(select(func.count(MediaItem.id)).where(MediaItem.is_primary_duplicate == False)) or 0,
@@ -1253,12 +1256,20 @@ def get_media_detail(request: Request, media_id: str, db: Session = Depends(get_
             .order_by(DeletedDuplicateHistory.volume_label.asc(), DeletedDuplicateHistory.relative_path.asc())
         ).all()
     )
+    item_faces = list(
+        db.scalars(
+            select(MediaFace)
+            .where(MediaFace.media_id == it.id)
+            .order_by(MediaFace.face_index.asc())
+        ).all()
+    )
 
     return render_template(
         request,
         "partials/modal_detail.html",
         {
             "item": it,
+            "item_faces": item_faces,
             "all_groups": all_groups,
             "flat_album_choices": build_flat_album_choices(all_groups),
             "duplicate_copies": duplicate_copies,

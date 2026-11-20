@@ -191,6 +191,23 @@
                     </form>
                 </div>
 
+                {% if item_faces is defined and item_faces %}
+                <div class="mt-4">
+                    <span class="text-slate-400 font-semibold">Wykryte twarze na tym zdjęciu (Kliknij konkretną osobę, aby ją znaleźć):</span>
+                    <div class="flex flex-wrap gap-1.5 mt-2">
+                        {% for fc in item_faces %}
+                        <button type="button"
+                                hx-get="/semantic/similar/{{ item.id }}?mode=same_person&amp;face_index={{ fc.face_index }}"
+                                hx-target="#media-grid"
+                                hx-on::after-request="const m=this.closest('.fixed'); if(m) m.remove();"
+                                class="inline-flex items-center space-x-1 bg-purple-950/90 hover:bg-purple-800 text-purple-200 border border-purple-600/70 px-2.5 py-1 rounded-full text-[11px] font-medium transition">
+                            <span>👤 Twarz #{{ fc.face_index + 1 }}{% if fc.person_name %} ({{ fc.person_name }}){% endif %}</span>
+                        </button>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
                 <div class="mt-4">
                     <span class="text-slate-400 font-semibold">Wygenerowane Tagi AI i Ręczne (Kliknij aby filtrować):</span>
                     <div class="flex flex-wrap gap-1.5 mt-2">

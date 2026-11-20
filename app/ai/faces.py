@@ -69,13 +69,13 @@ class OnDemandFaceEmbedder:
 
     def open_session(self) -> None:
         # Tier 1: Optional YuNet ONNX face detector (~230 KB)
-        if self.yunet_path.exists() and hasattr(cv2, "FaceDetectorYN"):
+        if self._yunet is None and self.yunet_path.exists() and hasattr(cv2, "FaceDetectorYN"):
             try:
                 self._yunet = cv2.FaceDetectorYN.create(
                     str(self.yunet_path.resolve()),
                     "",
                     (300, 300),
-                    score_threshold=0.65,
+                    score_threshold=0.60,
                     nms_threshold=0.35,
                     top_k=20,
                 )
@@ -101,14 +101,19 @@ class OnDemandFaceEmbedder:
                         pass
 
         # Optional SFace recognizer (~36 MB) or existing MobileNetV2 ONNX (~14 MB) on cropped face ROI
-        if self.sface_path.exists() and hasattr(cv2, "FaceRecognizerSF"):
+        if self._sface is None and self.sface_path.exists() and hasattr(cv2, "FaceRecognizerSF"):
             try:
                 self._sface = cv2.FaceRecognizerSF.create(str(self.sface_path.resolve()), "")
             except Exception as exc:
                 logger.debug("SFace init skipped: %s", exc)
                 self._sface = None
 
-        if self._sface is None and self.mobilenet_path.exists() and self.mobilenet_path.stat().st_size > 1_000_000:
+        if (
+            self._sface is None
+            and self._session is None
+            and self.mobilenet_path.exists()
+            and self.mobilenet_path.stat().st_size > 1_000_000
+        ):
             try:
                 import onnxruntime as ort
                 opts = ort.SessionOptions()
@@ -176,7 +181,7 @@ class OnDemandFaceEmbedder:
                         fy = max(0, min(h - 1, fy))
                         fw = min(w - fx, max(1, fw))
                         fh = min(h - fy, max(1, fh))
-                        if fw >= 20 and fh >= 20:
+                        if fw >= 10 and fh >= 10:
                             raw_boxes.append((fx, fy, fw, fh, round(min(1.0, score), 3)))
             except Exception as exc:
                 logger.debug("YuNet detect warning: %s", exc)
@@ -326,7 +331,16 @@ class OnDemandFaceEmbedder:
         lab_48 = small_lab.flatten()  # 48 dims
 
         onnx_32: Optional[np.ndarray] = None
-        if self._session is not None:
+        if self._sface is not None:
+            try:
+                face_112 = cv2.resize(norm_bgr_64, (112, 112), interpolation=cv2.INTER_CUBIC)
+                sf_feat = self._sface.feature(face_112).astype(np.float32).flatten()
+                if sf_feat.size >= 32:
+                    onnx_32 = _unit_norm(sf_feat[:32])
+            except Exception as exc:
+                logger.debug("SFace feature extraction skipped: %s", exc)
+                onnx_32 = None
+        elif self._session is not None:
             try:
                 rgb_224 = cv2.cvtColor(
                     cv2.resize(norm_bgr_64, (224, 224), interpolation=cv2.INTER_CUBIC),
@@ -379,7 +393,12 @@ class OnDemandFaceEmbedder:
             return []
 
         auto_opened = False
-        if self._session is None and self._yunet is None and self._frontal_cascade is None:
+        if (
+            self._session is None
+            and self._sface is None
+            and self._yunet is None
+            and self._frontal_cascade is None
+        ):
             self.open_session()
             auto_opened = True
 
@@ -420,10 +439,12 @@ class OnDemandFaceEmbedder:
         item_ids: List[str],
         thumbnails_dir: Optional[Path] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
-    ) -> Dict[str, int]:
+        stop_cb: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
         """
         Indexes faces for `item_ids` reading ONLY local thumbnails (100% offline safe!).
         Preserves any existing `person_name` on re-indexed items and releases all models in `finally:`.
+        Supports cooperative stopping via `stop_cb`.
         """
         from app.models import MediaFace, MediaItem, MediaTag
 
@@ -432,24 +453,33 @@ class OnDemandFaceEmbedder:
         processed = 0
         faces_found_total = 0
         items_with_faces = 0
+        stopped = False
+        remaining_ids: List[str] = []
 
         try:
             total = len(item_ids)
             for ch_start in range(0, total, 100):
+                if stop_cb and stop_cb():
+                    stopped = True
+                    remaining_ids = item_ids[ch_start:]
+                    break
                 ch_ids = item_ids[ch_start : ch_start + 100]
                 rows = db.execute(
                     select(MediaItem.id, MediaItem.thumbnail_relative_path).where(MediaItem.id.in_(ch_ids))
                 ).all()
 
-                existing_names: Dict[str, Optional[str]] = {}
-                for mid_r, pname_r in db.execute(
-                    select(MediaFace.media_id, MediaFace.person_name)
+                existing_names: Dict[Tuple[str, int], str] = {}
+                for mid_r, fidx_r, pname_r in db.execute(
+                    select(MediaFace.media_id, MediaFace.face_index, MediaFace.person_name)
                     .where(MediaFace.media_id.in_(ch_ids), MediaFace.person_name.is_not(None))
                 ).all():
-                    if str(mid_r) not in existing_names:
-                        existing_names[str(mid_r)] = str(pname_r)
+                    existing_names[(str(mid_r), int(fidx_r or 0))] = str(pname_r)
 
-                for mid, thumb_rel in rows:
+                for idx_in_ch, (mid, thumb_rel) in enumerate(rows):
+                    if stop_cb and stop_cb():
+                        stopped = True
+                        remaining_ids = item_ids[ch_start + idx_in_ch :]
+                        break
                     processed += 1
                     if not thumb_rel:
                         continue
@@ -461,15 +491,18 @@ class OnDemandFaceEmbedder:
                     db.execute(delete(MediaFace).where(MediaFace.media_id == mid))
                     if faces:
                         items_with_faces += 1
-                        prev_name = existing_names.get(str(mid))
                         for f in faces:
+                            f_idx = int(f["face_index"])
+                            person_name = existing_names.get((str(mid), f_idx)) or (
+                                existing_names.get((str(mid), 0)) if f_idx == 0 else None
+                            )
                             db.add(
                                 MediaFace(
                                     media_id=str(mid),
-                                    face_index=f["face_index"],
+                                    face_index=f_idx,
                                     bbox_json=json.dumps(f["bbox_norm"]),
                                     confidence=f["confidence"],
-                                    person_name=prev_name if f["face_index"] == 0 else None,
+                                    person_name=person_name,
                                     vector=f["vector_bytes"],
                                 )
                             )
@@ -493,11 +526,15 @@ class OnDemandFaceEmbedder:
                     if progress_cb and (processed % 20 == 0 or processed == total):
                         progress_cb(processed, total)
                 db.commit()
+                if stopped:
+                    break
 
             return {
                 "processed": processed,
                 "items_with_faces": items_with_faces,
                 "faces_found": faces_found_total,
+                "stopped": stopped,
+                "remaining_ids": remaining_ids,
             }
         finally:
             self.close_session()

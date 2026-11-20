@@ -78,7 +78,9 @@
                         hx-post="/actions/on-demand-keyword-scan"
                         hx-vals="{{ {'q': active_q}|tojson|e }}"
                         hx-target="#global-notification"
-                        class="bg-purple-800/90 hover:bg-purple-700 border border-purple-500 text-purple-100 px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition">
+                        hx-disabled-elt="this"
+                        onclick="const n=document.getElementById('global-notification'); if(n){ n.innerHTML='<span class=\'text-purple-300 text-xs font-semibold animate-pulse\'>🧠 Skanuję lokalne miniatury modelem AI (On-Demand) — proszę czekać...</span>'; }"
+                        class="bg-purple-800/90 hover:bg-purple-700 disabled:opacity-50 border border-purple-500 text-purple-100 px-2.5 py-0.5 rounded-full text-[11px] font-semibold transition">
                     🧠 Szukaj głębiej na miniaturach AI („{{ active_q }}”)
                 </button>
             {% endif %}
@@ -460,7 +462,11 @@
               hx-target="#global-notification"
               class="pt-2 border-t border-purple-800/50 flex flex-wrap items-center gap-2">
             <input type="hidden" name="default_media_ids_json" value='{{ (matched_person_ids or [])|tojson }}'>
-            <span class="text-purple-200 font-semibold">👤 Nazwij tę osobę (dla zaznaczonych lub wszystkich dopasowanych zdjęć):</span>
+            {% if active_face_index is defined and active_face_index is not none %}
+            <input type="hidden" name="target_media_id" value="{{ similarity_target_id }}">
+            <input type="hidden" name="face_index" value="{{ active_face_index }}">
+            {% endif %}
+            <span class="text-purple-200 font-semibold">👤 Nazwij tę osobę{% if active_face_index is defined and active_face_index is not none %} (Twarz #{{ active_face_index + 1 }}){% endif %} (dla zaznaczonych lub wszystkich dopasowanych zdjęć):</span>
             <input type="text" name="person_name" required placeholder="np. Babcia Zosia, Marek, Ania"
                    class="bg-slate-900 border border-purple-600/70 rounded-lg px-2.5 py-1 text-white w-56">
             <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1 rounded-lg font-semibold shadow">
@@ -1058,7 +1064,9 @@
                         hx-post="/actions/on-demand-keyword-scan"
                         hx-vals="{{ {'q': active_q}|tojson|e }}"
                         hx-target="#global-notification"
-                        class="bg-purple-800/90 hover:bg-purple-700 border border-purple-500 text-purple-100 px-4 py-2 rounded-lg text-xs font-semibold shadow transition">
+                        hx-disabled-elt="this"
+                        onclick="const n=document.getElementById('global-notification'); if(n){ n.innerHTML='<span class=\'text-purple-300 text-xs font-semibold animate-pulse\'>🧠 Skanuję lokalne miniatury modelem AI (On-Demand) — proszę czekać...</span>'; }"
+                        class="bg-purple-800/90 hover:bg-purple-700 disabled:opacity-50 border border-purple-500 text-purple-100 px-4 py-2 rounded-lg text-xs font-semibold shadow transition">
                     🧠 Nie znalazłeś wszystkiego? Przeszukaj teraz miniatury na żywo modelem AI pod kątem: „{{ active_q }}”
                 </button>
             </div>

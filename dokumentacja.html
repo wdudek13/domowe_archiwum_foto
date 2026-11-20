@@ -1,3 +1,4 @@
+html
 <!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -214,13 +215,13 @@
 
 <header>
     <h1>📸 Domowe Archiwum Foto — Dokumentacja Techniczna</h1>
-    <p>Architektura systemu, klastrowanie ról duplikatów i backupów, algorytmy 100% weryfikacji binarnej, silnik AI/CV On-Demand oraz kluczowe wnioski inżynieryjne</p>
+    <p>Architektura systemu, klastrowanie ról duplikatów i backupów, Zero-Trust FileSafetyGuard (kwarantanna i Two-Phase Commit), algorytmy 100% weryfikacji binarnej, silnik AI/CV On-Demand (1000 klas ImageNet + Rozpoznawanie Twarzy 256-D) oraz kluczowe wnioski inżynieryjne</p>
     <div class="badge-row">
         <span class="badge emerald">Python 3.11+ / FastAPI</span>
         <span class="badge blue">SQLite WAL + SSD Staged Backup (.db.gz)</span>
-        <span class="badge amber">Win32 Kernel32 VSN Tracking</span>
-        <span class="badge purple">OpenCV + ONNX Runtime (On-Demand)</span>
-        <span class="badge emerald">100% Weryfikacja Binarna i Klastrowa</span>
+        <span class="badge amber">Win32 Kernel32 Strict VSN Tracking</span>
+        <span class="badge purple">OpenCV + ONNX Runtime (On-Demand + Face 256-D)</span>
+        <span class="badge emerald">Zero-Trust FileSafetyGuard + Kwarantanna</span>
     </div>
 </header>
 
@@ -234,9 +235,9 @@
             <li><a href="#klastry-role">4. Model Ról Klastra i Znacznik ORYGINAŁ ✓</a></li>
             <li><a href="#backup-plan">5. Silnik Planowania i Wykonania Backupu</a></li>
             <li><a href="#move-backups">6. Przenoszenie Backupów Między Dyskami</a></li>
-            <li><a href="#safe-dup-delete">7. Bezpieczne Usuwanie Duplikatów Dysk-po-Dysku</a></li>
-            <li><a href="#albumy-multimedia">8. Albumy, Daty i Odporność Dekodera</a></li>
-            <li><a href="#ai-cv">9. Silnik AI / Computer Vision (On-Demand)</a></li>
+            <li><a href="#safe-dup-delete">7. Bezpieczne Usuwanie Duplikatów, FileSafetyGuard i Kwarantanna</a></li>
+            <li><a href="#albumy-multimedia">8. Albumy, Tagi Ręczne, Daty i Odporność Dekodera</a></li>
+            <li><a href="#ai-cv">9. Silnik AI / Computer Vision (On-Demand + Twarze 256-D)</a></li>
             <li><a href="#wnioski">10. Czego nauczyliśmy się o systemie (Wnioski Inżynieryjne)</a></li>
             <li><a href="#api-endpoints">11. Specyfikacja Punktów Końcowych REST / HTMX</a></li>
         </ol>
@@ -251,11 +252,11 @@
             <div class="grid-2">
                 <div class="card">
                     <h4>Zero-Startup-Overhead</h4>
-                    <p>Podczas startu serwera FastAPI żadne modele sieci neuronowych nie są ładowane do pamięci RAM. Sesje ONNX Runtime (<code>MobileNetV2</code>) oraz klasyfikatory OpenCV są otwierane wyłącznie na czas trwania zadania i natychmiast zwalniane (<code>del</code> + <code>gc.collect()</code>).</p>
+                    <p>Podczas startu serwera FastAPI żadne modele sieci neuronowych nie są ładowane do pamięci RAM. Sesje ONNX Runtime (<code>MobileNetV2</code>, opcjonalnie <code>YuNet</code>/<code>SFace</code>) oraz klasyfikatory OpenCV są otwierane wyłącznie na czas trwania zadania i natychmiast zwalniane (<code>del</code> + <code>gc.collect()</code>).</p>
                 </div>
                 <div class="card">
-                    <h4>Rozdział Backupu od Usuwania Duplikatów</h4>
-                    <p>Operacja tworzenia kopii zapasowych (<code>🛡️ Backup zdjęć/filmów</code>) jest całkowicie odseparowana od kasowania nadmiarowych kopii (<code>👥 Duplikaty binarne</code>). Backup jest w 100% niedestrukcyjny dla oryginałów, a usuwanie duplikatów wymaga spełnienia wielowarstwowych bramek bezpieczeństwa.</p>
+                    <h4>Rozdział Backupu od Usuwania i Architektura Zero-Trust</h4>
+                    <p>Operacja tworzenia kopii zapasowych (<code>🛡️ Backup zdjęć/filmów</code>) jest całkowicie odseparowana od kasowania nadmiarowych kopii (<code>👥 Duplikaty binarne</code>). Wszystkie fizyczne operacje na plikach użytkownika przechodzą przez pojedynczy punkt kontrolny <code>FileSafetyGuard</code> (<code>app/file_safety.py</code>) z dwufazowym tokenem zatwierdzania i kwarantanną <code>daf_kwarantanna/</code> na tym samym wolumenie.</p>
                 </div>
             </div>
 
@@ -264,29 +265,33 @@
 ├── app/
 │   ├── ai/
 │   │   ├── embeddings.py       # 512-wymiarowe wektory cech wizualnych (CIE LAB + HSV + Krawędzie Sobel)
+│   │   ├── faces.py            # Detekcja twarzy i wektory tożsamości osoby 256-D wyłącznie na miniaturach WebP
 │   │   ├── quality.py          # Odporne dekodowanie obrazów + detekcja ostrości (8x8 Patch) i wad jakości
-│   │   └── tagger.py           # Tagowanie obiektów i scen (ONNX MobileNetV2 + Haar Cascade + analiza HSV)
+│   │   └── tagger.py           # Dwupoziomowe tagowanie (kategorie + 1000 klas ImageNet PL/EN + HSV + skan On-Demand)
 │   ├── cloud/
 │   │   └── google_drive.py     # Integracja Google Drive API v3 (OAuth 2.0 + MD5 + retencja 1 kopii bazy)
 │   ├── routers/
-│   │   ├── actions.py          # Operacje dyskowe, backup, bezpieczne usuwanie duplikatów, konserwacja SQLite
-│   │   ├── media.py            # Wyszukiwanie SQLite, mapa cross-vault backup, strumieniowanie raw/HEIC/MOV
-│   │   └── semantic.py         # Wyszukiwanie semantyczne i 6 trybów podobieństwa wizualnego w RAM
+│   │   ├── actions.py          # Operacje dyskowe, Two-Phase Commit delete, tagi ręczne, nazywanie osób, VACUUM
+│   │   ├── media.py            # Wyszukiwanie SQLite (w tym po albumach), fallback podglądu z kopii online
+│   │   └── semantic.py         # Wyszukiwanie semantyczne i 7 trybów podobieństwa (w tym Ta sama osoba) w RAM
 │   ├── templates/              # Szablony HTML5 + HTMX + TailwindCSS (base, index, partials/*)
-│   ├── backup.py               # Transakcyjny BackupManager (bufor SSD staging + kompresja gzip .db.gz)
-│   ├── database.py             # Silnik SQLAlchemy, PRAGMA WAL/FULL, automatyczne migracje schematu i FTS5
-│   ├── models.py               # Modele ORM (WindowsVolume, MediaItem, MediaGroup, MediaTag, BackgroundJob...)
-│   ├── operation_log.py        # Trwały rejestr operacji (operations.log) oraz ProcessManager z cache RAM
+│   ├── backup.py               # Transakcyjny BackupManager (bufor SSD staging + gzip + pula pre_permanent_disk_delete)
+│   ├── database.py             # Silnik SQLAlchemy, PRAGMA WAL/FULL, automatyczne migracje schematu (w tym media_faces)
+│   ├── file_safety.py          # Centralny strażnik FileSafetyGuard (kwarantanna daf_kwarantanna/, Read-Only, JSONL)
+│   ├── models.py               # Modele ORM (WindowsVolume, MediaItem, MediaGroup, MediaTag, MediaFace, BackgroundJob...)
+│   ├── operation_log.py        # Trwały rejestr operacji (operations.log) oraz ProcessManager z globalnym mutexem dysku
 │   ├── scanner.py              # Win32 VSN Inspector, FastHasher (weryfikacja 100%), DateResolver, ThumbnailService
 │   └── storage_ops.py          # Planowanie backupu, przenoszenie backupów, bezpieczne usuwanie duplikatów
 ├── data/
 │   ├── db/media_vault.db       # Główna baza danych SQLite (tryb WAL)
 │   ├── backups/                # Lokalna rotowana kopia bazy SQLite + podkatalog bufora SSD (staging/)
-│   ├── logs/operations.log     # Trwały dziennik audytowy wszystkich operacji
-│   ├── thumbnails/             # Lokalny cache miniatur WebP (300 px) umożliwiający pracę w trybie Offline
-│   └── kosz/                   # Lokalny bezpieczny Kosz umożliwiający przywrócenie plików na dysk macierzysty
+│   ├── logs/
+│   │   ├── operations.log              # Trwały dziennik audytowy wszystkich operacji aplikacji
+│   │   └── file_operations_audit.jsonl # Niezależny od SQLite dziennik JSONL każdej operacji plikowej
+│   ├── thumbnails/             # Lokalny cache miniatur WebP (300 px) umożliwiający pracę i analizy AI w trybie Offline
+│   └── kosz/                   # Lokalny katalog pomocniczy Kosza
 └── tests/
-    └── test_vault.py           # Kompleksowy zestaw testów jednostkowych i integracyjnych</code></pre>
+    └── test_vault.py           # Kompleksowy zestaw testów jednostkowych, integracyjnych i bezpieczeństwa Zero-Trust</code></pre>
         </section>
 
         <section id="dyski-vsn">
@@ -297,13 +302,15 @@
                 Dla każdego podłączonego dysku w tabeli <code>windows_volumes</code> zapisywane są wartości <code>total_space_bytes</code> oraz <code>free_space_bytes</code>, które służą jako pamięć podręczna pojemności, gdy dysk przejdzie w stan Offline.
             </p>
             <ul>
-                <li><strong>Bariera operacji dyskowych na żywo (<code>verify_and_resolve_online_volume_root()</code>):</strong> przed każdym zapisem, przeniesieniem lub usunięciem pliku na dysku system sprawdza bieżącą mapę VSN. Gdy wolumen został zamontowany pod inną literą napędu, metoda automatycznie aktualizuje <code>last_known_drive_letter</code> i zwraca właściwą ścieżkę; przy niezgodności VSN operacja jest twardo blokowana (zwraca <code>None</code>), co wyklucza pomyłkę plików o identycznych ścieżkach na różnych dyskach.</li>
+                <li><strong>Bariera operacji dyskowych na żywo (<code>verify_and_resolve_online_volume_root(strict_vsn=True)</code>):</strong> przed każdym zapisem, przeniesieniem lub usunięciem pliku na dysku system domyślnie wymaga ścisłej zgodności sprzętowego numeru VSN (<code>strict_vsn=True</code>). Gdy wolumen został zamontowany pod inną literą napędu, metoda automatycznie aktualizuje <code>last_known_drive_letter</code> i zwraca właściwą ścieżkę; przy niezgodności VSN lub braku mapy VSN operacja jest twardo blokowana (zwraca <code>None</code>), co wyklucza pomyłkę plików o identycznych ścieżkach na różnych dyskach.</li>
+                <li><strong>Walidacja zawierania ścieżki w korzeniu wolumenu (<code>safe_resolve_volume_path</code>):</strong> każda ścieżka względna z bazy SQLite jest rozwiązywana przez <code>safe_resolve_volume_path(vol_root, relative_path)</code> w <code>app/file_safety.py</code>, która blokuje ścieżki absolutne, prefiksy dysków (<code>C:</code>), segmenty <code>..</code> oraz dowiązania wychodzące poza korzeń wolumenu (<code>is_relative_to(root_res)</code>).</li>
                 <li><strong>Dwie kolejki dysków offline i filtr <code>online_only</code>:</strong> funkcja <code>build_offline_drives_queues()</code> (<code>app/routers/media.py</code>) wylicza dwie listy dysków offline posortowane malejąco po liczbie brakujących oryginałów: <code>page_drives</code> (bieżąca strona / pierwsza zakładka) oraz <code>view_drives</code> (cały aktywny filtr). Użytkownik może też zawęzić listę do aktualnie podłączonych nośników flagą <code>online_only=True</code> lub jednym kliknięciem wrócić przyciskiem <em>„Wszystkie urządzenia”</em>.</li>
+                <li><strong>Automatyczny fallback podglądu zdjęcia/wideo z kopii ONLINE, gdy dysk Oryginału jest OFFLINE (<code>_resolve_online_preview_path</code>):</strong> jeśli dysk z przeglądanym Oryginałem jest odłączony (OFFLINE), ale na innym aktualnie podłączonym dysku ONLINE znajduje się jego kopia zapasowa (np. w <code>daf_backup/</code>) o tym samym <code>file_hash</code>, Lightbox i modal szczegółów automatycznie strumieniują pełnej jakości zdjęcie lub wideo z kopii online w trybie tylko do odczytu (wyświetlając zielony komunikat: <em>„🟢 Podgląd z kopii online — oryginał offline”</em>).</li>
             </ul>
         </section>
 
         <section id="baza-sqlite">
-            <h2>3. Baza SQLite, Spójność z Dyskami i Historia Usuniętych Duplikatów</h2>
+            <h2>3. Baza SQLite, Spójność z Dyskami, Ochrona Migawek Ratunkowych i Historia Duplikatów</h2>
             <p>Każde połączenie z bazą danych SQLite ustawia bezpieczne parametry transakcyjne (<code>WAL</code>, <code>synchronous = FULL</code>, <code>busy_timeout = 30000</code>). Klasa <code>BackupManager</code> (<code>app/backup.py</code>) realizuje 3-etapowy proces tworzenia kopii bazy:</p>
             <ol>
                 <li><strong>Etap 1 (Bufor SSD):</strong> Kopiowanie stron bazy za pomocą natywnego <code>sqlite3.Connection.backup()</code> do lokalnego katalogu <code>data/backups/staging/</code> na szybkim dysku lokalnym (eliminuje blokady i wolne losowe zapisy na zewnętrznych dyskach USB).</li>
@@ -311,7 +318,8 @@
                 <li><strong>Etap 3 (Atomowy zapis):</strong> Zapis do pliku <code>.tmp</code> na nośniku docelowym (<code>daf_backup/db_backups/</code> lub Google Drive) i atomowa zmiana nazwy na docelową.</li>
             </ol>
             <ul>
-                <li><strong>Spójność bazy z dyskami i bezpieczny re-skan:</strong> ponowne skanowanie w <code>FileScannerService</code> zachowuje dla istniejących plików wszystkie tagi AI, wektory 512-D, oceny ostrości, przypisania do albumów, kąt obrotu i daty. Narzędzia <code>verify_db_disk_consistency()</code> oraz <code>cleanup_missing_db_items()</code> sprawdzają obecność plików na podłączonych dyskach i pozwalają usunąć martwe wpisy wyłącznie za zgodą użytkownika.</li>
+                <li><strong>Ochrona migawek ratunkowych podczas rotacji (<code>BackupManager._rotate</code>):</strong> lokalny katalog <code>data/backups/</code> przechowuje domyślnie do <code>20</code> kopii bazy, przy czym: (a) zawsze chroni w osobnej puli co najmniej <strong>5 ostatnich migawek <code>pre_permanent_disk_delete</code></strong> (nigdy nie zostają one wypchnięte przez zwykłe kopie <code>auto</code> lub <code>pre_trash_move</code>), oraz (b) nigdy automatycznie nie usuwa żadnej starszej migawki, która jest o ponad 20% większa od najnowszej kopii bazy.</li>
+                <li><strong>Spójność bazy z dyskami i bezpieczny re-skan:</strong> ponowne skanowanie w <code>FileScannerService</code> zachowuje dla istniejących plików wszystkie tagi AI i ręczne, wektory 512-D, wektory twarzy 256-D, oceny ostrości, przypisania do albumów, kąt obrotu i daty. Narzędzia <code>verify_db_disk_consistency()</code> oraz <code>cleanup_missing_db_items()</code> sprawdzają obecność plików na podłączonych (VSN-verified) dyskach i pozwalają usunąć martwe wpisy wyłącznie za zgodą użytkownika, nie dotykając dysków offline.</li>
                 <li><strong>Historia usuniętych duplikatów (<code>DeletedDuplicateHistory</code>):</strong> tabela <code>deleted_duplicate_history</code> przechowuje dawne nazwy plików, ścieżki względne, nazwy wolumenów i <code>file_hash</code> skasowanych duplikatów (z automatycznym odtworzeniem wstecznym z kopii <code>pre_dup_delete</code>). Pozwala to wyszukać zachowany Oryginał po dawnej ścieżce duplikatu oraz uruchomić weryfikację integralności SQL w <code>verify_deleted_duplicates_integrity()</code> (<code>POST /actions/verify-deleted-duplicates</code>).</li>
                 <li>Dodatkowo punkt końcowy <code>POST /actions/vacuum-db</code> umożliwia na żądanie wykonanie <code>PRAGMA wal_checkpoint(TRUNCATE); VACUUM;</code> na głównej bazie danych, a <code>POST /actions/cleanup-orphan-thumbs</code> usuwa nieużywane pliki <code>.webp</code> z katalogu <code>data/thumbnails/</code>.</li>
             </ul>
@@ -362,17 +370,17 @@
             <h2>5. Silnik Planowania i Wykonania Backupu (<code>daf_backup/RRRR/MM/DD/</code>)</h2>
             <p>Metoda <code>build_backup_and_dedup_plan()</code> buduje kompletny plan zabezpieczenia kolekcji:</p>
             <ul>
-                <li><strong>Niezmiennik statystyk:</strong> <code>missing_backups + green_backups + orange_backups == total_unique</code>.</li>
+                <li><strong>Niezmiennik statystyk:</strong> <code>missing_backups + green_backups + orange_backups == total_unique</code>. (Pliki metadanych Kosza Windows <code>$RECYCLE.BIN/$I*</code> są automatycznie odfiltrowywane, aby nie powodowały błędów weryfikacji obrazu).</li>
                 <li><strong>Automatyczny dobór dysków docelowych (<code>default_target_volume_ids</code>):</strong> Sortuje dyski rosnąco według liczby posiadanych oryginałów (<code>orig_count_by_vol</code>) oraz malejąco według wolnej przestrzeni (<code>free_space_bytes</code>), dobierając minimalny zestaw dysków pokrywający zapotrzebowanie na nowe kopie.</li>
-                <li><strong>Trzy strumienie operacji plikowych (z dokładnością do dnia <code>RRRR/MM/DD</code>):</strong>
+                <li><strong>Trzy strumienie operacji plikowych (z dokładnością do dnia <code>RRRR/MM/DD</code> i natychmiastowym <code>db.commit()</code> po każdym pliku):</strong>
                     <ol>
-                        <li><code>backups_to_copy</code> (<em>Nowe kopie</em>): dla klastrów bez zielonego backupu (czyli <code>missing_backups</code> oraz <code>orange_backups</code>) kopiuje Oryginał na wybrany dysk docelowy do <code>daf_backup/RRRR/MM/DD/</code>.</li>
+                        <li><code>backups_to_copy</code> (<em>Nowe kopie</em>): dla klastrów bez zielonego backupu (czyli <code>missing_backups</code> oraz <code>orange_backups</code>) kopiuje Oryginał na wybrany dysk docelowy do <code>daf_backup/RRRR/MM/DD/</code> za pomocą append-only <code>safe_copy_new_to_daf_backup</code>.</li>
                         <li><code>backups_to_relocate</code> (<em>Kopie lokalne</em>): dla zielonych backupów leżących poza <code>daf_backup/</code> (gdy <code>minimize_transfers=True</code> lub kopia już leży na wybranym dysku docelowym) przenosi plik w obrębie tego samego dysku do <code>daf_backup/RRRR/MM/DD/</code>.</li>
                         <li><code>backups_remote_move</code> (<em>Kopie zdalne</em>): gdy użytkownik wyłączy opcję <em>Zminimalizuj przeniesienia</em> (<code>minimize_transfers=False</code>), przenosi zielone backupy z dysków niebędących docelowymi na wybrane dyski docelowe do <code>daf_backup/RRRR/MM/DD/</code>.</li>
                     </ol>
                 </li>
-                <li><strong>Tryb ścisłej ochrony wybranych dysków (<code>strict_target_writes_only=True</code>):</strong> ogranicza wszelkie operacje zapisu (nowe kopie, lokalne przeniesienia do <code>daf_backup/</code>, konsolidację zdalną oraz przypisania albumu <em>Ważne</em>) wyłącznie do dysków wskazanych w <code>target_volume_ids</code> (<code>allowed_write_vols</code>). Na dyskach niewybranych pomijane są relokacje lokalne i przypisania do albumu <em>Ważne</em> (<code>skipped_non_target_relocs</code>, <code>skipped_non_target_important</code>), a podczas przeniesień zdalnych wyłączane jest kasowanie pliku źródłowego (<code>_safe_unlink</code>) na dysku chronionym — tak aby nie nadpisywać potencjalnie skasowanych danych.</li>
-                <li><strong>Przypisanie 1-do-1 dla albumu „Ważne” i bilans zgodności (<code>reconciliation</code>):</strong> Każdy oryginał posiadający lokalną kopię na tym samym dysku jest przypisywany dokładnie do jednej aktywnej pary w harmonogramie (<code>_pick_pair_for_important</code>) i umieszczany w hierarchii <code>Ważne - &lt;Etykieta_Dysku&gt; &rarr; RRRR &rarr; MM &rarr; DD</code>. Suma operacji na parach w harmonogramie jest w 100% równa ogólnemu planowi.</li>
+                <li><strong>Tryb ścisłej ochrony wybranych dysków (<code>strict_target_writes_only=True</code>):</strong> ogranicza wszelkie operacje zapisu (nowe kopie, lokalne przeniesienia do <code>daf_backup/</code>, konsolidację zdalną oraz przypisania albumu <em>Ważne</em>) wyłącznie do dysków wskazanych w <code>target_volume_ids</code> (<code>allowed_write_vols</code>). Na dyskach niewybranych pomijane są relokacje lokalne i przypisania do albumu <em>Ważne</em> (<code>skipped_non_target_relocs</code>, <code>skipped_non_target_important</code>), a podczas przeniesień zdalnych wyłączane jest kasowanie pliku źródłowego na dysku chronionym — tak aby nie nadpisywać potencjalnie skasowanych danych.</li>
+                <li><strong>Przypisanie 1-do-1 dla albumu „Ważne” (w tym tryb czysto bazodanowy <code>POST /actions/assign-important-albums</code>):</strong> Każdy oryginał posiadający lokalną kopię na tym samym dysku jest przypisywany dokładnie do jednej aktywnej pary w harmonogramie (<code>_pick_pair_for_important</code>) i umieszczany w hierarchii <code>Ważne - &lt;Etykieta_Dysku&gt; &rarr; RRRR &rarr; MM &rarr; DD</code>. Dodatkowo przycisk <em>„⭐ Przypisz do albumu Ważne (tylko baza)”</em> pozwala wykonać to przypisanie dla całej bazy natychmiastowo w trybie Offline bez żadnych zapisów na dyskach.</li>
             </ul>
         </section>
 
@@ -385,44 +393,59 @@
                 <li>Analizuje wszystkie wolumeny z dokładnym podziałem na trzy kategorie backupów na każdym dysku: <code>in_vault_count</code> (w <code>daf_backup/</code>), <code>green_outside_count</code> (zielone poza <code>daf_backup/</code>) oraz <code>orange_count</code> (pomarańczowe na tym samym dysku co oryginał).</li>
                 <li>Dla wybranej pary <code>(source_volume_id, target_volume_id)</code> można selektywnie wskazać typy do przeniesienia flagami <code>include_in_vault</code>, <code>include_green_outside</code> i <code>include_orange_same_disk</code>; wszystkie przenoszone kopie trafiają zawsze na dysk docelowy do <code>daf_backup/RRRR/MM/DD/</code>.</li>
                 <li><strong>Twarda blokada separacji urządzeń:</strong> Jeżeli w klastrze danego pliku na dysku docelowym (<code>target_volume_id</code>) znajduje się już Oryginał (lub inna kopia niebędąca backupem), plik jest oznaczany jako <code>blocked_same_device_count</code> i <strong>nie zostaje przeniesiony</strong>.</li>
-                <li>Każdy kwalifikujący się plik jest kopiowany do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym, weryfikowany funkcją <code>verify_files_identical_100_percent</code> i dopiero po pełnym potwierdzeniu usuwany z dysku źródłowego.</li>
+                <li>Każdy kwalifikujący się plik jest kopiowany do <code>daf_backup/RRRR/MM/DD/</code> na dysku docelowym, weryfikowany funkcją <code>verify_files_identical_100_percent</code>, po czym plik źródłowy jest usuwany metodą <code>FileSafetyGuard.remove_verified_move_source</code> (o ile nie leżał w chronionym <code>daf_backup/</code>), a baza wykonuje natychmiastowy <code>self.db.commit()</code> po każdym pojedynczym pliku.</li>
             </ul>
         </section>
 
         <section id="safe-dup-delete">
-            <h2>7. Bezpieczne Usuwanie Duplikatów Dysk-po-Dysku i Kosz w Bazie</h2>
+            <h2>7. Bezpieczne Usuwanie Duplikatów, Architektura Zero-Trust (<code>FileSafetyGuard</code>), Kwarantanna i Kosz</h2>
             <p>
-                Usuwanie nadmiarowych kopii (<code>execute_safe_duplicate_removal</code> w <code>app/storage_ops.py</code> oraz worker <code>_run_duplicate_removal_worker</code> w <code>app/routers/actions.py</code>) realizuje wieloetapowy protokół bezpieczeństwa:
+                Wszystkie operacje mutujące pliki na dyskach użytkownika są chronione przez centralny moduł <code>FileSafetyGuard</code> (<code>app/file_safety.py</code>), zunifikowany ekstraktor filtrów <code>_resolve_bulk_ids_from_form</code> oraz dwufazowy protokół zatwierdzania:
             </p>
             <div class="callout">
-                <strong>Dwuwarstwowa Bramka Bezpieczeństwa (Safety Gates) przed usunięciem każdego pliku:</strong>
+                <strong>Wielowarstwowa Architektura Bezpieczeństwa Plików (Zero-Trust File Safety):</strong>
                 <ol>
-                    <li><strong>Safety Gate 1 (Ochrona ról i liczebności klastra):</strong> Plik z rolą <code>original</code> lub flagą <code>is_backup_copy == True</code> nigdy nie może zostać usunięty. Ponadto w klastrze po odjęciu usuwanego kandydata muszą pozostać przy życiu co najmniej 2 kopie (<code>len(surviving) &ge; 2</code>: Oryginał + Backup). W przeciwnym razie operacja jest blokowana (<code>blocked_safety += 1</code>).</li>
-                    <li><strong>Safety Gate 2 (Weryfikacja 100% Online oraz Cross-Metadata Offline):</strong>
+                    <li><strong>Dwufazowe zatwierdzanie z tokenem (Two-Phase Commit: <code>/actions/delete-preview</code> &rarr; <code>deletion_token</code> &rarr; <code>/actions/delete-permanently</code>):</strong>
                         <ul>
-                            <li>Gdy w klastrze istnieje kopia referencyjna (Oryginał lub Backup) na aktualnie podłączonym dysku (ONLINE), wykonywana jest 5-warstwowa weryfikacja <code>FastHasher.verify_files_identical_100_percent(ref_path, cand_path)</code> (ochrona <code>samefile</code>/hardlink, rozmiar, pełne SHA-256 + BLAKE2b + MD5, <code>filecmp.cmp</code> bajt-po-bajcie oraz <code>Image.verify()</code>).</li>
-                            <li>Gdy usuwany duplikat <code>cand</code> leży na dysku ONLINE, natomiast zarówno Oryginał, jak i Backup znajdują się na odłączonych dyskach OFFLINE, uruchamiana jest metoda <code>FastHasher.verify_candidate_against_cluster_metadata()</code> sprawdzająca dokładny rozmiar bajtowy, pełny skrót kryptograficzny SHA-256 na dysku oraz poprawność struktury obrazu względem zapisanych metadanych klastra. Pozwala to bezpiecznie usunąć duplikat na podłączonym dysku bez proszenia użytkownika o podłączanie dysku referencyjnego/backupowego.</li>
+                            <li>Endpoint <code>POST /actions/delete-permanently</code> odrzuca każde bezpośrednie wywołanie bez ważnego, jednorazowego tokenu serwerowego <code>deletion_token</code> wygenerowanego przez okno podsumowania <code>/actions/delete-preview</code> (dotyczy to również usuwania całych albumów <code>delete_group_id</code> oraz wznawiania zatrzymanych zadań <code>resume_job_id</code> z panelu Statusu!).</li>
+                            <li>Okno podglądu pokazuje tabelę dysków ze statusem VSN (<code>🟢 ONLINE</code> vs <code>🔴 OFFLINE</code>), dokładną liczbę Oryginałów, liczbę <strong>Jedynych egzemplarzy</strong> (bez innej kopii w bazie) oraz 15 przykładowych ścieżek.</li>
+                            <li>Jeśli wśród wybranych plików znajduje się choć jeden Oryginał, wymagane jest zaznaczenie checkboxa zgody, ręczne wpisanie słowa <code>USUŃ</code> oraz spełnienie twardego limitu wsadu (maksymalnie <code>MAX_ORIGINALS_DELETE_BATCH = 500</code> Oryginałów w jednej operacji).</li>
+                            <li>Domyślnym zakresem na pasku akcji jest <code>Tylko zaznaczone kafelki</code> (<code>scope="selected"</code>; przy 0 zaznaczonych zwraca pustą listę). W trybie <code>scope="filtered"</code> wymagany jest silny filtr zawężający (<code>_has_narrowing_filter</code>, uwzględniający m.in. <code>trashed_only</code>) oraz pełna zgodność liczby elementów z licznikiem widoku (<code>len(item_ids) == view_total_matching</code>).</li>
                         </ul>
                     </li>
-                    <li><strong>Odporność operacji dyskowych i kolejki wielodyskowej:</strong> funkcje pomocnicze <code>_safe_unlink()</code> oraz <code>_safe_move()</code> automatycznie usuwają atrybut tylko-do-odczytu w Windows (<code>os.chmod(..., stat.S_IWRITE)</code> przy <code>PermissionError</code> / <code>WinError 5</code>). Przeliczenie ról <code>flag_duplicate_clusters()</code> podczas wieloetapowego kasowania na wielu dyskach jest odkładane do momentu zakończenia ostatniego dysku, aby nie zmieniać kolejności kolejnych dysków w locie.</li>
-                    <li><strong>Kosz jako atrybut w bazie (<code>is_trashed = True</code>):</strong> przeniesienie plików do Kosza (<code>POST /actions/move-to-trash</code> dla zwykłych mediów i wad jakości) ustawia wyłącznie atrybut <code>is_trashed = True</code> w SQLite bez modyfikacji czy przenoszenia plików fizycznych na dyskach.</li>
+                    <li><strong>Atomowa Kwarantanna na tym samym wolumenie (<code>daf_kwarantanna/</code>) zamiast nieodwracalnego <code>unlink()</code>:</strong>
+                        <ul>
+                            <li>Podczas trwałego usuwania plików multimedialnych oraz opróżniania Kosza metoda <code>FileSafetyGuard.quarantine_file()</code> wykonuje atomowy <code>os.rename</code> na tym samym dysku do katalogu <code>&lt;vol_root&gt;/daf_kwarantanna/&lt;RRRRMMDD&gt;/&lt;relative_path&gt;</code> (katalog wykluczony ze skanera) i dopisuje metadane do lokalnego pliku <code>manifest.jsonl</code> oraz globalnego dziennika <code>data/logs/file_operations_audit.jsonl</code>.</li>
+                            <li><strong>Bezwzględne poszanowanie atrybutu Read-Only oraz <code>daf_backup/</code> i <code>backup/</code>:</strong> <code>FileSafetyGuard</code> nigdy nie zdejmuje atrybutu <code>Tylko do odczytu (Read-Only)</code> (brak <code>os.chmod(..., stat.S_IWRITE)</code>) — pliki Read-Only oraz pliki w <code>daf_backup/</code> i głównym katalogu <code>backup/</code> są twardo chronione wyjątkiem <code>PermissionError</code>.</li>
+                            <li><strong>Zakaz nadpisywania plików (<code>FileSafetyGuard.safe_move</code>):</strong> przed każdym przeniesieniem sprawdzane jest <code>if dst.exists(): raise FileExistsError(...)</code>, a zmiany nazw używają nie-nadpisującego <code>os.rename</code> (z transakcyjną kopią <code>.daf_move_tmp</code> i 100% weryfikacją SHA-256 przy ruchach między dyskami).</li>
+                        </ul>
+                    </li>
+                    <li><strong>Bramki bezpieczeństwa klastrów (Safety Gates 1 &amp; 2) i ochrona rekordów OFFLINE:</strong>
+                        <ul>
+                            <li>Podczas usuwania duplikatów (oraz dla każdego pliku o roli <code>duplicate</code>, <code>backup_green</code>, <code>backup_orange</code>) system wymusza pozostanie w klastrze co najmniej 2 kopii (Oryginał + Backup) i weryfikuje identyczność 5-warstwowo (<code>verify_files_identical_100_percent</code>) lub względem pełnego SHA-256 w bazie (<code>verify_candidate_against_cluster_metadata</code> — z twardą blokadą dla wideo mających jedynie częściowy hash <code>partial_3x64k</code> bez policzonego pełnego <code>verified_sha256</code>).</li>
+                            <li><strong>Złota zasada dla dysków OFFLINE:</strong> podczas <code>delete-permanently</code> i <code>empty-trash</code> dla odłączonych dysków (OFFLINE) <strong>rekordy w bazie SQLite, albumy oraz miniatury <code>.webp</code> nigdy nie są usuwane</strong> — pliki są pomijane lub kolejkowane do podłączenia dysku. Ponadto po 5 kolejnych błędach I/O na dysku uruchamia się wyłącznik awaryjny (<em>Circuit Breaker</em>), a globalny mutex <code>ProcessManager.try_acquire_storage_lock</code> blokuje współbieżne uruchamianie kolidujących operacji dyskowych.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Kosz jako atrybut w bazie (<code>is_trashed = True</code>):</strong> przeniesienie plików do Kosza (<code>POST /actions/move-to-trash</code>) ustawia wyłącznie atrybut <code>is_trashed = True</code> w SQLite bez ruszania plików fizycznych na dyskach (dopiero kliknięcie <em>Opróżnij Kosz</em> przenosi pliki z podłączonych dysków do <code>daf_kwarantanna/</code>).</li>
                 </ol>
             </div>
         </section>
 
         <section id="albumy-multimedia">
-            <h2>8. Albumy, Porządkowanie Oryginałów, Daty, Jakość i Wideo Offline</h2>
+            <h2>8. Albumy, Wyszukiwanie po Albumach, Tagi Ręczne, Daty i Wideo Offline</h2>
             <ul>
-                <li><strong>Porządkowanie nieprzypisanych oryginałów (<code>organize_ungrouped_originals()</code>):</strong> przenosi nieprzypisane do albumów Oryginały (z pominięciem klastrów posiadających już plik w <code>daf_oryginal/</code> na dowolnym dysku) do <code>daf_oryginal/RRRR/MM/DD/</code> na tym samym wolumenie VSN, zapisując pierwotną lokalizację wraz z nazwą dysku w polu <code>original_relative_path</code> na potrzeby filtrowania i wyszukiwania.</li>
-                <li><strong>Fizyczny eksport albumów (<code>export_physical_album()</code>):</strong> kopiuje zdjęcia wybranego albumu lub filtru do katalogu <code>daf_albums/&lt;NazwaAlbumu&gt;/</code> na wskazanym dysku bez rejestrowania tych kopii w <code>media_items</code> (skaner pomija <code>daf_backup/</code> i <code>daf_albums/</code>).</li>
-                <li><strong>Czyszczenie fałszywych alarmów jakości (<code>POST /actions/clear-quality-defect</code>):</strong> zeruje flagi <code>is_corrupted</code> i <code>is_blurry</code>, usuwa tagi wad <code>do_usuniecia%</code> (zachowując pozostałe tagi AI) oraz ustawia <code>blur_score = 100.0</code>, jeśli było puste lub <code>&lt; 45.0</code> (zachowując wyniki <code>&ge; 45.0</code>), aby zdjęcia nie wpadały ponownie na listę <em>Niezbadanej jakości</em>.</li>
-                <li><strong>Odporność na częściowo ucięte pliki JPEG, podglądy wideo Offline i osadzone podglądy:</strong> Moduły <code>app/ai/quality.py</code> (<code>decode_image_array</code>) oraz <code>app/scanner.py</code> (<code>ThumbnailService</code>) wykorzystują <code>ImageFile.LOAD_TRUNCATED_IMAGES = True</code>, wielostopniowy fallback (<code>cv2.imdecode</code> &rarr; <code>PIL.Image</code> &rarr; <code>extract_embedded_frame</code>) oraz atomowy zapis miniatur WebP. W Lightboxie dla plików wideo znajdujących się Offline przeglądarka wyświetla lokalną miniaturę zamiast błędu odtwarzania strumienia.</li>
+                <li><strong>Wyszukiwanie po słowach w nazwach i opisach albumów (wraz z podalbumami):</strong> pole wyszukiwania <code>q</code> w <code>apply_media_filters()</code> przeszukuje <code>MediaGroup.name</code> oraz <code>MediaGroup.description</code> i automatycznie rozwija trafienia o całe poddrzewa podalbumów (<code>get_group_subtree_ids</code>). Wpisanie np. <code>Ważne</code> lub <code>Mazury</code> znajduje wszystkie zdjęcia w tym albumie i jego podalbumach dziennych/miesięcznych. Dodatkowo w lewym pasku bocznym znajduje się filtr drzewa albumów na żywo (<code>filterAlbumTree</code>).</li>
+                <li><strong>Ręczne dodawanie i usuwanie własnych tagów (<code>source_model="manual"</code>):</strong> punkty końcowe <code>POST /actions/add-tags</code> oraz <code>POST /actions/remove-tag</code> pozwalają dodawać (po przecinku) i usuwać własne tagi dla pojedynczego zdjęcia lub zaznaczonego zbioru. Tagi ręczne (<code>manual</code>), nazwy osób (<code>face_cluster</code>) oraz tagi jakości (<code>quality_check</code>) są chronione podczas ponownego uruchamiania analizy AI i nigdy nie są przez nią nadpisywane.</li>
+                <li><strong>Porządkowanie nieprzypisanych oryginałów (<code>organize_ungrouped_originals(volume_id)</code>):</strong> po wybraniu konkretnego dysku w panelu bocznym przenosi nieprzypisane do albumów Oryginały z tego dysku (z pominięciem klastrów posiadających już plik w <code>daf_oryginal/</code> na dowolnym dysku) do <code>daf_oryginal/RRRR/MM/DD/</code>, zapisując pierwotną lokalizację wraz z nazwą dysku w polu <code>original_relative_path</code> i wykonując <code>db.commit()</code> po każdym pliku.</li>
+                <li><strong>Fizyczny eksport albumów (<code>export_physical_album()</code>):</strong> kopiuje zdjęcia wybranego albumu lub filtru metodą nie-nadpisującą <code>FileSafetyGuard.safe_copy_export</code> do katalogu <code>daf_albums/&lt;NazwaAlbumu&gt;/</code> na wskazanym dysku bez rejestrowania tych kopii w <code>media_items</code> (skaner pomija <code>daf_backup/</code>, <code>daf_albums/</code> oraz <code>daf_kwarantanna/</code>).</li>
+                <li><strong>Czyszczenie fałszywych alarmów jakości (<code>POST /actions/clear-quality-defect</code>) oraz wyindeksowanie (<code>POST /actions/unindex</code>):</strong> zeruje flagi <code>is_corrupted</code> i <code>is_blurry</code>, usuwa tagi wad <code>do_usuniecia%</code> oraz ustawia <code>blur_score = 100.0</code> (gdy brak lub <code>&lt; 45.0</code>). W widokach <em>Brak backupu</em> oraz <em>Wady jakości</em> dostępny jest także bezpośredni przycisk <em>„✖️ Wyindeksuj zaznaczone z bazy (bez ruszania plików na dysku)”</em>.</li>
+                <li><strong>Odporność na częściowo ucięte pliki JPEG, podglądy wideo Offline i osadzone podglądy:</strong> Moduły <code>app/ai/quality.py</code> (<code>decode_image_array</code>) oraz <code>app/scanner.py</code> (<code>ThumbnailService</code>) wykorzystują <code>ImageFile.LOAD_TRUNCATED_IMAGES = True</code>, wielostopniowy fallback (<code>cv2.imdecode</code> &rarr; <code>PIL.Image</code> &rarr; <code>extract_embedded_frame</code>) oraz atomowy zapis miniatur WebP.</li>
                 <li><strong>Rozwiązywanie i filtrowanie przyczyn niezgodności dat:</strong> funkcja <code>MetadataDateResolver.evaluate_date_sources</code> nadaje najwyższy priorytet dacie EXIF, a w jej braku wykrywa rozbieżności między folderem, nazwą pliku oraz śladem kopiowania (<code>ctime &gt; mtime</code>). Funkcja <code>_anomaly_type_clause()</code> pozwala filtrować niezgodności wg przyczyny (<code>folder</code>, <code>filename</code>, <code>copy_ctime</code>, <code>exif</code>, <code>other</code>).</li>
             </ul>
         </section>
 
         <section id="ai-cv">
-            <h2>9. Silnik AI / Computer Vision (On-Demand)</h2>
+            <h2>9. Silnik AI / Computer Vision (On-Demand — 100% Lokalny na Miniaturach)</h2>
             <table>
                 <thead>
                     <tr>
@@ -438,14 +461,29 @@
                         <td>Analiza wykonywana wyłącznie przy fizycznym dostępie do pliku oryginału (pliki Offline są pomijane, by nie badać skompresowanych miniatur). Wykrywa 6 klas wad: <code>uszkodzone</code>, <code>rozmyte</code>, <code>niedoswietlone</code>, <code>przeswietlone</code>, <code>brak_detali</code>, <code>niska_rozdzielczosc</code>.</td>
                     </tr>
                     <tr>
-                        <td>Tagowanie Obiektów i Scen</td>
+                        <td>Dwupoziomowe Tagowanie Obiektów (1000 klas ImageNet + Kwiaty HSV + Skan On-Demand)</td>
                         <td><code>app/ai/tagger.py</code></td>
-                        <td><code>MobileNetV2 (ONNX Runtime)</code> z preprocesingiem bez zniekształceń proporcji (Center Crop 224&times;224) + <code>Haar Cascade</code> + heurystyki barwne HSV.</td>
+                        <td>
+                            Działa w 100% offline na miniaturach <code>data/thumbnails/*.webp</code>. Zapisuje jednocześnie:
+                            (1) kategorię główną z rozbudowanego <code>PL_CATEGORY_MAPPING</code> (<code>source_model="opencv+onnx"</code>, prezentowaną w <em>Top 35 tagów</em> w pasku bocznym) oraz
+                            (2) szczegółową polsko-angielską nazwę każdej rozpoznanej klasy spośród wszystkich 1000 klas <code>MobileNetV2 (ImageNet)</code> (<code>source_model="onnx_detail"</code>, np. <code>stokrotka (daisy)</code>, <code>storczyk</code>, <code>wazon</code>, <code>rower</code>, <code>zamek</code>).
+                            Zawiera dedykowaną heurystykę HSV dla kwiatów (nasycone skupiska płatków na tle zieleni liści) oraz metodę <code>scan_thumbnails_for_keyword()</code> uruchamianą wyłącznie na życzenie przyciskiem <em>„🧠 Szukaj głębiej na miniaturach AI”</em>.
+                        </td>
                     </tr>
                     <tr>
                         <td>Wektory Podobieństwa 512-D</td>
                         <td><code>app/ai/embeddings.py</code></td>
                         <td>Znormalizowany wektor <code>512 float32</code> łączący siatkę przestrzenną <code>8&times;8 CIE LAB</code> (192-D), dwustrefowy histogram <code>HSV</code> (256-D) i orientację krawędzi <code>Sobel</code> (64-D). Wyszukiwanie <code>/semantic/similar/{id}</code> działa w 100% w pamięci RAM bez blokowania SQLite.</td>
+                    </tr>
+                    <tr>
+                        <td>Rozpoznawanie Twarzy i Wyszukiwanie Tej Samej Osoby (256-D Face Identity)</td>
+                        <td><code>app/ai/faces.py</code><br>(tabela <code>media_faces</code>)</td>
+                        <td>
+                            Działa w 100% offline na lokalnych miniaturach <code>data/thumbnails/*.webp</code> (0 podłączania dysków USB, 0 MB RAM w spoczynku).
+                            Wykorzystuje 3-poziomową detekcję twarzy (<code>YuNet ONNX</code> &rarr; <code>Haar Frontal/Profile + Eye + YCrCb skin validation</code> &rarr; wbudowany detektor owalu cery i kontrastu rysów oczu/ust).
+                            Wycina wyłącznie owalny obszar samej twarzy (odrzucając tło i ubranie), normalizuje oświetlenie przez <code>CLAHE</code> na kanale L i ekstrahuje znormalizowany wektor <code>256 float32</code> (siatka 4&times;4 HOG + lokalny kontrast strukturalny + profil CIE LAB + opcjonalnie cechy <code>SFace</code>/<code>MobileNetV2</code>).
+                            Obsługuje zdjęcia grupowe z wyborem konkretnej twarzy (<code>face_index</code>: <code>👤 Twarz #1</code>, <code>👤 Twarz #2</code>...) oraz przypisywanie imion (<code>POST /actions/name-person</code> &rarr; <code>person_name</code> + tag <code>osoba:&lt;imię&gt;</code>).
+                        </td>
                     </tr>
                 </tbody>
             </table>
@@ -453,7 +491,7 @@
 
         <section id="wnioski">
             <h2>10. Czego nauczyliśmy się o systemie — Kluczowe Wnioski Inżynieryjne</h2>
-            <p>Rozwój i testy na rzeczywistych, wielodyskowych kolekcjach zdjęć przyniosły sześć fundamentalnych lekcji architektonicznych zaimplementowanych w obecnej wersji systemu:</p>
+            <p>Rozwój i testy na rzeczywistych, wielodyskowych kolekcjach zdjęć przyniosły osiem fundamentalnych lekcji architektonicznych zaimplementowanych w obecnej wersji systemu:</p>
             <div class="grid-2">
                 <div class="card">
                     <h4>1. Zero zapisów do SQLite podczas <code>sqlite3.Connection.backup()</code></h4>
@@ -461,15 +499,15 @@
                 </div>
                 <div class="card">
                     <h4>2. Weryfikacja z metadanych eliminuje pytania o puste dyski</h4>
-                    <p>Gdy 3. kopia (duplikat) leżała na podłączonym dysku, a jej Oryginał i Backup znajdowały się na odłączonych dyskach (np. na dedykowanym dysku backupowym z <code>daf_backup/</code>, który w galerii pokazuje 0 zdjęć), klasyczne porównanie dwóch plików wymagało podłączenia dysku backupowego. Dodanie metody <code>verify_candidate_against_cluster_metadata</code> pozwoliło zweryfikować plik lokalnie względem pełnego SHA-256 w bazie i prosić użytkownika <strong>wyłącznie o dyski, na których faktycznie leżą duplikaty do usunięcia</strong>.</p>
+                    <p>Gdy 3. kopia (duplikat) leżała na podłączonym dysku, a jej Oryginał i Backup znajdowały się na odłączonych dyskach (np. na dedykowanym dysku backupowym z <code>daf_backup/</code>, który w galerii pokazuje 0 zdjęć), klasyczne porównanie dwóch plików wymagało podłączenia dysku backupowego. Dodanie metody <code>verify_candidate_against_cluster_metadata</code> pozwoliło zweryfikować plik lokalnie względem pełnego SHA-256 w bazie i przenosić go do bezpiecznej kwarantanny <code>daf_kwarantanna/</code> bez proszenia o dysk referencyjny.</p>
                 </div>
                 <div class="card">
                     <h4>3. Jednokrotny backup bazy w operacjach wielodyskowych</h4>
-                    <p>Podczas usuwania duplikatów rozłożonych na kilka odłączonych dysków USB, kliknięcie <em>„Kontynuuj na podłączonym dysku”</em> nie powinno ponawiać kopii zapasowej bazy SQLite. Przekazanie flagi <code>skip_db_backup=True</code> oraz <code>continue_job_id</code> sprawiło, że zrzut bazy robi się tylko raz na starcie, a kolejne dyski są czyszczone natychmiast.</p>
+                    <p>Podczas usuwania duplikatów rozłożonych na kilka odłączonych dysków USB, kliknięcie <em>„Kontynuuj na podłączonym dysku”</em> nie powinno ponawiać kopii zapasowej bazy SQLite. Przekazanie serwerowego tokenu kontynuacji (<code>is_continuation=True</code>) oraz <code>continue_job_id</code> sprawiło, że zrzut bazy robi się tylko raz na starcie, a kolejne dyski są czyszczone natychmiast.</p>
                 </div>
                 <div class="card">
-                    <h4>4. Skalowanie zaznaczeń dla 50 000+ plików</h4>
-                    <p>Zaznaczenie wszystkich nadmiarowych duplikatów na wszystkich stronach wymagało trzech usprawnień: (a) trwałego zbioru <code>window.persistedSelectedIds</code> w JS przesyłanego jako <code>selected_ids_json</code>, (b) zwiększenia limitu parsera formularzy Starlette/FastAPI (<code>max_fields=250000</code>, <code>64 MB</code>) oraz (c) dzielenia zapytań SQL <code>IN (...)</code> na paczki po <code>5000</code> elementów, aby nigdy nie przekroczyć limitu <code>32766</code> parametrów zmiennych w SQLite.</p>
+                    <h4>4. Skalowanie zaznaczeń i chunking po 900 parametrów SQLite</h4>
+                    <p>Zaznaczenie dziesiątek tysięcy plików na wszystkich stronach wymagało trzech usprawnień: (a) trwałego zbioru <code>window.persistedSelectedIds</code> w JS przesyłanego jako <code>selected_ids_json</code>, (b) zwiększenia limitu parsera formularzy Starlette/FastAPI (<code>max_fields=250000</code>, <code>64 MB</code>) oraz (c) dzielenia wszystkich zapytań SQL <code>IN (...)</code> na paczki po <code>900</code> elementów (poniżej klasycznego limitu <code>999</code> zmiennych SQLite).</p>
                 </div>
                 <div class="card">
                     <h4>5. Ukryta kartoteka <code>daf_backup/</code>, ale jawny status <code>ORYGINAŁ ✓</code></h4>
@@ -478,6 +516,14 @@
                 <div class="card">
                     <h4>6. Rozliczanie 1-do-1 w harmonogramie par dysków</h4>
                     <p>Jeśli dysk A tworzy pary zarówno z dyskiem B, jak i z dyskiem C, przypisywanie kandydatów do albumu <em>„Ważne”</em> na podstawie samego udziału dysku A w parze powodowało podwójne zliczanie tych samych plików przy obu parach. Przypisanie każdego kandydata 1-do-1 do jednej wybranej pary (<code>_pick_pair_for_important</code>) zapewniło pełną zgodność bilansu (<code>reconciliation</code>).</p>
+                </div>
+                <div class="card">
+                    <h4>7. Zero-Trust dla operacji masowych: Jeden Ekstraktor Filtrów + Token + Kwarantanna</h4>
+                    <p>Ręczne odczytywanie kilkudziesięciu pól formularza w każdym endpoincie POST grozi cichym pominięciem nowego filtra (<em>Signature Drift</em>). Zastąpienie go pojedynczym ekstraktorem <code>_extract_filter_params</code> z weryfikacją <code>len(item_ids) == view_total_matching</code>, wymuszeniem dwufazowego tokenu <code>deletion_token</code>, zachowaniem rekordów bazy dla dysków OFFLINE oraz atomową kwarantanną <code>daf_kwarantanna/</code> zamiast <code>unlink()</code> całkowicie eliminuje ryzyko przypadkowej utraty plików.</p>
+                </div>
+                <div class="card">
+                    <h4>8. Dwupoziomowe tagi AI i rozpoznawanie twarzy na miniaturach WebP</h4>
+                    <p>Zapisywanie zarówno kategorii ogólnej (dla przejrzystości paska bocznego), jak i szczegółowej klasy z 1000 pojęć ImageNet (<code>onnx_detail</code>), połączone z ekstrakcją wektorów twarzy 256-D wyłącznie z lokalnych miniatur <code>data/thumbnails/*.webp</code>, pozwala błyskawicznie wyszukiwać konkretne kwiaty, przedmioty oraz tę samą osobę na innych zdjęciach nawet wtedy, gdy wszystkie dyski USB są odłączone.</p>
                 </div>
             </div>
         </section>
@@ -492,15 +538,17 @@
                     </tr>
                 </thead>
                 <tbody>
-                    <tr><td><code>GET /</code>, <code>GET /przewodnik</code>, <code>GET /dokumentacja</code></td><td>Główny interfejs galerii (ze zwijanym panelem bocznym i odświeżaniem wyszukiwania), przewodnik użytkownika oraz dokumentacja techniczna (a w katalogu projektu również plik <code>szybki_start_workflow.html</code>).</td></tr>
-                    <tr><td><code>GET /media/sidebar</code>, <code>GET /media/search</code>, <code>GET /semantic/search</code></td><td>Panel boczny oraz wyszukiwanie SQLite i frazowe z obsługą <code>online_only</code>, <code>backup_mode</code>, <code>backup_types</code>, <code>anomaly_type</code>, kolejek dysków offline (<code>offline_drives_info</code>), historii usuniętych duplikatów oraz mapy <code>ORYGINAŁ ✓</code>.</td></tr>
-                    <tr><td><code>GET /media/{id}/detail</code>, <code>GET /media/{id}/raw</code></td><td>Szczegóły pliku oraz strumieniowanie oryginału (z konwersją HEIC/TIFF do JPEG i transkodowaniem MOV/AVI do MP4 w locie).</td></tr>
+                    <tr><td><code>GET /</code>, <code>GET /przewodnik</code>, <code>GET /dokumentacja</code>, <code>GET /szybki-start</code></td><td>Główny interfejs galerii (z ochroną CSRF Origin/Referer), przewodnik użytkownika, dokumentacja techniczna oraz przewodnik szybkiego startu.</td></tr>
+                    <tr><td><code>GET /media/sidebar</code>, <code>GET /media/search</code>, <code>GET /semantic/search</code></td><td>Panel boczny (z filtrem drzewa albumów i inwalidacją cache po <code>count(MediaTag)</code>/<code>count(MediaFace)</code>) oraz wyszukiwanie SQLite i frazowe (przeszukujące nazwy plików, ścieżki, pierwotne ścieżki, historię duplikatów, nazwy/opisy albumów z podalbumami oraz 1000 klas tagów AI i ręcznych).</td></tr>
+                    <tr><td><code>GET /semantic/similar/{id}?mode=...&amp;face_index=...</code></td><td>Wyszukiwanie podobnych zdjęć w 7 trybach (<code>hybrid</code>, <code>visual_duplicate</code>, <code>semantic_objects</code>, <code>color_mood</code>, <code>same_event</code>, <code>composition</code> oraz <code>same_person</code> z obsługą konkretnego <code>face_index</code> na zdjęciach grupowych).</td></tr>
+                    <tr><td><code>POST /actions/on-demand-keyword-scan</code><br><code>POST /actions/add-tags</code><br><code>POST /actions/remove-tag</code><br><code>POST /actions/name-person</code></td><td>Skanowanie miniatur na żądanie modelem ONNX pod kątem szukanego słowa kluczowego (z natychmiastowym zwolnieniem RAM), ręczne dodawanie i usuwanie tagów (<code>source_model="manual"</code>) oraz przypisywanie imienia rozpoznanej osobie (<code>MediaFace.person_name</code> + tag <code>osoba:&lt;imię&gt;</code>).</td></tr>
+                    <tr><td><code>GET /media/{id}/detail</code>, <code>GET /media/{id}/raw</code></td><td>Szczegóły pliku (wraz z listą wykrytych twarzy i zarządzaniem tagami) oraz strumieniowanie oryginału (z automatycznym fallbackiem tylko-do-odczytu z kopii online, gdy oryginał jest offline, konwersją HEIC/TIFF do JPEG i transkodowaniem MOV/AVI do MP4).</td></tr>
                     <tr><td><code>POST /actions/clear-quality-defect</code></td><td>Oznaczenie pojedynczego zdjęcia lub zaznaczonego/filtrowanego zbioru jako bez wady (zeruje <code>is_corrupted</code>/<code>is_blurry</code>, usuwa tagi <code>do_usuniecia%</code>, ustawia <code>blur_score = 100.0</code> gdy brak lub &lt; 45.0).</td></tr>
-                    <tr><td><code>POST /actions/organize-originals</code><br><code>POST /actions/export-physical-album</code></td><td>Grupowanie nieprzypisanych oryginałów do <code>daf_oryginal/RRRR/MM/DD/</code> (z zachowaniem <code>original_relative_path</code>) oraz eksport kopii albumów do <code>daf_albums/&lt;NazwaAlbumu&gt;/</code>.</td></tr>
+                    <tr><td><code>POST /actions/organize-originals</code><br><code>POST /actions/assign-important-albums</code><br><code>POST /actions/export-physical-album</code></td><td>Grupowanie nieprzypisanych oryginałów na wybranym dysku do <code>daf_oryginal/RRRR/MM/DD/</code> (z zachowaniem <code>original_relative_path</code>), czysto bazodanowe przypisanie oryginałów z lokalnymi duplikatami do albumów <em>„Ważne”</em> oraz eksport kopii albumów do <code>daf_albums/&lt;NazwaAlbumu&gt;/</code>.</td></tr>
                     <tr><td><code>GET /actions/redundant-duplicate-ids</code><br><code>POST /actions/refresh-duplicate-tags</code></td><td>Pobranie pełnej listy ID nadmiarowych kopii (<code>duplicate_role == 'duplicate'</code>) ze wszystkich stron filtra oraz przeliczenie ról klastrowych.</td></tr>
                     <tr><td><code>GET /actions/backup-panel</code><br><code>POST /actions/backup-panel</code><br><code>POST /actions/execute-backup</code></td><td>Planowanie i wykonywanie backupu do <code>daf_backup/RRRR/MM/DD/</code> z wyborem dysków docelowych, opcją <em>Zminimalizuj przeniesienia</em> i trybem ścisłej ochrony urządzeń (<code>strict_target_writes_only</code>).</td></tr>
                     <tr><td><code>GET/POST /actions/move-backups-panel</code><br><code>POST /actions/execute-move-backups</code></td><td>Analiza (z podziałem na <code>daf_backup/</code>, zielone i pomarańczowe) i bezpieczne przenoszenie wybranych rodzajów backupów między parą dysków do <code>daf_backup/RRRR/MM/DD/</code>.</td></tr>
-                    <tr><td><code>POST /actions/delete-permanently</code><br><code>POST /actions/move-to-trash</code><br><code>GET /actions/dup-delete-status</code><br><code>POST /actions/dup-delete-stop</code></td><td>Asynchroniczne, 2-etapowe usuwanie duplikatów dysk-po-dysku z 100% weryfikacją binarną (oraz bezdotykowym atrybutem <code>is_trashed</code> dla Kosza zwykłych mediów).</td></tr>
+                    <tr><td><code>POST /actions/delete-preview</code><br><code>POST /actions/delete-permanently</code><br><code>POST /actions/move-to-trash</code><br><code>GET /actions/dup-delete-status</code><br><code>POST /actions/dup-delete-stop</code></td><td>Dwufazowe podsumowanie przed usunięciem (generujące <code>deletion_token</code>, sprawdzające limit Oryginałów i bramkę <code>USUŃ</code>) oraz bezpieczne przenoszenie do kwarantanny <code>daf_kwarantanna/</code> dysk-po-dysku z zachowaniem rekordów dla dysków OFFLINE.</td></tr>
                     <tr><td><code>POST /actions/verify-db-disk-consistency</code><br><code>POST /actions/cleanup-missing-db-items</code><br><code>POST /actions/verify-deleted-duplicates</code><br><code>POST /actions/vacuum-db</code><br><code>POST /actions/cleanup-orphan-thumbs</code></td><td>Weryfikacja spójności bazy SQLite z podłączonymi dyskami, usuwanie brakujących rekordów, weryfikacja 100% Oryginałów po usunięciu duplikatów, kompaktowanie bazy (<code>VACUUM</code>) oraz usuwanie osieroconych miniatur.</td></tr>
                     <tr><td><code>GET /actions/gdrive-panel</code><br><code>POST /actions/backup-db-to-medium</code><br><code>POST /actions/restore-db-from-medium</code><br><code>POST /actions/gdrive-sync</code><br><code>POST /actions/gdrive-restore-db</code></td><td>Tworzenie i przywracanie pełnych lub lekkich kopii bazy SQLite (<code>.db</code> / <code>.db.gz</code>) na nośnikach USB oraz w chmurze Google Drive (z automatycznym zachowaniem 1 najnowszej kopii).</td></tr>
                 </tbody>
@@ -510,7 +558,7 @@
 </div>
 
 <footer>
-    Domowe Archiwum Foto &mdash; Dokumentacja Techniczna HTML5 &bull; Lokalna Architektura Zero-Data-Loss SQLite + FastAPI + OpenCV
+    Domowe Archiwum Foto &mdash; Dokumentacja Techniczna HTML5 &bull; Lokalna Architektura Zero-Data-Loss SQLite + FastAPI + OpenCV + FileSafetyGuard
 </footer>
 
 </body>
