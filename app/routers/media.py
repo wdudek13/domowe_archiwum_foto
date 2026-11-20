@@ -53,13 +53,14 @@ def get_unbacked_primary_ids_subquery():
     backed_hashes = select(MediaItem.file_hash).where(
         MediaItem.is_trashed == False,
         MediaItem.duplicate_role == "backup_green",
+        MediaItem.file_hash.is_not(None),
     )
     return (
         select(MediaItem.id)
         .where(
             MediaItem.is_trashed == False,
             MediaItem.is_primary_duplicate == True,
-            ~MediaItem.file_hash.in_(backed_hashes),
+            or_(MediaItem.file_hash.is_(None), ~MediaItem.file_hash.in_(backed_hashes)),
         )
     )
 
@@ -430,6 +431,15 @@ def apply_media_filters(
         )
     elif eff_bkp_mode == "include" and type_clauses:
         stmt = stmt.where(or_(is_not_any_backup, *type_clauses))
+    elif unbacked_only:
+        # Unbacked primaries can include sole surviving originals residing in daf_backup/
+        # (is_backup_copy=True, duplicate_role='original'); never hide them behind is_backup_copy==False.
+        stmt = stmt.where(
+            or_(
+                MediaItem.duplicate_role.is_(None),
+                MediaItem.duplicate_role.notin_(["backup_green", "backup_orange"]),
+            )
+        )
     elif duplicates_only or redundant_clusters_only or backups_to_move_only:
         stmt = stmt.where(MediaItem.is_backup_copy == False)
     else:

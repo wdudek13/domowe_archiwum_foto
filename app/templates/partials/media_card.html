@@ -45,7 +45,11 @@
                 </span>
             {% endif %}
 
-            {% if item.duplicate_role == 'backup_green' or item.is_backup_copy %}
+            {% if item.duplicate_role == 'original' and item.is_backup_copy %}
+                <span title="Jedyna zachowana kopia (w katalogu daf_backup/) — brak drugiej kopii na innym urządzeniu" class="bg-amber-700 text-white text-[10px] font-bold px-1 rounded">
+                    ORYGINAŁ (BKP)
+                </span>
+            {% elif item.duplicate_role == 'backup_green' or item.is_backup_copy %}
                 <span title="BACKUP na innym urządzeniu" class="bg-emerald-600 text-white text-[10px] font-bold px-1 rounded">
                     BACKUP
                 </span>

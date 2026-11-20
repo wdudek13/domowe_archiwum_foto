@@ -36,6 +36,7 @@ from app.file_safety import (
     _safe_unlink,
     is_item_in_daf_backup,
     is_path_in_daf_backup,
+    is_path_in_quarantine,
     safe_resolve_volume_path,
 )
 from app.storage_ops import StorageAutomationService
@@ -3345,6 +3346,16 @@ async def move_physical_files_action(
 
     try:
         if tv_id:
+            clean_sub_check = sub_folder.strip().strip("/\\")
+            if clean_sub_check and (
+                is_path_in_daf_backup(Path(clean_sub_check))
+                or is_path_in_quarantine(Path(clean_sub_check))
+            ):
+                return HTMLResponse(
+                    "<span class='text-rose-400 text-xs font-semibold'>"
+                    "🛡️ Zablokowano przenoszenie plików do chronionego katalogu systemowego (daf_backup/, backup/, daf_kwarantanna/)."
+                    "</span>"
+                )
             res = svc.schedule_or_execute_moves(items, target_volume_id=tv_id, target_subfolder=sub_folder)
             msg = f"🚚 Przeniesiono fizycznie: {res['moved_physically']} plików"
             if res["skipped_offline"] > 0:
@@ -3369,10 +3380,32 @@ async def move_physical_files_action(
                 f"<span class='text-rose-400 text-xs'>Dysk docelowy {drive_root} jest odłączony (Offline). Podłącz oba dyski, aby przenieść pliki.</span>"
             )
 
-        dest_dir_resolved = dest_dir.resolve()
-        dest_dir_resolved.mkdir(parents=True, exist_ok=True)
-        vsn, label, root = WindowsVolumeInspector.get_volume_info(dest_dir_resolved)
+        # LOW-01: Inspect the existing drive root VSN first (without creating dest_dir on disk yet).
+        # Directory creation is deferred to svc.schedule_or_execute_moves() after live VSN & safe_resolve_volume_path checks.
+        vsn, label, root = WindowsVolumeInspector.get_volume_info(Path(drive_root))
         root_path = Path(root).resolve()
+        dest_dir_resolved = dest_dir.resolve()
+
+        try:
+            rel_sub = dest_dir_resolved.relative_to(root_path).as_posix()
+            if rel_sub == ".":
+                rel_sub = ""
+        except ValueError:
+            return HTMLResponse(
+                f"<span class='text-rose-400 text-xs font-semibold'>"
+                f"🛡️ Ścieżka docelowa ({dest_dir_resolved}) wykracza poza katalog główny zweryfikowanego wolumenu ({root_path})."
+                f"</span>"
+            )
+
+        if rel_sub and (
+            is_path_in_daf_backup(dest_dir_resolved, volume_root=root_path)
+            or is_path_in_quarantine(dest_dir_resolved, volume_root=root_path)
+        ):
+            return HTMLResponse(
+                "<span class='text-rose-400 text-xs font-semibold'>"
+                "🛡️ Zablokowano przenoszenie plików do chronionego katalogu systemowego (daf_backup/, backup/, daf_kwarantanna/)."
+                "</span>"
+            )
 
         target_vol = db.scalar(select(WindowsVolume).where(WindowsVolume.volume_serial_number == vsn))
         if not target_vol:
@@ -3389,13 +3422,6 @@ async def move_physical_files_action(
             target_vol.last_known_drive_letter = root
             target_vol.is_online = True
             db.commit()
-
-        try:
-            rel_sub = dest_dir_resolved.relative_to(root_path).as_posix()
-            if rel_sub == ".":
-                rel_sub = ""
-        except ValueError:
-            rel_sub = ""
 
         res = svc.schedule_or_execute_moves(items, target_volume_id=target_vol.id, target_subfolder=rel_sub)
         msg = f"🚚 Przeniesiono fizycznie {res['moved_physically']} plików do {dest_dir_resolved}"

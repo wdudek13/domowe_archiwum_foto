@@ -7133,6 +7133,176 @@ class TestDomoweArchiwumFotoSuite(unittest.TestCase):
         self.assertNotIn("niedzwiedz_kalafior.jpg", r_tulip_q.text)
         self.assertIn("ogrod_roza.jpg", r_tulip_q.text)
 
+    def test_unbacked_only_includes_sole_originals_in_daf_backup(self):
+        """
+        Regression test: when the only remaining copy of a file resides inside `daf_backup/`
+        (is_backup_copy=True, duplicate_role='original', is_primary_duplicate=True),
+        sidebar `Brak backupu na innym dysku` counts it AND `/media/search?unbacked_only=true`
+        MUST display it (instead of hiding it behind is_backup_copy == False and showing an empty list).
+        """
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="V-UNBKP-A",
+                volume_label="Foto-A",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="V-UNBKP-B",
+                volume_label="Backup-B",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+
+            # 1) Properly backed up pair (original on Foto-A + backup_green in Backup-B/daf_backup)
+            p_orig = create_synthetic_jpeg(self.drive_a / "backed_orig.jpg", color=(30, 120, 210))
+            (self.drive_b / "daf_backup" / "2024" / "01" / "01").mkdir(parents=True, exist_ok=True)
+            p_bkp = self.drive_b / "daf_backup" / "2024" / "01" / "01" / "backed_orig.jpg"
+            shutil.copy2(p_orig, p_bkp)
+
+            # 2) Sole surviving original inside Backup-B/daf_backup/ (no other copy anywhere!)
+            p_sole = create_synthetic_jpeg(
+                self.drive_b / "daf_backup" / "2024" / "01" / "01" / "sole_in_backup.jpg",
+                color=(210, 90, 40),
+            )
+
+            it_orig = FileScannerService.process_file(p_orig, vol_a)
+            it_bkp = FileScannerService.process_file(p_bkp, vol_b)
+            it_sole = FileScannerService.process_file(p_sole, vol_b)
+            db.add_all([it_orig, it_bkp, it_sole])
+            db.commit()
+
+            StorageAutomationService(db).flag_duplicate_clusters()
+            db.expire_all()
+
+            sole_reloaded = db.get(MediaItem, it_sole.id)
+            self.assertTrue(sole_reloaded.is_backup_copy)
+            self.assertEqual(sole_reloaded.duplicate_role, "original")
+            self.assertTrue(sole_reloaded.is_primary_duplicate)
+
+            bkp_stats = media_module.compute_backup_and_dup_sidebar_stats(db)
+            self.assertEqual(bkp_stats["unbacked_cross_device"], 1)
+
+        # Clicking "Brak backupu na innym dysku" (unbacked_only=true, default backup_mode=hide) MUST list sole_in_backup.jpg
+        r_unbkp = self.client.get("/media/search", params={"unbacked_only": "true", "backup_mode": "hide"})
+        self.assertEqual(r_unbkp.status_code, 200)
+        self.assertIn("sole_in_backup.jpg", r_unbkp.text)
+        self.assertIn("ORYGINAŁ (daf_backup)", r_unbkp.text)
+        self.assertNotIn("backed_orig.jpg", r_unbkp.text)
+        self.assertIn("Wykryto 1 plików bez kopii zapasowej", r_unbkp.text)
+
+    def test_low01_move_files_destination_path_defers_mkdir_and_blocks_protected_dirs(self):
+        """
+        LOW-01 regression test:
+        - `POST /actions/move-files` with `destination_path` inspects VSN on `Path(drive_root)` first
+          WITHOUT prematurely calling `dest_dir.mkdir(...)`.
+        - Moving into `daf_backup/`, `backup/`, or `daf_kwarantanna/` (via either `destination_path`
+          or `target_volume_id` + `target_subfolder`) is blocked without creating directories on disk.
+        - If VSN verification fails inside `schedule_or_execute_moves()`, no empty target directory is left behind.
+        - On a verified online volume, `schedule_or_execute_moves()` creates the folder and moves the file.
+        """
+        with self.TestingSessionLocal() as db:
+            vol_a = WindowsVolume(
+                volume_serial_number="VSN-LOW01-A",
+                volume_label="Foto-LowA",
+                last_known_drive_letter=str(self.drive_a),
+                is_online=True,
+            )
+            vol_b = WindowsVolume(
+                volume_serial_number="VSN-LOW01-B",
+                volume_label="Foto-LowB",
+                last_known_drive_letter=str(self.drive_b),
+                is_online=True,
+            )
+            db.add_all([vol_a, vol_b])
+            db.commit()
+            db.refresh(vol_a)
+            db.refresh(vol_b)
+            vol_b_id = vol_b.id
+
+            p_src = create_synthetic_jpeg(self.drive_a / "low01_photo.jpg", color=(90, 140, 200))
+            it = FileScannerService.process_file(p_src, vol_a)
+            db.add(it)
+            db.commit()
+            it_id = it.id
+
+        # 1) destination_path inside daf_backup/ -> blocked AND directory MUST NOT be created
+        bad_bkp_dir = self.drive_b / "daf_backup" / "2026" / "unauthorized"
+        called_paths = []
+
+        def fake_vol_info(path_arg):
+            called_paths.append(Path(path_arg))
+            return ("VSN-LOW01-B", "Foto-LowB", str(self.drive_b))
+
+        with patch.object(WindowsVolumeInspector, "get_volume_info", side_effect=fake_vol_info):
+            r_blk_bkp = self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_id], "destination_path": str(bad_bkp_dir)},
+            )
+        self.assertEqual(r_blk_bkp.status_code, 200)
+        self.assertIn("chronionego katalogu systemowego", r_blk_bkp.text)
+        self.assertFalse(bad_bkp_dir.exists(), "daf_backup target directory must NOT be created when blocked!")
+        # Verify get_volume_info was invoked on drive root (not on non-existent bad_bkp_dir)
+        self.assertEqual(len(called_paths), 1)
+        self.assertNotEqual(called_paths[0].resolve(), bad_bkp_dir.resolve())
+
+        # 2) target_volume_id + target_subfolder inside daf_backup/ or daf_kwarantanna/ -> blocked
+        r_blk_sub = self.client.post(
+            "/actions/move-files",
+            data={"scope": "selected", "selected_ids": [it_id], "target_volume_id": str(vol_b_id), "target_subfolder": "daf_backup/2026"},
+        )
+        self.assertEqual(r_blk_sub.status_code, 200)
+        self.assertIn("chronionego katalogu systemowego", r_blk_sub.text)
+        self.assertFalse((self.drive_b / "daf_backup" / "2026").exists())
+
+        # 3) Hardware VSN mismatch (different VSN mounted at target root) -> skips move AND MUST NOT create empty dir
+        unverified_dir = self.drive_b / "ShouldNotBeCreatedOnVsnMismatch"
+        with patch.object(
+            WindowsVolumeInspector,
+            "get_volume_info",
+            return_value=("DEAD-BEEF", "FakeDisk", str(self.drive_b)),
+        ), patch.object(
+            WindowsVolumeInspector,
+            "get_connected_vsn_map",
+            return_value={
+                "VSN-LOW01-A": (str(self.drive_a), "Foto-LowA"),
+                "1111-2222": (str(self.drive_b), "DifferentPhysicalDrive"),
+            },
+        ):
+            r_unver = self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_id], "destination_path": str(unverified_dir)},
+            )
+        self.assertEqual(r_unver.status_code, 200)
+        self.assertFalse(unverified_dir.exists(), "Target directory must NOT be created when VSN check fails!")
+        self.assertTrue(p_src.exists())
+
+        # 4) Verified online VSN + valid folder -> schedule_or_execute_moves creates folder & moves file
+        valid_dir = self.drive_b / "VerifiedTargetDir"
+        with patch.object(
+            WindowsVolumeInspector,
+            "get_volume_info",
+            return_value=("VSN-LOW01-B", "Foto-LowB", str(self.drive_b)),
+        ), patch.object(
+            WindowsVolumeInspector,
+            "get_connected_vsn_map",
+            return_value={
+                "VSN-LOW01-A": (str(self.drive_a), "Foto-LowA"),
+                "VSN-LOW01-B": (str(self.drive_b), "Foto-LowB"),
+            },
+        ):
+            r_ok = self.client.post(
+                "/actions/move-files",
+                data={"scope": "selected", "selected_ids": [it_id], "destination_path": str(valid_dir)},
+            )
+        self.assertEqual(r_ok.status_code, 200)
+        self.assertTrue((valid_dir / "low01_photo.jpg").exists())
+        self.assertFalse(p_src.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

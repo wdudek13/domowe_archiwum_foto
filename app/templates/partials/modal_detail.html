@@ -278,7 +278,9 @@
                         <div class="flex items-center justify-between p-1.5 rounded bg-slate-900/90 border border-borderBg text-[10px]">
                             <div class="truncate pr-2">
                                 {% set dup_vault_bkp = cross_vault_backup_by_item_id.get(dup.id) if cross_vault_backup_by_item_id is defined else None %}
-                                {% if dup.duplicate_role == 'backup_green' or dup.is_backup_copy %}
+                                {% if dup.duplicate_role == 'original' and dup.is_backup_copy %}
+                                    <span class="bg-amber-700 text-white px-1 rounded font-bold mr-1" title="Jedyna zachowana kopia (w daf_backup/)">ORYGINAŁ (BKP)</span>
+                                {% elif dup.duplicate_role == 'backup_green' or dup.is_backup_copy %}
                                     <span class="bg-emerald-700 text-white px-1 rounded font-bold mr-1" title="BACKUP na innym urządzeniu">BACKUP</span>
                                 {% elif dup.duplicate_role == 'backup_orange' %}
                                     <span class="bg-orange-600 text-white px-1 rounded font-bold mr-1" title="BACKUP na tym samym urządzeniu">BACKUP</span>
