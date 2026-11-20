@@ -188,6 +188,7 @@ class GoogleDriveManager:
         folder_id: str,
         purge_local_after_verify: bool = False,
         keep_only_one_db: bool = False,
+        volume_root: Optional[Path] = None,
     ) -> Dict[str, Any]:
         if not self.service:
             self.authenticate()
@@ -230,7 +231,13 @@ class GoogleDriveManager:
 
         purged = False
         if purge_local_after_verify and verified:
-            local_path.unlink()
+            from app.file_safety import FileSafetyGuard
+
+            FileSafetyGuard.quarantine_or_unlink(
+                local_path,
+                volume_root=volume_root,
+                reason="gdrive_upload_purge",
+            )
             purged = True
 
         pruned_backups: List[str] = []

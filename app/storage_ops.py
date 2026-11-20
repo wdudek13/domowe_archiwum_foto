@@ -13,134 +13,22 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.backup import BackupManager
 import app.database as db_module
+from app.file_safety import (
+    FileSafetyGuard,
+    QUARANTINE_DIR_NAME,
+    _safe_copy_new_to_daf_backup,
+    _safe_move,
+    _safe_unlink,
+    is_item_in_daf_backup,
+    is_path_in_daf_backup,
+    quarantine_file,
+    safe_resolve_volume_path,
+)
 from app.models import MediaItem, WindowsVolume, MediaGroup, DeletedDuplicateHistory
 from app.operation_log import OperationLogger
 from app.scanner import FastHasher, MetadataDateResolver, WindowsVolumeInspector
 
 logger = logging.getLogger("StorageOps")
-
-
-def is_path_in_daf_backup(path: Path, volume_root: Optional[Path] = None) -> bool:
-    """
-    Returns True if `path` resides inside a protected media backup folder:
-    - `daf_backup/` at any depth (unique DAF system folder), OR
-    - top-level `backup/` directly under the volume/drive root (matching scanner.py & is_item_in_daf_backup,
-      without falsely blocking unrelated user subfolders like `E:\\DCIM\\backup\\...`).
-    Excludes SQLite `db_backups` rotation files and uncommitted `.daf_tmp` / `.daf_move_tmp` staging files.
-    """
-    p_obj = Path(path)
-    lname = p_obj.name.lower()
-    if lname.endswith(".daf_tmp") or lname.endswith(".daf_move_tmp"):
-        return False
-
-    rel_parts: List[str] = []
-    if volume_root is not None:
-        try:
-            rel_parts = [p.lower() for p in p_obj.resolve().relative_to(Path(volume_root).resolve()).parts]
-        except ValueError:
-            rel_parts = []
-    if not rel_parts:
-        anchor = p_obj.anchor
-        rel_parts = [p.lower() for p in p_obj.parts if p not in ("", anchor, "\\", "/")]
-
-    if "db_backups" in rel_parts:
-        return False
-    if "daf_backup" in rel_parts:
-        return True
-    return bool(rel_parts and rel_parts[0] == "backup")
-
-
-def is_item_in_daf_backup(item: MediaItem) -> bool:
-    """Returns True if a MediaItem represents a protected backup file inside `daf_backup/` or top-level `backup/`."""
-    if getattr(item, "is_backup_copy", False):
-        return True
-    rel = (getattr(item, "relative_path", "") or "").replace("\\", "/").lower()
-    parts = [p for p in rel.split("/") if p]
-    return ("daf_backup" in parts) or (bool(parts) and parts[0] == "backup")
-
-
-def _safe_unlink(path: Path, volume_root: Optional[Path] = None) -> None:
-    """Deletes a file on disk, clearing Windows Read-Only attribute if needed. Hard-blocks daf_backup/ & top-level backup/."""
-    if is_path_in_daf_backup(path, volume_root=volume_root):
-        raise PermissionError(f"Ochrona daf_backup: zabronione usuwanie istniejącego pliku w katalogu backupu: {path}")
-    try:
-        path.unlink()
-    except PermissionError:
-        os.chmod(path, stat.S_IWRITE)
-        path.unlink()
-
-
-def _safe_move(src: Path, dst: Path, src_volume_root: Optional[Path] = None, dst_volume_root: Optional[Path] = None) -> None:
-    """
-    Moves a file on disk safely (V-08):
-    - Hard-blocks mutating/deleting existing files in `daf_backup/` or top-level `backup/`.
-    - For cross-drive moves (`src.drive != dst.drive`), performs transactional copy to `.daf_move_tmp`,
-      100% SHA-256 + media verification, atomic replace to `dst`, and only then unlinks `src`.
-    """
-    if is_path_in_daf_backup(src, volume_root=src_volume_root):
-        raise PermissionError(f"Ochrona daf_backup: zabronione przenoszenie/usuwanie pliku z katalogu backupu: {src}")
-    if is_path_in_daf_backup(dst, volume_root=dst_volume_root) and dst.exists():
-        raise PermissionError(f"Ochrona daf_backup: zabronione nadpisywanie istniejącego pliku w katalogu backupu: {dst}")
-
-    src_drive = str(src.resolve().drive).lower() if src.exists() else str(src.drive).lower()
-    dst_drive = str(dst.parent.resolve().drive).lower() if dst.parent.exists() else str(dst.drive).lower()
-    if src_drive and dst_drive and src_drive != dst_drive and src.exists() and src.is_file():
-        tmp_dst = dst.with_name(f"{dst.name}.daf_move_tmp")
-        if tmp_dst.exists():
-            try:
-                tmp_dst.unlink()
-            except OSError:
-                pass
-        shutil.copy2(str(src), str(tmp_dst))
-        verified, reason, _ = FastHasher.verify_files_identical_100_percent(src, tmp_dst)
-        if not verified:
-            try:
-                tmp_dst.unlink()
-            except OSError:
-                pass
-            raise OSError(f"Weryfikacja 100% po przeniesieniu między dyskami nie powiodła się ({src} -> {dst}): {reason}")
-        tmp_dst.replace(dst)
-        _safe_unlink(src, volume_root=src_volume_root)
-        return
-
-    try:
-        shutil.move(str(src), str(dst))
-    except PermissionError:
-        os.chmod(src, stat.S_IWRITE)
-        shutil.move(str(src), str(dst))
-
-
-def _safe_copy_new_to_daf_backup(src_path: Path, dest_path: Path) -> Tuple[bool, str, Optional[str]]:
-    """
-    Append-only verified write into `daf_backup/`:
-    1) Refuses if `dest_path` already exists (never overwrites an existing backup file).
-    2) Copies to a `.daf_tmp` staging filename, runs 100% SHA-256 + media verification.
-    3) Only atomically renames `.daf_tmp` -> `dest_path` on 100% pass; on fail, cleans only `.daf_tmp`.
-    """
-    if dest_path.exists():
-        raise PermissionError(f"Ochrona daf_backup: plik docelowy już istnieje i nie może zostać nadpisany: {dest_path}")
-    tmp_path = dest_path.with_name(f"{dest_path.name}.daf_tmp")
-    if tmp_path.exists():
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-    shutil.copy2(str(src_path), str(tmp_path))
-    verified, reason, full_sha = FastHasher.verify_files_identical_100_percent(src_path, tmp_path)
-    if not verified:
-        try:
-            tmp_path.unlink()
-        except OSError as exc:
-            logger.debug("Cleanup failed staging backup copy %s: %s", tmp_path, exc)
-        return False, reason, None
-    if dest_path.exists():
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise PermissionError(f"Ochrona daf_backup: wykryto istniejący plik podczas finalizacji: {dest_path}")
-    tmp_path.replace(dest_path)
-    return True, reason, full_sha
 
 
 class StorageAutomationService:
@@ -159,7 +47,7 @@ class StorageAutomationService:
         self,
         vol: Optional[WindowsVolume],
         connected_map: Optional[Dict[str, Tuple[str, str]]] = None,
-        strict_vsn: bool = False,
+        strict_vsn: bool = True,
     ) -> Optional[Path]:
         """
         Verifies via live OS VSN enumeration that `vol` is truly mounted right now and resolves
@@ -476,7 +364,10 @@ class StorageAutomationService:
             clusters_checked += 1
             primary = next((x for x in cluster if x.is_primary_duplicate), cluster[0])
             p_root = verified_roots.get(primary.volume_id)
-            p_path = (p_root / primary.relative_path) if p_root is not None else None
+            try:
+                p_path = safe_resolve_volume_path(p_root, primary.relative_path) if p_root is not None else None
+            except ValueError:
+                p_path = None
 
             if not p_path or not p_path.exists():
                 offline_skipped += len(cluster) - 1
@@ -486,7 +377,10 @@ class StorageAutomationService:
                 if candidate.id == primary.id:
                     continue
                 c_root = verified_roots.get(candidate.volume_id)
-                c_path = (c_root / candidate.relative_path) if c_root is not None else None
+                try:
+                    c_path = safe_resolve_volume_path(c_root, candidate.relative_path) if c_root is not None else None
+                except ValueError:
+                    c_path = None
                 if not c_path or not c_path.exists():
                     offline_skipped += 1
                     continue
@@ -1561,7 +1455,11 @@ class StorageAutomationService:
                 vol_root = self.verify_and_resolve_online_volume_root(bkp_vol, connected_map=connected_map)
                 if not bkp_item or not bkp_vol or vol_root is None:
                     continue
-                curr_path = vol_root / bkp_item.relative_path
+                try:
+                    curr_path = safe_resolve_volume_path(vol_root, bkp_item.relative_path)
+                except ValueError as exc:
+                    logger.warning("Blocked invalid relative_path during relocate (%s): %s", bkp_item.relative_path, exc)
+                    continue
                 if not curr_path.exists():
                     missing_source_files += 1
                     continue
@@ -1574,13 +1472,23 @@ class StorageAutomationService:
                     while target_bkp_path.exists():
                         target_bkp_path = target_bkp_dir / f"{curr_path.stem}_{c}{curr_path.suffix}"
                         c += 1
-                    _safe_move(curr_path, target_bkp_path, src_volume_root=vol_root, dst_volume_root=vol_root)
+                    _safe_move(
+                        curr_path,
+                        target_bkp_path,
+                        src_volume_root=vol_root,
+                        dst_volume_root=vol_root,
+                        job_id=job_id,
+                        file_hash=bkp_item.file_hash,
+                        vsn=bkp_vol.volume_serial_number,
+                    )
                     self._preserve_original_path_before_move(bkp_item, bkp_vol)
                     bkp_item.file_name = target_bkp_path.name
                     bkp_item.relative_path = target_bkp_path.resolve().relative_to(vol_root.resolve()).as_posix()
                 bkp_item.is_backup_copy = True
                 bkp_item.is_primary_duplicate = False
                 bkp_item.duplicate_role = "backup_green"
+                # H-04: Commit DB immediately after each relocated physical file
+                self.db.commit()
                 backups_relocated += 1
                 local_done_in_pair += 1
                 if job_id:
@@ -1613,7 +1521,11 @@ class StorageAutomationService:
                 dst_root = self.verify_and_resolve_online_volume_root(dst_vol, connected_map=connected_map)
                 if not bkp_item or not src_vol or not dst_vol or src_root_v is None or dst_root is None:
                     continue
-                src_path = src_root_v / bkp_item.relative_path
+                try:
+                    src_path = safe_resolve_volume_path(src_root_v, bkp_item.relative_path)
+                except ValueError as exc:
+                    logger.warning("Blocked invalid relative_path during remote move (%s): %s", bkp_item.relative_path, exc)
+                    continue
                 if not src_path.exists():
                     missing_source_files += 1
                     continue
@@ -1634,13 +1546,23 @@ class StorageAutomationService:
                 while dest_path.exists():
                     dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
-                verified, reason, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
+                verified, reason, full_sha = _safe_copy_new_to_daf_backup(
+                    src_path, dest_path, job_id=job_id, vsn=dst_vol.volume_serial_number
+                )
                 if not verified:
                     verification_blocks += 1
                     continue
                 if ((not strict_target_writes_only) or (src_vol.id in allowed_write_vols)) and not is_path_in_daf_backup(src_path, volume_root=src_root_v):
                     try:
-                        _safe_unlink(src_path, volume_root=src_root_v)
+                        FileSafetyGuard.remove_verified_move_source(
+                            src_path,
+                            dest_path,
+                            src_volume_root=src_root_v,
+                            verified_sha256=full_sha or "",
+                            job_id=job_id,
+                            reason="remote_backup_move",
+                            vsn=src_vol.volume_serial_number,
+                        )
                     except OSError as exc:
                         logger.debug("Source unlink warning after remote backup move %s: %s", src_path, exc)
                 self._preserve_original_path_before_move(bkp_item, src_vol)
@@ -1651,6 +1573,8 @@ class StorageAutomationService:
                 bkp_item.is_primary_duplicate = False
                 bkp_item.duplicate_role = "backup_green"
                 bkp_item.verified_sha256 = full_sha
+                # H-04: Commit DB immediately after each remote-moved physical file
+                self.db.commit()
                 backups_remote_moved += 1
                 if job_id:
                     ProcessManager.update_progress(
@@ -1672,7 +1596,11 @@ class StorageAutomationService:
                 if not orig_item or not src_vol or not dst_vol or src_root_v is None or dst_root is None:
                     continue
 
-                src_path = src_root_v / orig_item.relative_path
+                try:
+                    src_path = safe_resolve_volume_path(src_root_v, orig_item.relative_path)
+                except ValueError as exc:
+                    logger.warning("Blocked invalid relative_path during backup copy (%s): %s", orig_item.relative_path, exc)
+                    continue
                 if not src_path.exists():
                     missing_source_files += 1
                     continue
@@ -1695,7 +1623,9 @@ class StorageAutomationService:
                     dest_path = backup_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
 
-                verified, reason, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
+                verified, reason, full_sha = _safe_copy_new_to_daf_backup(
+                    src_path, dest_path, job_id=job_id, vsn=dst_vol.volume_serial_number
+                )
                 if not verified:
                     verification_blocks += 1
                     OperationLogger.log(
@@ -1742,7 +1672,7 @@ class StorageAutomationService:
                     is_trashed=False,
                 )
                 self.db.add(new_bkp)
-                self.db.flush()
+                self.db.commit()
                 backups_created += 1
                 if job_id:
                     ProcessManager.update_progress(
@@ -2174,14 +2104,22 @@ class StorageAutomationService:
                         blocked_safety += 1
                         continue
 
-                    cand_path = vol_root / cand.relative_path
+                    try:
+                        cand_path = safe_resolve_volume_path(vol_root, cand.relative_path)
+                    except ValueError as exc:
+                        logger.warning("Blocked invalid relative_path in duplicate removal (%s): %s", cand.relative_path, exc)
+                        blocked_safety += 1
+                        continue
                     if not cand_path.exists():
                         # V-05 protection: NEVER reconcile/delete DB record unless a surviving copy is physically verified online!
                         verified_surviving_online = False
                         for rc in [orig, bkp] + [x for x in surviving if x.id not in (orig.id, bkp.id)]:
                             rv_root = verified_roots.get(rc.volume_id)
                             if rv_root is not None:
-                                rp = rv_root / rc.relative_path
+                                try:
+                                    rp = safe_resolve_volume_path(rv_root, rc.relative_path)
+                                except ValueError:
+                                    continue
                                 if rp.exists() and rp.is_file() and rp.stat().st_size == rc.file_size_bytes:
                                     verified_surviving_online = True
                                     break
@@ -2207,7 +2145,10 @@ class StorageAutomationService:
                     for rc in ref_candidates:
                         rv_root = verified_roots.get(rc.volume_id)
                         if rv_root is not None:
-                            rp = rv_root / rc.relative_path
+                            try:
+                                rp = safe_resolve_volume_path(rv_root, rc.relative_path)
+                            except ValueError:
+                                continue
                             if rp.exists() and rp.resolve() != cand_path.resolve():
                                 ref_item = rc
                                 ref_path = rp
@@ -2216,15 +2157,19 @@ class StorageAutomationService:
                     # If backup is currently online, verify its file actually exists on disk before trusting it
                     bkp_root = verified_roots.get(bkp.volume_id)
                     if bkp_root is not None:
-                        bkp_p = bkp_root / bkp.relative_path
-                        if not bkp_p.exists() and len(surviving) == 2:
+                        try:
+                            bkp_p = safe_resolve_volume_path(bkp_root, bkp.relative_path)
+                        except ValueError:
+                            bkp_p = None
+                        if (bkp_p is None or not bkp_p.exists()) and len(surviving) == 2:
                             blocked_safety += 1
                             continue
 
                     if ref_item is not None and ref_path is not None:
                         is_identical, verify_msg, full_sha = FastHasher.verify_files_identical_100_percent(ref_path, cand_path)
                     else:
-                        # V-07 protection: NEVER delete videos offline using partial_3x64k — require full verified_sha256!
+                        # V-07 + H-10 protection: NEVER delete videos offline using partial_3x64k — require full verified_sha256,
+                        # and when ref_item is None (all surviving copies offline), NEVER hard-unlink: move ONLY to daf_kwarantanna/!
                         can_verify_from_meta = (
                             orig.file_size_bytes == bkp.file_size_bytes == cand.file_size_bytes
                             and (
@@ -2275,9 +2220,32 @@ class StorageAutomationService:
                         # Logical-only KOSZ attribute: physical file stays completely untouched on disk
                         cand.is_trashed = True
                     else:
+                        # C-03, C-04, H-10: Move to same-volume atomic quarantine (`daf_kwarantanna/`) instead of irreversible unlink!
+                        q_reason = (
+                            "dup_removal_offline_ref_quarantine"
+                            if ref_item is None
+                            else "dup_removal_quarantine"
+                        )
                         try:
-                            _safe_unlink(cand_path, volume_root=vol_root)
+                            FileSafetyGuard.quarantine_file(
+                                cand_path,
+                                vol_root,
+                                job_id=job_id,
+                                reason=q_reason,
+                                file_hash=full_sha or cand.file_hash,
+                                vsn=vol.volume_serial_number,
+                            )
                             consecutive_io_errors = 0
+                        except PermissionError as exc:
+                            blocked_safety += 1
+                            OperationLogger.log(
+                                "DUP_PROTECTED_BLOCK",
+                                f"Zablokowano usunięcie chronionego pliku {cand_path}: {exc}",
+                                status="WARN",
+                                db=self.db,
+                                commit=True,
+                            )
+                            continue
                         except OSError as exc:
                             consecutive_io_errors += 1
                             blocked_verify += 1
@@ -2309,7 +2277,12 @@ class StorageAutomationService:
                     drive_processed_cnt += 1
                 else:
                     # Standard non-duplicate removal
-                    src_p = vol_root / cand.relative_path
+                    try:
+                        src_p = safe_resolve_volume_path(vol_root, cand.relative_path)
+                    except ValueError as exc:
+                        logger.warning("Blocked invalid relative_path in removal (%s): %s", cand.relative_path, exc)
+                        blocked_safety += 1
+                        continue
                     if is_item_in_daf_backup(cand) or is_path_in_daf_backup(src_p, volume_root=vol_root):
                         blocked_safety += 1
                         continue
@@ -2319,10 +2292,30 @@ class StorageAutomationService:
                     else:
                         if src_p.exists():
                             try:
-                                _safe_unlink(src_p, volume_root=vol_root)
+                                # C-03 & C-04: Always quarantine non-duplicate / single-copy files (never irreversible unlink!)
+                                FileSafetyGuard.quarantine_file(
+                                    src_p,
+                                    vol_root,
+                                    job_id=job_id,
+                                    reason="permanent_delete_quarantine",
+                                    file_hash=cand.file_hash,
+                                    vsn=vol.volume_serial_number,
+                                )
                                 physical_count += 1
+                            except PermissionError as exc:
+                                blocked_safety += 1
+                                OperationLogger.log(
+                                    "DELETE_PROTECTED_BLOCK",
+                                    f"Zablokowano usunięcie chronionego pliku {src_p}: {exc}",
+                                    status="WARN",
+                                    db=self.db,
+                                    commit=True,
+                                )
+                                continue
                             except OSError as exc:
-                                logger.debug("Permanent delete unlink warning: %s", exc)
+                                blocked_verify += 1
+                                logger.debug("Permanent delete quarantine warning: %s", exc)
+                                continue
                         trash_p = eff_trash_dir / f"{cand.id}_{cand.file_name}"
                         if trash_p.exists():
                             try:
@@ -2621,7 +2614,11 @@ class StorageAutomationService:
             item = self.db.get(MediaItem, row["item_id"])
             if not item:
                 continue
-            src_path = src_root / item.relative_path
+            try:
+                src_path = safe_resolve_volume_path(src_root, item.relative_path)
+            except ValueError as exc:
+                logger.warning("Blocked invalid relative_path during move_backups (%s): %s", item.relative_path, exc)
+                continue
             if not src_path.exists():
                 continue
 
@@ -2639,14 +2636,23 @@ class StorageAutomationService:
                 dest_path = target_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                 c += 1
 
-            verified, _, full_sha = _safe_copy_new_to_daf_backup(src_path, dest_path)
+            verified, _, full_sha = _safe_copy_new_to_daf_backup(
+                src_path, dest_path, vsn=dst_vol.volume_serial_number
+            )
             if not verified:
                 verification_blocks += 1
                 continue
 
             if not is_path_in_daf_backup(src_path, volume_root=src_root):
                 try:
-                    _safe_unlink(src_path, volume_root=src_root)
+                    FileSafetyGuard.remove_verified_move_source(
+                        src_path,
+                        dest_path,
+                        src_volume_root=src_root,
+                        verified_sha256=full_sha or "",
+                        reason="move_backups",
+                        vsn=src_vol.volume_serial_number,
+                    )
                 except OSError as exc:
                     logger.debug("Source unlink warning during move backup %s: %s", src_path, exc)
 
@@ -2658,6 +2664,8 @@ class StorageAutomationService:
             item.is_primary_duplicate = False
             item.duplicate_role = "backup_green"
             item.verified_sha256 = full_sha
+            # H-04: Commit DB immediately after each moved backup file
+            self.db.commit()
             moved_count += 1
             moved_bytes += int(item.file_size_bytes or 0)
 
@@ -2699,6 +2707,9 @@ class StorageAutomationService:
 
         dst_root = self.verify_and_resolve_online_volume_root(target_vol, connected_map=connected_map)
         clean_sub = target_subfolder.strip().strip("/\\")
+        dst_dir_resolved: Optional[Path] = None
+        if dst_root is not None:
+            dst_dir_resolved = safe_resolve_volume_path(dst_root, clean_sub) if clean_sub else dst_root.resolve()
         moved_physically = 0
         skipped_offline = 0
 
@@ -2708,22 +2719,30 @@ class StorageAutomationService:
         for it in items:
             src_vol = self.db.get(WindowsVolume, it.volume_id)
             src_root = self.verify_and_resolve_online_volume_root(src_vol, connected_map=connected_map)
+            src_file: Optional[Path] = None
+            if src_root is not None:
+                try:
+                    src_file = safe_resolve_volume_path(src_root, it.relative_path)
+                except ValueError as exc:
+                    logger.warning("Blocked invalid relative_path during move (%s): %s", it.relative_path, exc)
+                    skipped_offline += 1
+                    continue
             can_move_physically = (
-                src_root is not None
+                src_file is not None
                 and dst_root is not None
-                and (src_root / it.relative_path).exists()
+                and dst_dir_resolved is not None
+                and src_file.exists()
             )
             if not can_move_physically:
                 skipped_offline += 1
                 continue
 
-            src_file = src_root / it.relative_path
             if src_vol and target_vol and src_vol.id != target_vol.id:
                 has_space, _ = self.check_volume_free_space(str(dst_root), int(it.file_size_bytes or 0))
                 if not has_space:
                     skipped_offline += 1
                     continue
-            dst_dir = (dst_root / clean_sub) if clean_sub else dst_root
+            dst_dir = dst_dir_resolved
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst_file = dst_dir / it.file_name
 
@@ -2732,12 +2751,21 @@ class StorageAutomationService:
                 while dst_file.exists():
                     dst_file = dst_dir / f"{src_file.stem}_{c}{src_file.suffix}"
                     c += 1
-                _safe_move(src_file, dst_file, src_volume_root=src_root, dst_volume_root=dst_root)
+                _safe_move(
+                    src_file,
+                    dst_file,
+                    src_volume_root=src_root,
+                    dst_volume_root=dst_root,
+                    file_hash=it.file_hash,
+                    vsn=target_vol.volume_serial_number,
+                )
 
             self._preserve_original_path_before_move(it, src_vol)
             it.volume_id = target_vol.id
             it.file_name = dst_file.name
             it.relative_path = dst_file.resolve().relative_to(dst_root.resolve()).as_posix()
+            # H-04: Commit DB immediately after each physically moved file
+            self.db.commit()
             moved_physically += 1
 
         self.db.commit()
@@ -2948,8 +2976,11 @@ class StorageAutomationService:
             vol_valid = 0
             vol_missing = 0
             for it in items:
-                fp = root / it.relative_path
-                if not fp.exists() or not fp.is_file():
+                try:
+                    fp = safe_resolve_volume_path(root, it.relative_path)
+                except ValueError:
+                    fp = None
+                if fp is None or not fp.exists() or not fp.is_file():
                     vol_missing += 1
                     other_copies = max(0, int(hash_counts.get(it.file_hash, 1)) - 1)
                     if other_copies > 0:
@@ -3056,7 +3087,11 @@ class StorageAutomationService:
             if root is None:
                 skipped += 1
                 continue
-            fp = root / it.relative_path
+            try:
+                fp = safe_resolve_volume_path(root, it.relative_path)
+            except ValueError:
+                skipped += 1
+                continue
             if fp.exists():
                 skipped += 1
                 continue
@@ -3153,7 +3188,12 @@ class StorageAutomationService:
                 skipped_offline += 1
                 continue
 
-            src_path = root / it.relative_path
+            try:
+                src_path = safe_resolve_volume_path(root, it.relative_path)
+            except ValueError as exc:
+                logger.warning("Blocked invalid relative_path in organize_ungrouped_originals (%s): %s", it.relative_path, exc)
+                errors += 1
+                continue
             if not src_path.exists() or not src_path.is_file():
                 missing_on_disk += 1
                 continue
@@ -3168,7 +3208,14 @@ class StorageAutomationService:
                     dst_path = dst_dir / f"{src_path.stem}_{c}{src_path.suffix}"
                     c += 1
                 try:
-                    _safe_move(src_path, dst_path, src_volume_root=root, dst_volume_root=root)
+                    _safe_move(
+                        src_path,
+                        dst_path,
+                        src_volume_root=root,
+                        dst_volume_root=root,
+                        file_hash=it.file_hash,
+                        vsn=vol.volume_serial_number,
+                    )
                 except OSError as exc:
                     logger.debug("Organize original move error for %s: %s", src_path, exc)
                     errors += 1
@@ -3178,9 +3225,9 @@ class StorageAutomationService:
             it.file_name = dst_path.name
             it.relative_path = dst_path.resolve().relative_to(root.resolve()).as_posix()
             already_organized_hashes.add(it.file_hash)
+            # H-04: Commit DB immediately after each moved original file
+            self.db.commit()
             moved_count += 1
-            if moved_count % 200 == 0:
-                self.db.commit()
 
         self.db.commit()
         msg = (
@@ -3244,7 +3291,11 @@ class StorageAutomationService:
             if src_root is None:
                 skipped_offline += 1
                 continue
-            src_file = src_root / it.relative_path
+            try:
+                src_file = safe_resolve_volume_path(src_root, it.relative_path)
+            except ValueError:
+                skipped_offline += 1
+                continue
             if not src_file.exists() or not src_file.is_file():
                 skipped_offline += 1
                 continue
@@ -3259,7 +3310,12 @@ class StorageAutomationService:
             while dst_file.exists():
                 dst_file = export_dir / f"{src_file.stem}_{c}{src_file.suffix}"
                 c += 1
-            shutil.copy2(str(src_file), str(dst_file))
+            FileSafetyGuard.safe_copy_export(
+                src_file,
+                dst_file,
+                file_hash=it.file_hash,
+                vsn=target_vol.volume_serial_number,
+            )
             copied_count += 1
             copied_bytes += int(it.file_size_bytes or 0)
 

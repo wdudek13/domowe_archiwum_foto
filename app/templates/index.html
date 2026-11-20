@@ -150,7 +150,8 @@
             </button>
             <button type="button"
                     hx-post="/actions/organize-originals"
-                    hx-confirm="Uporządkować wszystkie nieprzypisane do albumów Oryginały (bez plików będących już w daf_oryginal/ na jakimkolwiek dysku) do kartoteki daf_oryginal/RRRR/MM/DD/ na ich macierzystym dysku? Oryginalne ścieżki z nazwą dysku pozostaną zachowane w bazie do wyszukiwania."
+                    hx-include="#filter-form"
+                    hx-confirm="Uporządkować nieprzypisane do albumów Oryginały na wybranym dysku (bez plików będących już w daf_oryginal/ na jakimkolwiek dysku) do kartoteki daf_oryginal/RRRR/MM/DD/? Oryginalne ścieżki z nazwą dysku pozostaną zachowane w bazie do wyszukiwania."
                     hx-target="#global-notification"
                     class="bg-teal-800 hover:bg-teal-700 border border-teal-600/60 text-white px-3 py-1.5 rounded-lg font-medium transition">
                 🗂️ Uporządkuj oryginały
@@ -169,7 +170,7 @@
             </button>
             <button type="button"
                     hx-post="/actions/unindex"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
                     hx-confirm="Usunąć wybrane pozycje z bazy danych (wyindeksować)? Oryginalne pliki na dysku NIE zostaną usunięte."
                     hx-target="#global-notification"
                     class="bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 px-3 py-1.5 rounded-lg transition">
@@ -177,15 +178,15 @@
             </button>
             <button type="button"
                     hx-post="/actions/move-to-trash"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-confirm="Oznaczyć wybrane zdjęcia atrybutem KOSZ w bazie? Fizyczne pliki na dyskach NIE zostaną ruszone ani przeniesione."
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
+                    hx-confirm="Oznaczyć wybrane zdjęcia jako KOSZ? (Pliki zostaną usunięte z dysku dopiero po kliknięciu Opróżnij Kosz)"
                     hx-target="#global-notification"
                     class="bg-rose-900/80 hover:bg-rose-800 border border-rose-700 text-rose-200 px-3 py-1.5 rounded-lg transition">
                 🗑️ Do Kosza
             </button>
             <button type="button"
                     hx-post="/actions/delete-preview"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
                     hx-target="#modal-container"
                     class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-3 py-1.5 rounded-lg font-semibold transition">
                 🔥 Usuń trwale
@@ -345,7 +346,7 @@
             <button type="button" onclick="document.getElementById('move-files-modal').classList.add('hidden')" class="text-slate-400 hover:text-white text-lg px-1">&times;</button>
         </div>
         <form hx-post="/actions/move-files"
-              hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
+              hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
               hx-target="#global-notification"
               onsubmit="document.getElementById('move-files-modal').classList.add('hidden');"
               class="space-y-4">

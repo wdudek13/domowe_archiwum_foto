@@ -1,0 +1,185 @@
+<div class="space-y-4 text-xs">
+    {% if execution_result %}
+    <div class="p-3.5 rounded-xl border {% if execution_result.status == 'ok' %}bg-emerald-950/70 border-emerald-600 text-emerald-100{% elif execution_result.status == 'offline' %}bg-amber-950/70 border-amber-600 text-amber-100{% else %}bg-rose-950/70 border-rose-600 text-rose-100{% endif %}">
+        <div class="font-bold text-sm">🚚 Wynik przenoszenia backupów:</div>
+        <div class="mt-1">{{ execution_result.message }}</div>
+    </div>
+    {% endif %}
+
+    <!-- Stan backupów i miejsca na poszczególnych urządzeniach -->
+    <div class="bg-slate-950/60 border border-borderBg rounded-xl p-3.5 space-y-2">
+        <div class="font-bold text-slate-200">💾 Urządzenia w bazie — ilość backupów wg rodzaju (niebieskie w daf_backup / zielone / pomarańczowe) i wolne miejsce:</div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {% for v in analysis.volumes %}
+            {% set st = analysis.bkp_stats_by_vol.get(v.id, {'count': 0, 'bytes': 0, 'in_vault_count': 0, 'green_outside_count': 0, 'orange_count': 0}) %}
+            {% set sp = analysis.vol_space.get(v.id) %}
+            <div class="p-2.5 rounded-lg bg-cardBg border border-borderBg flex items-center justify-between gap-2">
+                <div>
+                    <div class="font-semibold text-slate-200">
+                        {% if v.is_online %}🟢 ONLINE{% else %}🔴 OFFLINE{% endif %} — {{ v.volume_label }} (VSN: {{ v.volume_serial_number }})
+                    </div>
+                    <div class="text-[10px] font-mono text-teal-300 mt-0.5">
+                        Łącznie backupów: <strong>{{ st.count }} szt.</strong> ({{ "%.2f"|format(st.bytes / (1024*1024)) }} MB)
+                    </div>
+                    <div class="text-[10px] font-mono text-slate-300 flex flex-wrap gap-1.5 mt-0.5">
+                        <span class="text-sky-300">w daf_backup/: <strong>{{ st.in_vault_count or 0 }}</strong></span> &bull;
+                        <span class="text-emerald-300">zielone: <strong>{{ st.green_outside_count or 0 }}</strong></span> &bull;
+                        <span class="text-orange-300">pomarańczowe: <strong>{{ st.orange_count or 0 }}</strong></span>
+                    </div>
+                </div>
+                <div class="text-right font-mono">
+                    {% if sp %}
+                    <div class="{% if sp.is_offline_cached %}text-amber-300{% else %}text-emerald-400{% endif %} font-bold">
+                        Wolne: {{ "%.2f"|format(sp.free_gb) }} GB
+                    </div>
+                    <div class="text-[10px] text-slate-400">z {{ "%.2f"|format(sp.total_gb) }} GB</div>
+                    {% else %}
+                    <span class="text-slate-500 text-[10px]">Brak danych pojemności</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Wybór pary urządzeń oraz rodzajów backupów do przeniesienia -->
+    <form hx-post="/actions/move-backups-panel"
+          hx-target="#move-backups-panel-body"
+          hx-trigger="change"
+          class="bg-slate-900/90 border border-teal-700/60 p-4 rounded-xl space-y-3">
+        <input type="hidden" name="types_submitted" value="1">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">1. Urządzenie źródłowe (zabierz backupy z):</label>
+                <select name="source_volume_id" class="w-full bg-cardBg border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="">-- Wybierz dysk źródłowy --</option>
+                    {% for v in analysis.volumes %}
+                    {% set st = analysis.bkp_stats_by_vol.get(v.id, {'count': 0, 'bytes': 0, 'in_vault_count': 0, 'green_outside_count': 0, 'orange_count': 0}) %}
+                    <option value="{{ v.id }}" {% if analysis.source_volume_id == v.id %}selected{% endif %}>
+                        {% if v.is_online %}🟢{% else %}🔴{% endif %} {{ v.volume_label }} — Łącznie: {{ st.count }} (vault: {{ st.in_vault_count }}, ziel: {{ st.green_outside_count }}, pom: {{ st.orange_count }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label class="block text-slate-300 mb-1 font-semibold">2. Urządzenie docelowe (zawsze do <code>daf_backup/RRRR/MM/DD/</code>):</label>
+                <select name="target_volume_id" class="w-full bg-cardBg border border-borderBg rounded-lg p-2.5 text-white">
+                    <option value="">-- Wybierz dysk docelowy --</option>
+                    {% for v in analysis.volumes %}
+                    {% set sp = analysis.vol_space.get(v.id) %}
+                    <option value="{{ v.id }}" {% if analysis.target_volume_id == v.id %}selected{% endif %}>
+                        {% if v.is_online %}🟢{% else %}🔴{% endif %} {{ v.volume_label }} — Wolne: {{ "%.2f"|format(sp.free_gb) if sp else '?' }} GB
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-4 pt-2 border-t border-borderBg/50 text-[11px]">
+            <span class="text-slate-300 font-semibold">Rodzaje backupów do przeniesienia do <code>daf_backup/RRRR/MM/DD/</code>:</span>
+            <label class="flex items-center space-x-1.5 cursor-pointer text-sky-300">
+                <input type="checkbox" name="include_in_vault" value="true" {% if analysis.include_in_vault %}checked{% endif %} class="rounded bg-slate-950 border-borderBg text-sky-500">
+                <span>Niebieskie / w <code>daf_backup/</code></span>
+            </label>
+            <label class="flex items-center space-x-1.5 cursor-pointer text-emerald-300">
+                <input type="checkbox" name="include_green_outside" value="true" {% if analysis.include_green_outside %}checked{% endif %} class="rounded bg-slate-950 border-borderBg text-emerald-500">
+                <span>Zielone poza <code>daf_backup/</code></span>
+            </label>
+            <label class="flex items-center space-x-1.5 cursor-pointer text-orange-300">
+                <input type="checkbox" name="include_orange_same_disk" value="true" {% if analysis.include_orange_same_disk %}checked{% endif %} class="rounded bg-slate-950 border-borderBg text-orange-500">
+                <span>Pomarańczowe (na tym samym dysku co oryginał)</span>
+            </label>
+        </div>
+    </form>
+
+    {% if analysis.src_vol and analysis.dst_vol and analysis.src_vol.id != analysis.dst_vol.id %}
+    <div class="bg-slate-900/80 border border-borderBg rounded-xl p-4 space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div class="p-3 rounded-lg bg-cardBg border border-emerald-700/60">
+                <div class="text-slate-400 text-[11px]">Można bezpiecznie przenieść:</div>
+                <div class="text-lg font-bold text-emerald-400 font-mono mt-0.5">
+                    {{ analysis.movable_count }} szt. ({{ "%.2f"|format(analysis.movable_bytes / (1024*1024)) }} MB)
+                </div>
+                <div class="text-[10px] text-slate-400">Oryginały tych plików są na innych dyskach niż docelowy.</div>
+            </div>
+            <div class="p-3 rounded-lg bg-cardBg border border-amber-700/60">
+                <div class="text-slate-400 text-[11px]">Pominięto (zasada różnych dysków):</div>
+                <div class="text-lg font-bold text-amber-400 font-mono mt-0.5">
+                    {{ analysis.blocked_same_device_count }} szt. ({{ "%.2f"|format(analysis.blocked_same_device_bytes / (1024*1024)) }} MB)
+                </div>
+                <div class="text-[10px] text-slate-400">Ich Oryginał leży na dysku {{ analysis.dst_vol.volume_label }} (zostają na dysku {{ analysis.src_vol.volume_label }}).</div>
+            </div>
+            <div class="p-3 rounded-lg bg-cardBg border {% if analysis.space_ok %}border-sky-700/60{% else %}border-rose-600{% endif %}">
+                <div class="text-slate-400 text-[11px]">Miejsce na dysku docelowym po przeniesieniu:</div>
+                <div class="text-lg font-bold {% if analysis.space_ok %}text-sky-300{% else %}text-rose-400{% endif %} font-mono mt-0.5">
+                    {{ "%.2f"|format(analysis.dst_free_after / (1024**3)) }} GB
+                </div>
+                <div class="text-[10px] text-slate-400">
+                    Zwolni się na {{ analysis.src_vol.volume_label }}: +{{ "%.2f"|format(analysis.movable_bytes / (1024*1024)) }} MB
+                    {% if not analysis.space_ok %}<span class="text-rose-400 font-bold block">⚠️ BRAK MIEJSCA!</span>{% endif %}
+                </div>
+            </div>
+        </div>
+
+        {% if analysis.movable_rows %}
+        <div class="max-h-48 overflow-y-auto border border-borderBg/70 rounded-lg">
+            <table class="w-full text-left border-collapse text-[11px]">
+                <thead>
+                    <tr class="border-b border-borderBg bg-slate-950/60 text-slate-400">
+                        <th class="py-1.5 px-2">Plik</th>
+                        <th class="py-1.5 px-2">Rodzaj</th>
+                        <th class="py-1.5 px-2">Dysk Oryginału (bezpieczny)</th>
+                        <th class="py-1.5 px-2">Ścieżka źródłowa</th>
+                        <th class="py-1.5 px-2">Ścieżka docelowa (daf_backup/RRRR/MM/DD/)</th>
+                        <th class="py-1.5 px-2">Rozmiar</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-borderBg/40 font-mono">
+                    {% for r in analysis.movable_rows[:200] %}
+                    <tr>
+                        <td class="py-1 px-2 text-slate-200 truncate max-w-[160px]">{{ r.file_name }}</td>
+                        <td class="py-1 px-2">
+                            {% if r.backup_kind == 'in_vault' %}
+                            <span class="px-1 rounded bg-sky-900 text-sky-200 text-[9px]">w daf_backup</span>
+                            {% elif r.backup_kind == 'orange' %}
+                            <span class="px-1 rounded bg-orange-900 text-orange-200 text-[9px]">pomarańczowy</span>
+                            {% else %}
+                            <span class="px-1 rounded bg-emerald-900 text-emerald-200 text-[9px]">zielony</span>
+                            {% endif %}
+                        </td>
+                        <td class="py-1 px-2 text-sky-300">{{ r.orig_vol_label }}</td>
+                        <td class="py-1 px-2 text-slate-400 truncate max-w-[170px]">{{ r.src_relative_path }}</td>
+                        <td class="py-1 px-2 text-emerald-300 truncate max-w-[170px]">{{ r.dst_relative_path }}</td>
+                        <td class="py-1 px-2 text-slate-400">{{ "%.2f"|format(r.file_size / (1024*1024)) }} MB</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <div class="flex items-center justify-between pt-2 border-t border-borderBg">
+            <span class="text-[11px] text-slate-400">
+                Każdy plik przechodzi 100% weryfikację binarną przed usunięciem z nośnika źródłowego i trafia do <code>daf_backup/RRRR/MM/DD/</code>.
+            </span>
+            <form hx-post="/actions/execute-move-backups" hx-target="#move-backups-panel-body">
+                <input type="hidden" name="source_volume_id" value="{{ analysis.source_volume_id }}">
+                <input type="hidden" name="target_volume_id" value="{{ analysis.target_volume_id }}">
+                <input type="hidden" name="types_submitted" value="1">
+                {% if analysis.include_in_vault %}<input type="hidden" name="include_in_vault" value="true">{% endif %}
+                {% if analysis.include_green_outside %}<input type="hidden" name="include_green_outside" value="true">{% endif %}
+                {% if analysis.include_orange_same_disk %}<input type="hidden" name="include_orange_same_disk" value="true">{% endif %}
+                <button type="submit"
+                        {% if analysis.movable_count == 0 or not analysis.space_ok %}disabled{% endif %}
+                        class="bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white px-5 py-2.5 rounded-xl font-bold shadow-lg transition">
+                    🚚 Przenieś {{ analysis.movable_count }} backupów na {{ analysis.dst_vol.volume_label }}
+                </button>
+            </form>
+        </div>
+    </div>
+    {% elif analysis.src_vol and analysis.dst_vol and analysis.src_vol.id == analysis.dst_vol.id %}
+    <div class="p-4 rounded-xl bg-amber-950/60 border border-amber-700 text-amber-200 text-center">
+        Wybierz dwa różne urządzenia (źródłowe i docelowe).
+    </div>
+    {% endif %}
+</div>

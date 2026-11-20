@@ -618,13 +618,13 @@ class FileScannerService:
 
     @staticmethod
     def is_in_excluded_album_export_folder(rel_path: str) -> bool:
-        """Excludes physical album export folders (daf_albums/) and Windows system folders ($RECYCLE.BIN, System Volume Information) from indexing."""
+        """Excludes physical album export folders (daf_albums/), quarantine (daf_kwarantanna/), and Windows system folders ($RECYCLE.BIN, System Volume Information) from indexing."""
         parts = [p.lower() for p in Path(rel_path).parts if p not in ("", ".", "/", "\\")]
         if not parts:
             return False
-        if parts[0] == "daf_albums":
+        if parts[0] in ("daf_albums", "daf_kwarantanna"):
             return True
-        return any(p in ("$recycle.bin", "system volume information") for p in parts)
+        return any(p in ("$recycle.bin", "system volume information", "daf_kwarantanna") for p in parts)
 
     @classmethod
     def process_file(cls, path: Path, volume: WindowsVolume, rel_override: Optional[str] = None) -> Optional[MediaItem]:

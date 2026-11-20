@@ -65,6 +65,15 @@
                             ⏹️ Zatrzymaj
                         </button>
                         {% elif j.status in ('STOPPED', 'PAUSED', 'WAITING_FOR_DEVICE', 'FAILED') %}
+                        {% if j.job_type == 'delete_permanently' %}
+                        <button type="button"
+                                hx-post="/actions/delete-preview"
+                                hx-vals='{"resume_job_id": "{{ j.id }}"}'
+                                hx-target="#modal-container"
+                                class="bg-amber-700 hover:bg-amber-600 text-white px-2.5 py-1 rounded text-[10px] font-semibold">
+                            🔍 Podgląd przed wznowieniem
+                        </button>
+                        {% else %}
                         <button type="button"
                                 hx-post="/actions/process-control"
                                 hx-vals='{"action": "resume", "job_id": "{{ j.id }}"}'
@@ -72,6 +81,7 @@
                                 class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded text-[10px] font-semibold">
                             ▶️ Wznów / Wystartuj
                         </button>
+                        {% endif %}
                         <button type="button"
                                 hx-post="/actions/process-control"
                                 hx-vals='{"action": "cancel", "job_id": "{{ j.id }}"}'

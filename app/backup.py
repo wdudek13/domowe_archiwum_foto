@@ -256,6 +256,10 @@ class BackupManager:
         )
         if len(backups) <= self.max_retained_backups:
             return
+        # M-05 protection: always preserve at least 5 most recent `pre_permanent_disk_delete`
+        # snapshots in their own dedicated retention pool, regardless of subsequent regular backups.
+        pre_delete_snaps = [p for p in backups if "pre_permanent_disk_delete" in p.name.lower()]
+        protected_pre_delete = set(pre_delete_snaps[:5])
         try:
             raw_sz = backups[0].stat().st_size
             newest_size = raw_sz if isinstance(raw_sz, int) else 0
@@ -263,6 +267,12 @@ class BackupManager:
             newest_size = 0
         for old_backup in backups[self.max_retained_backups:]:
             try:
+                if old_backup in protected_pre_delete:
+                    logger.debug(
+                        "Preserving pre_permanent_disk_delete snapshot in dedicated pool: %s",
+                        old_backup.name,
+                    )
+                    continue
                 # V-09 protection: never automatically rotate out a snapshot that is >20% larger
                 # than the newest DB backup (protects pre-incident rescue snapshots).
                 old_sz = old_backup.stat().st_size

@@ -62,8 +62,12 @@ def _compute_vector_in_ram(item: MediaItem) -> np.ndarray:
                 else None
             )
             if v_root is not None:
-                src_p = v_root / item.relative_path
-                if src_p.exists():
+                from app.file_safety import safe_resolve_volume_path
+                try:
+                    src_p = safe_resolve_volume_path(v_root, item.relative_path)
+                except ValueError:
+                    src_p = None
+                if src_p is not None and src_p.exists():
                     thumb_p = src_p
 
     if thumb_p.exists() and thumb_p.stat().st_size > 0:

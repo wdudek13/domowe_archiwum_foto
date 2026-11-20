@@ -3,9 +3,10 @@ import logging
 import sys
 import threading
 import traceback
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
 from app.backup import BackupManager
@@ -52,7 +53,41 @@ async def lifespan(_app: FastAPI):
         logger.warning("Shutdown backup warning: %s", exc)
 
 
-app = FastAPI(title="Domowe Archiwum Foto", lifespan=lifespan, debug=True)
+app = FastAPI(title="Domowe Archiwum Foto", lifespan=lifespan, debug=False)
+
+_ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
+
+
+def _is_allowed_local_origin(header_val: str) -> bool:
+    raw = (header_val or "").strip()
+    if not raw or raw.lower() == "null":
+        return False
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in _ALLOWED_LOCAL_HOSTS
+
+
+@app.middleware("http")
+async def csrf_origin_referer_guard(request: Request, call_next):
+    """M-01: Blocks cross-origin POST/PUT/DELETE/PATCH requests (CSRF protection)."""
+    if request.method.upper() in ("POST", "PUT", "DELETE", "PATCH"):
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        if origin is not None and not _is_allowed_local_origin(origin):
+            logger.warning("CSRF blocked on %s (Origin=%s)", request.url.path, origin)
+            return PlainTextResponse(
+                "403 Forbidden: żądanie z obcego źródła (Origin) zostało zablokowane.",
+                status_code=403,
+            )
+        if referer is not None and not _is_allowed_local_origin(referer):
+            logger.warning("CSRF blocked on %s (Referer=%s)", request.url.path, referer)
+            return PlainTextResponse(
+                "403 Forbidden: żądanie z obcego źródła (Referer) zostało zablokowane.",
+                status_code=403,
+            )
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)

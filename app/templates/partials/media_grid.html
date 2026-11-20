@@ -1,4 +1,5 @@
 <div class="space-y-4">
+    <input type="hidden" id="view-total-matching" name="view_total_matching" value="{{ total_matching }}">
     <!-- Podsumowanie aktywnego zbioru i paginacja -->
     <div class="flex flex-wrap items-center justify-between gap-2.5 bg-cardBg/80 border border-borderBg px-4 py-2.5 rounded-xl shadow-card text-xs">
         <div class="flex flex-wrap items-center gap-2">
@@ -194,9 +195,17 @@
                 ✓ Oznacz jako bez wady / nieuszkodzone
             </button>
             <button type="button"
+                    hx-post="/actions/unindex"
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
+                    hx-confirm="Usunąć wybrane wpisy WYŁĄCZNIE z bazy danych (wyindeksować)? Pliki fizyczne na dyskach NIE zostaną ruszone."
+                    hx-target="#global-notification"
+                    class="bg-slate-800 hover:bg-slate-700 border border-slate-500 text-sky-200 px-3 py-1.5 rounded-lg font-semibold">
+                ✖️ Wyindeksuj zaznaczone z bazy (bez ruszania plików na dysku)
+            </button>
+            <button type="button"
                     hx-post="/actions/move-to-trash"
-                    hx-include="#filter-form, #bulk-scope-select, input[name='selected_ids']:checked"
-                    hx-confirm="Czy na pewno przenieść zaznaczone wadliwe pliki do Kosza?"
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
+                    hx-confirm="Oznaczyć wybrane wadliwe pliki jako KOSZ? (Pliki zostaną usunięte z dysku dopiero po kliknięciu Opróżnij Kosz)"
                     hx-target="#global-notification"
                     class="bg-rose-700 hover:bg-rose-600 text-white px-3.5 py-1.5 rounded-lg font-semibold shadow">
                 🗑️ Przenieś do Kosza
@@ -316,10 +325,20 @@
             <div class="font-bold text-emerald-300 text-sm">🛡️ Wykryto {{ total_matching }} plików bez kopii zapasowej (backupu) na innym urządzeniu</div>
             <div class="text-slate-300 text-[11px]">Kopia zapasowa zostanie zapisana w katalogu <code>daf_backup/</code> na innym dysku niż oryginał, ze sprawdzaniem wolnego miejsca i 100% weryfikacją.</div>
         </div>
-        <button type="button" onclick="openBackupModal()"
-                class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
-            🛡️ Otwórz Panel Backupu zdjęć/filmów
-        </button>
+        <div class="flex flex-wrap items-center gap-2">
+            <button type="button"
+                    hx-post="/actions/unindex"
+                    hx-include="#filter-form, #bulk-scope-select, #view-total-matching, input[name='selected_ids']:checked"
+                    hx-confirm="Usunąć wybrane wpisy WYŁĄCZNIE z bazy danych (wyindeksować)? Pliki fizyczne na dyskach NIE zostaną ruszone."
+                    hx-target="#global-notification"
+                    class="bg-slate-800 hover:bg-slate-700 border border-slate-500 text-sky-200 px-3 py-2 rounded-lg font-semibold">
+                ✖️ Wyindeksuj zaznaczone z bazy (bez ruszania plików na dysku)
+            </button>
+            <button type="button" onclick="openBackupModal()"
+                    class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg font-semibold shadow">
+                🛡️ Otwórz Panel Backupu zdjęć/filmów
+            </button>
+        </div>
     </div>
     {% endif %}
 
@@ -446,16 +465,15 @@
                     </button>
                 </form>
                 <form hx-post="/actions/move-to-trash"
-                      hx-confirm="Czy na pewno oznaczyć cały album '{{ active_group.name }}' atrybutem KOSZ w bazie? Fizyczne pliki na dyskach nie zostaną ruszone."
+                      hx-confirm="Oznaczyć cały album '{{ active_group.name }}' jako KOSZ? (Pliki zostaną usunięte z dysku dopiero po kliknięciu Opróżnij Kosz)"
                       hx-target="#global-notification">
                     <input type="hidden" name="trash_group_id" value="{{ active_group.id }}">
                     <button type="submit" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-medium">
                         🗑️ Album + zdjęcia do Kosza
                     </button>
                 </form>
-                <form hx-post="/actions/delete-permanently"
-                      hx-confirm="UWAGA! Czy na pewno TRWALE usunąć fizycznie z dysku wszystkie zdjęcia z albumu '{{ active_group.name }}'? Operacja jest nieodwracalna!"
-                      hx-target="#global-notification">
+                <form hx-post="/actions/delete-preview"
+                      hx-target="#modal-container">
                     <input type="hidden" name="delete_group_id" value="{{ active_group.id }}">
                     <button type="submit" class="bg-red-950 hover:bg-red-800 border border-red-600 text-red-200 px-2.5 py-1 rounded font-semibold">
                         🔥 Usuń z dysku

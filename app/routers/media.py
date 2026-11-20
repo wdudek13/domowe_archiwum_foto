@@ -235,6 +235,7 @@ def _resolve_online_preview_path(db: Session, it: MediaItem) -> tuple[Optional[P
     2) If `it` is offline/missing, falls back READ-ONLY to any non-trashed copy (preferring backup copies)
        sharing `it.file_hash` on a VSN-verified online volume. Never mutates the fallback copy.
     """
+    from app.file_safety import safe_resolve_volume_path
     from app.scanner import WindowsVolumeInspector
     from app.storage_ops import StorageAutomationService
 
@@ -244,8 +245,11 @@ def _resolve_online_preview_path(db: Session, it: MediaItem) -> tuple[Optional[P
     if it.volume:
         own_root = svc.verify_and_resolve_online_volume_root(it.volume, connected_map=connected_map)
         if own_root is not None:
-            own_path = own_root / it.relative_path
-            if own_path.exists() and own_path.is_file():
+            try:
+                own_path = safe_resolve_volume_path(own_root, it.relative_path)
+            except ValueError:
+                own_path = None
+            if own_path is not None and own_path.exists() and own_path.is_file():
                 return own_path, None
 
     if not it.file_hash:
@@ -270,7 +274,10 @@ def _resolve_online_preview_path(db: Session, it: MediaItem) -> tuple[Optional[P
         cp_root = svc.verify_and_resolve_online_volume_root(cp.volume, connected_map=connected_map)
         if cp_root is None:
             continue
-        cp_path = cp_root / cp.relative_path
+        try:
+            cp_path = safe_resolve_volume_path(cp_root, cp.relative_path)
+        except ValueError:
+            continue
         if cp_path.exists() and cp_path.is_file():
             return cp_path, f"{cp.volume.volume_label} ({cp.volume.last_known_drive_letter})"
 

@@ -1,0 +1,48 @@
+{% set m_prefix = maint_prefix | default('status') %}
+<div class="bg-slate-900/80 border border-amber-700/50 rounded-xl p-4 space-y-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+            <span class="font-bold text-amber-300 text-sm">🧹 Konserwacja i Odzyskiwanie Miejsca na Dysku</span>
+            <p class="text-[11px] text-slate-400">
+                Fizyczne zmniejszenie pliku bazy <code>media_vault.db</code> (<code>VACUUM</code> po usunięciu duplikatów) oraz czyszczenie osieroconych plików miniatur.
+            </p>
+        </div>
+        {% if maint_stats is defined %}
+        <div class="text-right font-mono text-[11px] text-slate-300">
+            <div>Baza SQLite: <strong class="text-white">{{ "%.2f"|format(maint_stats.db_size_mb) }} MB</strong></div>
+            <div>Do odzyskania w bazie (freelist): <strong class="{% if maint_stats.freelist_mb > 1 %}text-emerald-400{% else %}text-slate-400{% endif %}">{{ "%.2f"|format(maint_stats.freelist_mb) }} MB</strong></div>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2.5">
+        <button type="button"
+                hx-post="/actions/verify-db-disk-consistency"
+                hx-target="#maint-result-{{ m_prefix }}"
+                hx-indicator="#maint-spinner-{{ m_prefix }}"
+                class="bg-sky-700 hover:bg-sky-600 text-white px-3.5 py-2 rounded-lg font-semibold shadow transition">
+            🔍 Sprawdź spójność bazy z dyskami
+        </button>
+        <button type="button"
+                hx-post="/actions/vacuum-db"
+                hx-target="#maint-result-{{ m_prefix }}"
+                hx-indicator="#maint-spinner-{{ m_prefix }}"
+                hx-confirm="Kompaktowanie bazy (SQLite VACUUM) przebuduje plik bazy danych i może potrwać kilkanaście sekund przy dużej bazie. Kontynuować?"
+                class="bg-amber-700 hover:bg-amber-600 text-white px-3.5 py-2 rounded-lg font-semibold shadow transition">
+            🗜️ Kompaktuj bazę (VACUUM)
+        </button>
+        <button type="button"
+                hx-post="/actions/cleanup-orphan-thumbs"
+                hx-target="#maint-result-{{ m_prefix }}"
+                hx-indicator="#maint-spinner-{{ m_prefix }}"
+                hx-confirm="Przeskanować katalog miniatur i trwale usunąć wszystkie pliki .webp niepowiązane z żadnym rekordem w bazie (w tym spoza Kosza)?"
+                class="bg-rose-800 hover:bg-rose-700 text-white px-3.5 py-2 rounded-lg font-semibold shadow transition">
+            🖼️ Usuń osierocone miniatury
+        </button>
+        <span id="maint-spinner-{{ m_prefix }}" class="htmx-indicator text-amber-300 text-[11px] animate-pulse">
+            ⏳ Trwa operacja konserwacji — proszę czekać...
+        </span>
+    </div>
+
+    <div id="maint-result-{{ m_prefix }}" class="text-xs"></div>
+</div>
